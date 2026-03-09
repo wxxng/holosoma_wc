@@ -516,8 +516,8 @@ class MotionTrackingPolicy(BasePolicy):
                 target_pos_config = self._motion_to_config_order(self.motion_dof_pos[0]).reshape(1, -1)
                 interp_ratio = min(self.rl_interp_count / self.rl_interp_steps, 1.0)
                 interp_abs = dof_pos + (target_pos_config - dof_pos) * interp_ratio
-                # base.py adds default_dof_angles → return relative (absolute - default)
-                self.scaled_policy_action = interp_abs - self.default_dof_angles
+                # Return absolute joint targets during interpolation.
+                self.scaled_policy_action = interp_abs
                 self.rl_interp_count += 1
                 self.last_policy_action = np.zeros((1, self.num_dofs), dtype=np.float32)
                 self.global_timestep += 1
@@ -548,10 +548,9 @@ class MotionTrackingPolicy(BasePolicy):
         input_feed = {"obs": obs["actor_obs"]}
         raw_action_asset = self.policy(input_feed)
 
-        action_scale, _, action_clip_min, action_clip_max = self._get_action_params_asset()
-        # base.py adds default_dof_angles → do NOT apply action_offset here (offset == default)
+        action_scale, action_offset, action_clip_min, action_clip_max = self._get_action_params_asset()
         policy_action_asset = np.clip(
-            raw_action_asset * action_scale,
+            raw_action_asset * action_scale + action_offset,
             action_clip_min,
             action_clip_max,
         )
