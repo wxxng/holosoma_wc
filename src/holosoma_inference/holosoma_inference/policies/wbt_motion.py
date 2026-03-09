@@ -9,16 +9,13 @@ import joblib
 import numpy as np
 import onnx
 import onnxruntime
-import pinocchio as pin
-from defusedxml import ElementTree
 from loguru import logger
+from scipy.spatial.transform import Rotation
 from termcolor import colored
 
 from holosoma_inference.config.config_types.inference import InferenceConfig
-from holosoma_inference.config.config_types.robot import RobotConfig
 from holosoma_inference.policies import BasePolicy
 from holosoma_inference.utils.clock import ClockSub
-from holosoma_inference.utils.math.misc import get_index_of_a_in_b
 from holosoma_inference.utils.math.quat import (
     quat_mul,
     quat_to_rpy,
@@ -148,48 +145,13 @@ G1_MOTION_JOINT_NAMES_43 = [
     "right_hand_middle_1_joint",
 ]
 
-
-class PinocchioRobot:
-    def __init__(self, robot_cfg: RobotConfig, urdf_text: str):
-        xml_text = self._create_xml_from_urdf(urdf_text)
-
-        self.robot_model = pin.buildModelFromXML(xml_text, pin.JointModelFreeFlyer())
-        self.robot_data = self.robot_model.createData()
-
-        joint_names_in_real_robot = robot_cfg.dof_names
-        joint_names_in_pinocchio_robot = [
-            name for name in self.robot_model.names if name not in ["universe", "root_joint"]
-        ]
-        assert len(joint_names_in_pinocchio_robot) == len(joint_names_in_real_robot), (
-            "The number of joints in the pinocchio robot and the real robot are not the same"
-        )
-        self.real2pinocchio_index = get_index_of_a_in_b(joint_names_in_pinocchio_robot, joint_names_in_real_robot)
-
-        self.ref_body_frame_id = self.robot_model.getFrameId(robot_cfg.motion["body_name_ref"][0])
-
-    def fk_and_get_ref_body_orientation_in_world(self, configuration: np.ndarray) -> np.ndarray:
-        pin.framesForwardKinematics(self.robot_model, self.robot_data, configuration)
-        ref_body_pose_in_world = self.robot_data.oMf[self.ref_body_frame_id]
-        quaternion = pin.Quaternion(ref_body_pose_in_world.rotation)
-        return np.expand_dims(quaternion.coeffs(), axis=0)  # xyzw, (1, 4)
-
-    @staticmethod
-    def _create_xml_from_urdf(urdf_text: str) -> str:
-        """Strip visuals/collisions from URDF text and return XML text."""
-        root = ElementTree.fromstring(urdf_text)
-
-        def _is_visual_or_collision(tag: str) -> bool:
-            return tag.split("}")[-1] in {"visual", "collision"}
-
-        for parent in root.iter():
-            for child in list(parent):
-                if _is_visual_or_collision(child.tag):
-                    parent.remove(child)
-
-        xml_text = ElementTree.tostring(root, encoding="unicode")
-        if not xml_text.lstrip().startswith("<?xml"):
-            xml_text = '<?xml version="1.0"?>\n' + xml_text
-        return xml_text
+DEFAULT_MOTION_REL_PATH = Path("src/holosoma/holosoma/data/motions/motion_tracking/grab_omomo_selected_111_filtered.pkl")
+DEFAULT_MOTION_CLIP_KEY = "GRAB_s10_cubemedium_pass_1"
+GRAVITY_WORLD = np.array([0.0, 0.0, -1.0], dtype=np.float32)
+LEFT_HAND_DEFAULTS = np.array([0.0, 1.0, 1.7, -1.57, -1.7, -1.57, -1.7], dtype=np.float32)
+RIGHT_HAND_DEFAULTS = np.array([0.0, -1.0, -1.7, 1.57, 1.7, 1.57, 1.7], dtype=np.float32)
+ASSET_TO_CONFIG_ORDER_29DOF_ARR = np.array(ASSET_TO_CONFIG_ORDER_29DOF, dtype=np.int64)
+G1_TO_ASSET_ORDER_29DOF_ARR = np.array(G1_TO_ASSET_ORDER_29DOF, dtype=np.int64)
 
 
 class MotionTrackingPolicy(BasePolicy):
@@ -222,6 +184,7 @@ class MotionTrackingPolicy(BasePolicy):
         self._last_clock_reading: int | None = None
 
         self.use_sim_time = config.task.use_sim_time
+        self.motion_to_asset_joint_map = G1_TO_ASSET_ORDER_29DOF_ARR
 
         self._stiff_hold_active = True
         self.robot_yaw_offset = 0.0
@@ -250,6 +213,16 @@ class MotionTrackingPolicy(BasePolicy):
 
         if self._stiff_hold_q.shape[1] != self.num_dofs:
             raise ValueError("Stiff startup pose dimension mismatch with robot DOFs")
+
+        if self.num_dofs == 43:
+            self._config_to_asset_order = np.array(CONFIG_TO_ASSET_ORDER_43DOF, dtype=np.int64)
+            self._action_asset_to_config_order = np.array(ASSET_TO_CONFIG_ORDER_43DOF, dtype=np.int64)
+        else:
+            self._config_to_asset_order = np.array(CONFIG_TO_ASSET_ORDER_29DOF, dtype=np.int64)
+            self._action_asset_to_config_order = np.array(ACTION_ASSET_TO_CONFIG_ORDER_29DOF, dtype=np.int64)
+
+        self._action_params_cache_29: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = None
+        self._action_params_cache_43: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = None
 
         if config.robot.motor_kp is not None:
             self._default_kp = np.array(config.robot.motor_kp, dtype=np.float32)
@@ -343,8 +316,6 @@ class MotionTrackingPolicy(BasePolicy):
         self.motion_dof_vel = (dof_pos_next - self.motion_dof_pos) * self.motion_fps
         self.motion_dof_vel[-1] = 0.0
 
-        self.motion_to_asset_joint_map = np.array(G1_TO_ASSET_ORDER_29DOF)
-
         logger.info(
             f"Motion loaded: {self.motion_length} frames @ {self.motion_fps} Hz"
             f" = {self.motion_length / self.motion_fps:.2f}s"
@@ -377,39 +348,13 @@ class MotionTrackingPolicy(BasePolicy):
         for prop in onnx_model.metadata_props:
             metadata[prop.key] = json.loads(prop.value)
 
-        if "robot_urdf" in metadata:
-            urdf_text = metadata["robot_urdf"]
-            logger.info("Loaded URDF from ONNX metadata")
-        else:
-            robot_name = self.config.robot.robot
-            robot_type = self.config.robot.robot_type
-            holosoma_root = Path(__file__).parent.parent.parent.parent.parent
-            urdf_path = holosoma_root / "src" / "holosoma" / "holosoma" / "data" / "robots" / robot_name / f"{robot_type}.urdf"
-            if not urdf_path.exists():
-                raise FileNotFoundError(f"URDF file not found: {urdf_path}")
-            urdf_text = urdf_path.read_text()
-            logger.info(f"Loaded URDF from: {urdf_path}")
-
-        self.pinocchio_robot = PinocchioRobot(self.config.robot, urdf_text)
-
         self.onnx_kp = np.array(metadata["kp"]) if "kp" in metadata else None
         self.onnx_kd = np.array(metadata["kd"]) if "kd" in metadata else None
 
         if self.onnx_kp is not None:
             logger.info(f"Loaded KP/KD from ONNX metadata: {Path(model_path).name}")
 
-        # Load motion PKL: use config path if specified, otherwise use hardcoded default
-        _holosoma_root = Path(__file__).parent.parent.parent.parent.parent
-        _default_pkl = _holosoma_root / "src/holosoma/holosoma/data/motions/motion_tracking/grab_omomo_selected_111_filtered.pkl"
-
-        if self.config.task.motion_pkl_path is not None:
-            pkl_path = Path(self.config.task.motion_pkl_path)
-        else:
-            pkl_path = _default_pkl
-
-        clip_key = getattr(self.config.task, "motion_clip_key", None)
-        if clip_key is None:
-            clip_key = "GRAB_s10_cubemedium_pass_1"
+        pkl_path, clip_key = self._resolve_motion_source()
 
         if pkl_path.exists():
             self._load_motion_from_pkl(str(pkl_path), clip_key=clip_key)
@@ -421,6 +366,17 @@ class MotionTrackingPolicy(BasePolicy):
             return output[0]
 
         self.policy = policy_act
+
+    def _resolve_motion_source(self) -> tuple[Path, str]:
+        """Resolve PKL path and clip key for tracking motion."""
+        holosoma_root = Path(__file__).parent.parent.parent.parent.parent
+        pkl_path = (
+            Path(self.config.task.motion_pkl_path)
+            if self.config.task.motion_pkl_path is not None
+            else holosoma_root / DEFAULT_MOTION_REL_PATH
+        )
+        clip_key = self.config.task.motion_clip_key or DEFAULT_MOTION_CLIP_KEY
+        return pkl_path, clip_key
 
     def _capture_policy_state(self):
         state = super()._capture_policy_state()
@@ -471,25 +427,19 @@ class MotionTrackingPolicy(BasePolicy):
         dof_pos_config = robot_state_data[:, 7 : 7 + self.num_dofs]
         dof_vel_config = robot_state_data[:, 7 + self.num_dofs + 6 : 7 + self.num_dofs + 6 + self.num_dofs]
 
-        if self.num_dofs == 43:
-            reorder_map = np.array(CONFIG_TO_ASSET_ORDER_43DOF)
-        else:
-            reorder_map = np.array(CONFIG_TO_ASSET_ORDER_29DOF)
-
-        dof_pos_asset = dof_pos_config[:, reorder_map]
-        dof_vel_asset = dof_vel_config[:, reorder_map]
-        default_dof_angles_asset = self.default_dof_angles[reorder_map]
+        dof_pos_asset = dof_pos_config[:, self._config_to_asset_order]
+        dof_vel_asset = dof_vel_config[:, self._config_to_asset_order]
+        default_dof_angles_asset = self.default_dof_angles[self._config_to_asset_order]
 
         # obs in listed order: dof_pos, dof_vel, base_ang_vel, projected_gravity, actions, motion_command_sequence
         current_obs_buffer_dict["dof_pos"] = dof_pos_asset - default_dof_angles_asset
         current_obs_buffer_dict["dof_vel"] = dof_vel_asset
         current_obs_buffer_dict["base_ang_vel"] = robot_state_data[:, 7 + self.num_dofs + 3 : 7 + self.num_dofs + 6]
 
-        from scipy.spatial.transform import Rotation
         base_quat_wxyz = robot_state_data[:, 3:7]
         w, x, y, z = base_quat_wxyz[0]
         rot = Rotation.from_quat([x, y, z, w])
-        current_obs_buffer_dict["projected_gravity"] = rot.inv().apply(np.array([0.0, 0.0, -1.0])).reshape(1, -1)
+        current_obs_buffer_dict["projected_gravity"] = rot.inv().apply(GRAVITY_WORLD).reshape(1, -1)
 
         current_obs_buffer_dict["actions"] = self.last_policy_action
 
@@ -555,10 +505,7 @@ class MotionTrackingPolicy(BasePolicy):
             action_clip_max,
         )
 
-        if self.num_dofs == 43:
-            self.scaled_policy_action = policy_action_asset[:, np.array(ASSET_TO_CONFIG_ORDER_43DOF)]
-        else:
-            self.scaled_policy_action = policy_action_asset[:, np.array(ACTION_ASSET_TO_CONFIG_ORDER_29DOF)]
+        self.scaled_policy_action = policy_action_asset[:, self._action_asset_to_config_order]
 
         self.last_policy_action = raw_action_asset
         self.global_timestep += 1
@@ -573,52 +520,57 @@ class MotionTrackingPolicy(BasePolicy):
 
     def _get_action_params_asset(self):
         """Return (scale, offset, clip_min, clip_max) in asset order."""
-        action_scale = np.array([
-            0.5475, 0.5475, 0.5475, 0.3507, 0.3507, 0.4386, 0.5475, 0.5475, 0.4386,
-            0.3507, 0.3507, 0.4386, 0.4386, 0.4386, 0.4386, 0.4386, 0.4386, 0.4386,
-            0.4386, 0.4386, 0.4386, 0.4386, 0.4386, 0.4386, 0.4386, 0.0745, 0.0745,
-            0.0745, 0.0745, 0.7000, 0.7000, 0.3063, 0.7000, 0.7000, 0.3063, 0.7000,
-            0.7000, 0.7000, 0.7000, 0.7000, 0.7000, 0.7000, 0.7000,
-        ], dtype=np.float32)
+        cache = self._action_params_cache_43
+        if cache is None:
+            action_scale = np.array([
+                0.5475, 0.5475, 0.5475, 0.3507, 0.3507, 0.4386, 0.5475, 0.5475, 0.4386,
+                0.3507, 0.3507, 0.4386, 0.4386, 0.4386, 0.4386, 0.4386, 0.4386, 0.4386,
+                0.4386, 0.4386, 0.4386, 0.4386, 0.4386, 0.4386, 0.4386, 0.0745, 0.0745,
+                0.0745, 0.0745, 0.7000, 0.7000, 0.3063, 0.7000, 0.7000, 0.3063, 0.7000,
+                0.7000, 0.7000, 0.7000, 0.7000, 0.7000, 0.7000, 0.7000,
+            ], dtype=np.float32)
 
-        action_offset = np.array([
-            -0.3120, -0.3120, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000,
-            0.0000, 0.6690, 0.6690, 0.2000, 0.2000, -0.3630, -0.3630, 0.2000,
-            -0.2000, 0.0000, 0.0000, 0.0000, 0.0000, 0.6000, 0.6000, 0.0000,
-            0.0000, 0.0000, 0.0000, 0.0000, 0.0000, -1.4000, -1.4000, 0.0000,
-            1.4000, 1.4000, 0.0000, -1.5700, -1.5700, 0.3500, 1.5700, 1.5700,
-            0.3500, 1.5700, -1.5700,
-        ], dtype=np.float32)
+            action_offset = np.array([
+                -0.3120, -0.3120, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000,
+                0.0000, 0.6690, 0.6690, 0.2000, 0.2000, -0.3630, -0.3630, 0.2000,
+                -0.2000, 0.0000, 0.0000, 0.0000, 0.0000, 0.6000, 0.6000, 0.0000,
+                0.0000, 0.0000, 0.0000, 0.0000, 0.0000, -1.4000, -1.4000, 0.0000,
+                1.4000, 1.4000, 0.0000, -1.5700, -1.5700, 0.3500, 1.5700, 1.5700,
+                0.3500, 1.5700, -1.5700,
+            ], dtype=np.float32)
 
-        action_clip_min = np.array([
-            -10.9509, -10.9509, -10.9509, -7.0132, -7.0132, -8.7715, -10.9509, -10.9509, -8.7715,
-            -7.0132, -7.0132, -8.7715, -8.7715, -8.7715, -8.7715, -8.7715, -8.7715, -8.7715,
-            -8.7715, -8.7715, -8.7715, -8.7715, -8.7715, -8.7715, -8.7715, -1.4900, -1.4900,
-            -1.4900, -1.4900, -14.0000, -14.0000, -6.1250, -14.0000, -14.0000, -6.1250, -14.0000,
-            -14.0000, -14.0000, -14.0000, -14.0000, -14.0000, -14.0000, -14.0000,
-        ], dtype=np.float32)
+            action_clip_min = np.array([
+                -10.9509, -10.9509, -10.9509, -7.0132, -7.0132, -8.7715, -10.9509, -10.9509, -8.7715,
+                -7.0132, -7.0132, -8.7715, -8.7715, -8.7715, -8.7715, -8.7715, -8.7715, -8.7715,
+                -8.7715, -8.7715, -8.7715, -8.7715, -8.7715, -8.7715, -8.7715, -1.4900, -1.4900,
+                -1.4900, -1.4900, -14.0000, -14.0000, -6.1250, -14.0000, -14.0000, -6.1250, -14.0000,
+                -14.0000, -14.0000, -14.0000, -14.0000, -14.0000, -14.0000, -14.0000,
+            ], dtype=np.float32)
 
-        action_clip_max = np.array([
-            10.9509, 10.9509, 10.9509, 7.0132, 7.0132, 8.7715, 10.9509, 10.9509, 8.7715,
-            7.0132, 7.0132, 8.7715, 8.7715, 8.7715, 8.7715, 8.7715, 8.7715, 8.7715,
-            8.7715, 8.7715, 8.7715, 8.7715, 8.7715, 8.7715, 8.7715, 1.4900, 1.4900,
-            1.4900, 1.4900, 14.0000, 14.0000, 6.1250, 14.0000, 14.0000, 6.1250, 14.0000,
-            14.0000, 14.0000, 14.0000, 14.0000, 14.0000, 14.0000, 14.0000,
-        ], dtype=np.float32)
+            action_clip_max = np.array([
+                10.9509, 10.9509, 10.9509, 7.0132, 7.0132, 8.7715, 10.9509, 10.9509, 8.7715,
+                7.0132, 7.0132, 8.7715, 8.7715, 8.7715, 8.7715, 8.7715, 8.7715, 8.7715,
+                8.7715, 8.7715, 8.7715, 8.7715, 8.7715, 8.7715, 8.7715, 1.4900, 1.4900,
+                1.4900, 1.4900, 14.0000, 14.0000, 6.1250, 14.0000, 14.0000, 6.1250, 14.0000,
+                14.0000, 14.0000, 14.0000, 14.0000, 14.0000, 14.0000, 14.0000,
+            ], dtype=np.float32)
+            cache = (action_scale, action_offset, action_clip_min, action_clip_max)
+            self._action_params_cache_43 = cache
 
         if self.num_dofs == 29:
-            return action_scale[:29], action_offset[:29], action_clip_min[:29], action_clip_max[:29]
-        return action_scale, action_offset, action_clip_min, action_clip_max
+            if self._action_params_cache_29 is None:
+                self._action_params_cache_29 = tuple(arr[:29] for arr in cache)
+            return self._action_params_cache_29
+
+        return cache
 
     def _motion_to_config_order(self, pos_motion_order: np.ndarray) -> np.ndarray:
         """Convert joint positions from G1_JOINT_NAMES order to config order."""
         pos_asset = pos_motion_order[self.motion_to_asset_joint_map]
         if self.num_dofs == 43:
-            pos_config_29 = pos_asset[np.array(ASSET_TO_CONFIG_ORDER_29DOF)]
-            left_hand_defaults = np.array([0.0, 1.0, 1.7, -1.57, -1.7, -1.57, -1.7], dtype=np.float32)
-            right_hand_defaults = np.array([0.0, -1.0, -1.7, 1.57, 1.7, 1.57, 1.7], dtype=np.float32)
-            return np.concatenate([pos_config_29[:22], left_hand_defaults, pos_config_29[22:], right_hand_defaults])
-        return pos_asset[np.array(ASSET_TO_CONFIG_ORDER_29DOF)]
+            pos_config_29 = pos_asset[ASSET_TO_CONFIG_ORDER_29DOF_ARR]
+            return np.concatenate([pos_config_29[:22], LEFT_HAND_DEFAULTS, pos_config_29[22:], RIGHT_HAND_DEFAULTS])
+        return pos_asset[ASSET_TO_CONFIG_ORDER_29DOF_ARR]
 
     def _get_manual_command(self, robot_state_data):
         if not self._stiff_hold_active:
@@ -730,7 +682,6 @@ class MotionTrackingPolicy(BasePolicy):
             self._handle_start_stabilization()
         elif keycode == "s":
             if self.use_policy_action:
-                self.clock_sub.reset_origin()
                 self._handle_start_motion_clip()
             else:
                 self.logger.warning("Press ']' first to enable policy, then 's' to start motion")
