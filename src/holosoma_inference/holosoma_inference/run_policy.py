@@ -21,6 +21,7 @@ from holosoma_inference.config.config_values.inference import AnnotatedInference
 from holosoma_inference.config.utils import TYRO_CONFIG
 from holosoma_inference.policies.locomotion import LocomotionPolicy
 from holosoma_inference.policies.wbt import WholeBodyTrackingPolicy
+from holosoma_inference.policies.wbt_motion import MotionTrackingPolicy
 from holosoma_inference.utils.misc import restore_terminal_settings
 
 
@@ -100,7 +101,12 @@ def run_policy(config: InferenceConfig):
     try:
         # Determine policy class based on observation type
         actor_obs = config.observation.obs_dict.get("actor_obs", [])
-        policy_class = WholeBodyTrackingPolicy if "motion_command" in actor_obs else LocomotionPolicy
+        if "motion_command_sequence" in actor_obs:
+            policy_class = MotionTrackingPolicy
+        elif "motion_command" in actor_obs:
+            policy_class = WholeBodyTrackingPolicy
+        else:
+            policy_class = LocomotionPolicy
         logger.info(f"Using {policy_class.__name__}")
         policy: LocomotionPolicy | WholeBodyTrackingPolicy = policy_class(config=config)
 
