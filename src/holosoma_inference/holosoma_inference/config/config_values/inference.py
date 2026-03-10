@@ -155,7 +155,7 @@ g1_43dof_object = InferenceConfig(
 DEFAULTS = {
     "g1-29dof-loco": g1_29dof_loco,
     "t1-29dof-loco": t1_29dof_loco,
-    "g1-29dof-wbt": g1_29dof_dancing,
+    "g1-29dof-dancing": g1_29dof_dancing,
     "g1-29dof-tracking" : g1_29dof_tracking,
     "g1-43dof-object" : g1_43dof_object
 }

@@ -40,7 +40,27 @@ wbt = TaskConfig(
     wandb_download_dir="/tmp",
 )
 
+# Tracking task (g1-29dof-tracking, g1-43dof-object): policy returns absolute joint positions
+wbt_tracking = TaskConfig(
+    model_path="",  # Must be provided by user
+    rl_rate=50,
+    policy_action_scale=1.0,
+    use_phase=False,
+    gait_period=1.0,
+    desired_base_height=0.75,
+    residual_upper_body_action=False,
+    domain_id=0,
+    interface="lo",
+    use_joystick=False,
+    joystick_type="xbox",
+    joystick_device=0,
+    use_ros=False,
+    wandb_download_dir="/tmp",
+    use_absolute_action=True,
+)
+
 DEFAULTS = {
     "locomotion": locomotion,
     "wbt": wbt,
+    "wbt-tracking": wbt_tracking,
 }

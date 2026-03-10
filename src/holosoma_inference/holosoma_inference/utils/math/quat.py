@@ -71,6 +71,7 @@ def quat_inverse(q01):
 def quat_mul(a, b):
     "a: (1, 4), b: (1, 4), wxyz"
     assert a.shape == b.shape
+    orig_shape = a.shape
     a = a.reshape(-1, 4)
     b = b.reshape(-1, 4)
 
@@ -87,7 +88,7 @@ def quat_mul(a, b):
     y = qq - yy + (w1 - x1) * (y2 + z2)
     z = qq - zz + (z1 + y1) * (w2 - x2)
 
-    return np.stack([w, x, y, z]).reshape(a.shape)
+    return np.stack([w, x, y, z], axis=-1).reshape(orig_shape)
 
 
 def quat_apply(a, b):  # a: (1, 4), b: (1, 3)
