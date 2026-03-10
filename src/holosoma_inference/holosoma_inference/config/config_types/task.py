@@ -69,3 +69,9 @@ class TaskConfig:
 
     motion_end_timestep: int | None = None
     """Ending timestep for motion clip playback. If None, plays until the end."""
+
+    use_absolute_action: bool = False
+    """If True, policy outputs absolute joint positions (no default_dof_angles added)."""
+
+    use_gen_traj: bool = False
+    """Whether to use trajectory generator for object motion."""

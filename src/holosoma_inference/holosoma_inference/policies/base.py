@@ -20,6 +20,7 @@ from termcolor import colored
 from holosoma_inference.config.config_types.inference import InferenceConfig
 from holosoma_inference.config.config_types.robot import RobotConfig
 from holosoma_inference.sdk import create_interface
+from holosoma_inference.sdk.interface_wrapper import InterfaceWrapper
 from holosoma_inference.utils.latency import LatencyTracker
 from holosoma_inference.utils.math.quat import quat_rotate_inverse
 from holosoma_inference.utils.rate import RateLimiter
@@ -56,6 +57,8 @@ class BasePolicy:
         self._init_phase_components()
         # Initialize latency tracking
         self._init_latency_tracking()
+        # Initialize safety monitoring
+        self._init_safety_components()
 
     # ============================================================================
     # Initialization Methods
@@ -67,6 +70,13 @@ class BasePolicy:
         self.num_dofs = self.robot_config.num_joints
         self.default_dof_angles = np.array(self.robot_config.default_dof_angles)
         self.num_upper_dofs = robot_config.num_upper_body_joints
+
+        # Initialize motor limits (only position limits are used)
+        q_max = getattr(self.robot_config, "joint_pos_max", None)
+        q_min = getattr(self.robot_config, "joint_pos_min", None)
+        self.q_max_arr: np.array | None = np.array(q_max) if q_max is not None else None
+        self.q_min_arr: np.array | None = np.array(q_min) if q_min is not None else None
+
         # Setup dof names and indices
         self._setup_dof_mappings()
 
@@ -133,12 +143,22 @@ class BasePolicy:
     def _init_communication_components(self):
         """Initialize appropriate robot interface."""
 
-        self.interface = create_interface(
-            self.robot_config,
-            self.config.task.domain_id,
-            self.config.task.interface,
-            self.config.task.use_joystick,
-        )
+        # 43-DOF robots require InterfaceWrapper (supports get_full_state_43dof, hand interfaces, etc.)
+        if self.robot_config.num_joints == 43:
+            self.interface = InterfaceWrapper(
+                self.robot_config,
+                domain_id=self.config.task.domain_id,
+                interface_str=self.config.task.interface,
+                use_joystick=self.config.task.use_joystick,
+                use_hands=True,
+            )
+        else:
+            self.interface = create_interface(
+                self.robot_config,
+                self.config.task.domain_id,
+                self.config.task.interface,
+                self.config.task.use_joystick,
+            )
 
     def _init_policy_components(self, model_path, policy_action_scale, rl_rate):
         """Initialize policy-related components."""
@@ -163,6 +183,8 @@ class BasePolicy:
 
         # Determine KP/KD values: config override > ONNX metadata > error
         self._resolve_control_gains()
+        self._default_kp = np.array(self.robot_config.motor_kp, dtype=np.float32)
+        self._default_kd = np.array(self.robot_config.motor_kd, dtype=np.float32)
 
     def _collect_model_paths(self, model_path):
         """Normalize model_path into a list of up to nine entries."""
@@ -275,6 +297,18 @@ class BasePolicy:
         self.cmd_dq = np.zeros(self.num_dofs)
         self.cmd_tau = np.zeros(self.num_dofs)
 
+        # Used by WBT to request stiff gains during startup interpolation.
+        self._stiff_startup_active = False
+
+        # Hand default positions for 43-DOF robots (when using 29-DOF policy)
+        # Config order: left_hand(7), right_hand(7)
+        self.hand_default_pos = np.array([
+            # Left hand (7 joints)
+            0.0, 1.0, 1.7, -1.57, -1.7, -1.57, -1.7,
+            # Right hand (7 joints)
+            0.0, -1.0, -1.7, 1.57, 1.7, 1.57, 1.7
+        ], dtype=np.float32)
+
     def _init_phase_components(self):
         """Initialize phase components."""
         self.use_phase = self.config.task.use_phase
@@ -342,6 +376,74 @@ class BasePolicy:
         threading.Thread(target=self.start_key_listener, daemon=True).start()
         self.logger.info("Keyboard Listener Initialized")
 
+    def _init_safety_components(self):
+        """Initialize safety monitoring components."""
+        if hasattr(self.robot_config, 'dof_effort_limit_list') and self.robot_config.dof_effort_limit_list:
+            self.safety_torque_limits = np.array(self.robot_config.dof_effort_limit_list) * 0.8
+        else:
+            default_limit = self.config.task.safety_torque_limit if hasattr(self.config.task, 'safety_torque_limit') else 30.0
+            self.safety_torque_limits = np.full(self.num_dofs, default_limit)
+
+        self.orientation_safety_threshold = self.config.task.orientation_safety_threshold if hasattr(self.config.task, 'orientation_safety_threshold') else -0.5
+
+        self.safety_enabled = False
+        self.damping_mode_active = False
+
+        self.logger.info(f"Safety system initialized - Orientation threshold: {self.orientation_safety_threshold:.2f}")
+
+    def activate_damping_mode(self):
+        """Activate damping mode to safely stop the robot."""
+        if self.damping_mode_active:
+            return
+
+        self.damping_mode_active = True
+        self.use_policy_action = False
+        self.get_ready_state = False
+
+        self.logger.error(colored("!!! DAMPING MODE ACTIVATED !!!", "red", attrs=["bold"]))
+
+        damping_kp = np.zeros(self.num_dofs)
+        damping_kd = np.full(self.num_dofs, 3.0)
+        damping_q = np.zeros(self.num_dofs)
+        damping_dq = np.zeros(self.num_dofs)
+        damping_tau = np.zeros(self.num_dofs)
+
+        if self.num_dofs == 43:
+            robot_state_data = self.interface.get_full_state_43dof()
+        else:
+            robot_state_data = self.interface.get_low_state()
+
+        current_q = robot_state_data[0, 7 : 7 + self.num_dofs]
+
+        if self.num_dofs == 43:
+            self.interface.send_full_command_43dof(
+                damping_q, damping_dq, damping_tau, current_q,
+                kp_override_43=damping_kp, kd_override_43=damping_kd,
+            )
+        else:
+            self.interface.send_low_command(
+                damping_q, damping_dq, damping_tau, current_q,
+                kp_override=damping_kp, kd_override=damping_kd,
+            )
+
+    def is_unsafe(self, robot_state_data, projected_gravity):
+        """Check if robot is in an unsafe state."""
+        if not self.safety_enabled or self.damping_mode_active:
+            return False
+
+        if self.use_joystick and hasattr(self, 'key_states') and self.key_states:
+            if self.key_states.get('L2+B', False):
+                self.logger.error(colored("[SAFETY TRIGGER] Manual emergency stop (L2+B) pressed!", "red", attrs=["bold"]))
+                return True
+
+        if projected_gravity[0, 2] > self.orientation_safety_threshold:
+            self.logger.error(
+                colored(f"[SAFETY TRIGGER] Robot is upside down! projected_gravity_z: {projected_gravity[0, 2]:.3f}", "red", attrs=["bold"])
+            )
+            return True
+
+        return False
+
     # ============================================================================
     # Policy Methods
     # ============================================================================
@@ -404,8 +506,12 @@ class BasePolicy:
             self.robot_config = replace(
                 self.robot_config, motor_kp=tuple(kp_values.tolist()), motor_kd=tuple(kd_values.tolist())
             )
-            # Update interface's robot_config and propagate to internal SDK components
-            self.interface.update_config(self.robot_config)
+            # Update InterfaceWrapper's robot_config reference since replace() creates a new object
+            self.interface.robot_config = self.robot_config
+            # Update sdk2py backend components (booster SDK only)
+            if self.interface.backend == "sdk2py":
+                self.interface.command_sender.config = self.robot_config
+                self.interface.state_processor.config = self.robot_config
         else:
             # No values available - error
             raise ValueError(
@@ -537,7 +643,11 @@ class BasePolicy:
                 history = list(buffer)
                 if len(history) < history_len:
                     missing = history_len - len(history)
-                    history = [np.zeros_like(obs)] * missing + history
+                    if group in {"proprio_body", "proprio_hand"}:
+                        pad_value = history[0] if history else obs
+                        history = [pad_value.copy()] * missing + history
+                    else:
+                        history = [np.zeros_like(obs)] * missing + history
 
                 # Match training order: time dimension first, then flatten into [history_len * term_dim].
                 stacked = np.stack(history[-history_len:], axis=1)
@@ -573,6 +683,32 @@ class BasePolicy:
             return q_target
         return dof_pos
 
+    def _resolve_command_gains(self, kp_override, kd_override):
+        """Resolve KP/KD overrides for command publishing."""
+        if kp_override is not None or kd_override is not None:
+            kp = kp_override if kp_override is not None else self._default_kp
+            kd = kd_override if kd_override is not None else self._default_kd
+            return kp, kd
+
+        if getattr(self, "_stiff_startup_active", False):
+            kp = getattr(self, "_stiff_hold_kp", None)
+            kd = getattr(self, "_stiff_hold_kd", None)
+            if kp is not None and kd is not None:
+                kp_arr = np.asarray(kp, dtype=np.float32).reshape(-1)
+                kd_arr = np.asarray(kd, dtype=np.float32).reshape(-1)
+                if kp_arr.shape[0] == self.num_dofs and kd_arr.shape[0] == self.num_dofs:
+                    return kp_arr, kd_arr
+                if not getattr(self, "_stiff_gain_warned", False):
+                    self.logger.warning(
+                        "Stiff startup gains shape mismatch: kp=%s kd=%s expected=%s. Falling back to default gains.",
+                        kp_arr.shape[0],
+                        kd_arr.shape[0],
+                        self.num_dofs,
+                    )
+                    self._stiff_gain_warned = True
+
+        return self._default_kp, self._default_kd
+
     def policy_action(self):
         """Execute policy action and send commands to robot."""
 
@@ -581,7 +717,20 @@ class BasePolicy:
 
         # Stage 1: Read State
         with self.latency_tracker.measure("read_state"):
-            robot_state_data = self.interface.get_low_state()
+            if self.num_dofs == 43:
+                robot_state_data = self.interface.get_full_state_43dof()
+            else:
+                robot_state_data = self.interface.get_low_state()
+
+        # Safety Check: Monitor for unsafe conditions after policy starts
+        if self.safety_enabled and self.use_policy_action:
+            base_quat = robot_state_data[:, 3:7]
+            v = np.array([[0, 0, -1]])
+            projected_gravity = quat_rotate_inverse(base_quat, v)
+
+            if self.is_unsafe(robot_state_data, projected_gravity):
+                self.activate_damping_mode()
+                return  # Skip rest of control loop
 
         # Stage 2: Pre-processing
         with self.latency_tracker.measure("preprocessing"):
@@ -589,6 +738,11 @@ class BasePolicy:
             if self.get_ready_state:
                 q_target = self.get_init_target(robot_state_data)
                 self.init_count = min(self.init_count, 500)
+                # Use motor_kp/kd when moving to the default pose
+                if self.robot_config.motor_kp is not None:
+                    kp_override = np.asarray(self.robot_config.motor_kp, dtype=np.float32)
+                if self.robot_config.motor_kd is not None:
+                    kd_override = np.asarray(self.robot_config.motor_kd, dtype=np.float32)
             elif not self.use_policy_action:
                 manual_cmd = self._get_manual_command(robot_state_data)
                 if manual_cmd is not None:
@@ -599,7 +753,7 @@ class BasePolicy:
                     q_target = robot_state_data[:, 7 : 7 + self.num_dofs]
             else:
                 # Prepare for inference - any preprocessing before RL inference
-                pass
+                q_target = None
 
         # Stage 3: Inference
         if self.use_policy_action and not self.get_ready_state:
@@ -616,29 +770,76 @@ class BasePolicy:
                         )
                     else:
                         raise NotImplementedError("Upper body controller not implemented")
-                actor_obs_terms = self.obs_dict.get("actor_obs", [])
-                is_g1_tracking = (
-                    self.config.robot.robot_type == "g1_29dof"
-                    and "motion_command_sequence" in actor_obs_terms
-                )
-                if is_g1_tracking:
-                    q_target = scaled_policy_action
-                else:
-                    q_target = scaled_policy_action + self.default_dof_angles
+                q_target = scaled_policy_action  # + self.default_dof_angles
 
-            # Prepare command (reuse pre-allocated arrays)
-            self.cmd_q[:] = q_target
+                # Clip target positions to motor limits (in-place for speed)
+                if self.q_min_arr is not None and self.q_max_arr is not None:
+                    np.clip(q_target[0], self.q_min_arr, self.q_max_arr, out=q_target[0])
+                # Prepare command (reuse pre-allocated arrays)
+                self.cmd_q[:] = q_target[0]
+            elif self.q_min_arr is not None and self.q_max_arr is not None:
+                # Clip target positions to motor limits for manual/init modes
+                np.clip(q_target[0], self.q_min_arr, self.q_max_arr, out=q_target[0])
+                # Prepare command (reuse pre-allocated arrays)
+                self.cmd_q[:] = q_target[0]
 
         # Stage 5: Action Pub
         with self.latency_tracker.measure("action_pub"):
-            self.interface.send_low_command(
-                self.cmd_q,
-                self.cmd_dq,
-                self.cmd_tau,
-                robot_state_data[0, 7 : 7 + self.num_dofs],
-                kp_override=kp_override,
-                kd_override=kd_override,
-            )
+            # Expand 29-DOF command to 43-DOF if needed (add hand defaults)
+            if self.num_dofs == 29:
+                # Robot supports 43-DOF but policy only controls 29-DOF
+                # Insert hand defaults at correct positions in config order
+                cmd_q_43 = np.zeros(43, dtype=np.float32)
+                # Body joints (29): left_leg(6) + right_leg(6) + waist(3) + left_arm(4) + left_wrist(3) + right_arm(4) + right_wrist(3)
+                cmd_q_43[:22] = self.cmd_q[:22]  # left_leg + right_leg + waist + left_arm + left_wrist
+                cmd_q_43[22:29] = self.hand_default_pos[:7]  # left hand (7 joints)
+                cmd_q_43[29:36] = self.cmd_q[22:29]  # right_arm + right_wrist
+                cmd_q_43[36:43] = self.hand_default_pos[7:]  # right hand (7 joints)
+
+                # Get current state for 43-DOF
+                robot_state_43 = self.interface.get_full_state_43dof()
+
+                # Send 43-DOF command
+                kp_override = np.concatenate([
+                    self._default_kp[:22],  # body
+                    np.full(7, 5.0),  # left hand - lower gains for compliance
+                    self._default_kp[22:29] if len(self._default_kp) >= 29 else np.full(7, 14.25),  # right arm
+                    np.full(7, 5.0),  # right hand - lower gains for compliance
+                ])
+                kd_override = np.concatenate([
+                    self._default_kd[:22],  # body
+                    np.full(7, 0.5),  # left hand
+                    self._default_kd[22:29] if len(self._default_kd) >= 29 else np.full(7, 0.91),  # right arm
+                    np.full(7, 0.5),  # right hand
+                ])
+
+                self.interface.send_full_command_43dof(
+                    cmd_q_43,
+                    np.zeros(43),  # cmd_dq
+                    np.zeros(43),  # cmd_tau
+                    robot_state_43[0, 7:50],  # current q (43 DOF)
+                    kp_override_43=kp_override,
+                    kd_override_43=kd_override,
+                )
+            elif self.num_dofs == 43:
+                kp_override, kd_override = self._resolve_command_gains(kp_override, kd_override)
+                self.interface.send_full_command_43dof(
+                    self.cmd_q,
+                    self.cmd_dq,
+                    self.cmd_tau,
+                    robot_state_data[0, 7 : 7 + self.num_dofs],
+                    kp_override_43=kp_override,
+                    kd_override_43=kd_override,
+                )
+            else:
+                self.interface.send_low_command(
+                    self.cmd_q,
+                    self.cmd_dq,
+                    self.cmd_tau,
+                    robot_state_data[0, 7 : 7 + self.num_dofs],
+                    kp_override=kp_override,
+                    kd_override=kd_override,
+                )
 
     def _get_manual_command(self, robot_state_data):
         """Optional manual command when policy control is disabled."""
@@ -741,7 +942,8 @@ class BasePolicy:
         """Handle start policy action."""
         self.use_policy_action = True
         self.get_ready_state = False
-        self.logger.info(colored("Using policy actions", "blue"))
+        self.safety_enabled = True  # Enable safety checks when policy starts
+        self.logger.info(colored("Using policy actions - Safety monitoring ENABLED", "blue"))
         self.phase = np.array([[0.0, np.pi]])
         if hasattr(self.interface, "no_action"):
             self.interface.no_action = 0
@@ -750,6 +952,8 @@ class BasePolicy:
         """Handle stop policy action."""
         self.use_policy_action = False
         self.get_ready_state = False
+        self.safety_enabled = False  # Disable safety checks when policy is stopped
+        self.damping_mode_active = False  # Reset damping mode
         self.logger.info("Actions set to zero")
         if hasattr(self.interface, "no_action"):
             self.interface.no_action = 1
