@@ -1,4 +1,5 @@
 import time
+import socket
 
 import numpy as np
 from loguru import logger
@@ -12,6 +13,11 @@ from unitree_interface import (
 )
 
 from holosoma.bridge.base.basic_sdk2py_bridge import BasicSdk2Bridge
+
+OBJECT_STATE_UDP_PORT = 10002
+OBJECT_STATE_UDP_HOST = "127.0.0.1"
+ROBOT_STATE_UDP_PORT = 10003
+ROBOT_STATE_UDP_HOST = "127.0.0.1"
 
 
 class UnitreeSdk2Bridge(BasicSdk2Bridge):
@@ -44,6 +50,25 @@ class UnitreeSdk2Bridge(BasicSdk2Bridge):
             self._init_hands_components(interface_name)
         else:
             self._init_standard_components(robot_type, interface_name)
+
+        # Object/robot state UDP publisher (sim2sim on loopback)
+        self._object_state_sock = None
+        self._object_state_addr = None
+        self._object_state_warned = False
+        self._robot_state_sock = None
+        self._robot_state_addr = None
+        self._robot_state_warned = False
+        if interface_name == "lo":
+            self._object_state_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._object_state_addr = (OBJECT_STATE_UDP_HOST, OBJECT_STATE_UDP_PORT)
+            logger.info(
+                f"Object state UDP publisher enabled on {OBJECT_STATE_UDP_HOST}:{OBJECT_STATE_UDP_PORT}"
+            )
+            self._robot_state_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._robot_state_addr = (ROBOT_STATE_UDP_HOST, ROBOT_STATE_UDP_PORT)
+            logger.info(
+                f"Robot state UDP publisher enabled on {ROBOT_STATE_UDP_HOST}:{ROBOT_STATE_UDP_PORT}"
+            )
 
     def _init_standard_components(self, robot_type, interface_name):
         """Initialize standard (non-hands) SDK components."""
@@ -168,6 +193,8 @@ class UnitreeSdk2Bridge(BasicSdk2Bridge):
 
         # Publish (CRC calculated automatically in C++)
         self.interface.publish_low_state(self.low_state)
+        self._publish_object_state_udp()
+        self._publish_robot_state_udp()
 
     def _publish_low_state_with_hands(self):
         """Publish state for 43 DOF robots (29 body + 14 hands)."""
@@ -210,6 +237,8 @@ class UnitreeSdk2Bridge(BasicSdk2Bridge):
 
         # Publish body state
         self.interface.publish_low_state(self.low_state)
+        self._publish_object_state_udp()
+        self._publish_robot_state_udp()
 
         # === Publish hand states via C++ binding ===
         # Read any incoming hand commands from policy
@@ -325,3 +354,38 @@ class UnitreeSdk2Bridge(BasicSdk2Bridge):
         except Exception as e:
             logger.error(f"Error computing torques: {e}")
             raise
+
+    def _publish_object_state_udp(self):
+        if self._object_state_sock is None or self._object_state_addr is None:
+            return
+        try:
+            states = self.simulator.get_actor_states(["object"], env_ids=None)
+        except Exception:
+            if not self._object_state_warned:
+                logger.warning(
+                    "Object state not available in simulator. Ensure MJCF has a body named 'object' "
+                    "and it's registered in the simulator object registry."
+                )
+                self._object_state_warned = True
+            return
+        if states is None or states.numel() == 0:
+            return
+        state = states[0].detach().cpu().numpy().astype(np.float32, copy=False)
+        self._object_state_sock.sendto(state.tobytes(), self._object_state_addr)
+
+    def _publish_robot_state_udp(self):
+        if self._robot_state_sock is None or self._robot_state_addr is None:
+            return
+        try:
+            states = self.simulator.get_actor_states(["robot"], env_ids=None)
+        except Exception:
+            if not self._robot_state_warned:
+                logger.warning(
+                    "Robot state not available in simulator. Ensure robot is registered in the object registry."
+                )
+                self._robot_state_warned = True
+            return
+        if states is None or states.numel() == 0:
+            return
+        state = states[0].detach().cpu().numpy().astype(np.float32, copy=False)
+        self._robot_state_sock.sendto(state.tobytes(), self._robot_state_addr)
