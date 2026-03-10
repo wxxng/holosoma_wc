@@ -1869,9 +1869,19 @@ g1_43dof = RobotConfig(
 )
 
 
+g1_43dof_cubemedium = replace(
+    g1_43dof,
+    asset=replace(
+        g1_43dof.asset,
+        xml_file="g1/g1_object/g1_43dof_cubemedium.xml",
+        robot_type="g1_43dof_cubemedium",
+    ),
+)
+
 DEFAULTS = {
     "g1_29dof": g1_29dof,
     "g1_43dof": g1_43dof,
     "t1_29dof_waist_wrist": t1_29dof_waist_wrist,
     "g1_29dof_w_object": g1_29dof_w_object,
+    "g1_43dof_cubemedium": g1_43dof_cubemedium,
 }
