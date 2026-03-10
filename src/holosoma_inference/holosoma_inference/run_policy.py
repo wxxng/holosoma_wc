@@ -22,6 +22,7 @@ from holosoma_inference.config.utils import TYRO_CONFIG
 from holosoma_inference.policies.locomotion import LocomotionPolicy
 from holosoma_inference.policies.wbt import WholeBodyTrackingPolicy
 from holosoma_inference.policies.wbt_motion import MotionTrackingPolicy
+from holosoma_inference.policies.wbt_object import WholeBodyTrackingPolicy as ObjectTrackingPolicy
 from holosoma_inference.utils.misc import restore_terminal_settings
 
 
@@ -105,6 +106,8 @@ def run_policy(config: InferenceConfig):
             policy_class = MotionTrackingPolicy
         elif "motion_command" in actor_obs:
             policy_class = WholeBodyTrackingPolicy
+        elif "actor_obs" not in config.observation.obs_dict:
+            policy_class = ObjectTrackingPolicy
         else:
             policy_class = LocomotionPolicy
         logger.info(f"Using {policy_class.__name__}")

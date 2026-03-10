@@ -31,4 +31,7 @@ __pycache__
 *.pkl
 *.png
 *.obj
-
+*.urdf
+src/holosoma/holosoma/data/robots/g1/g1_object/
+src/holosoma/holosoma/data/grab/
+src/holosoma_retargeting/holosoma_retargeting/models/g1/assets/
