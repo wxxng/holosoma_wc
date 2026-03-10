@@ -364,6 +364,8 @@ class WholeBodyTrackingPolicy(BasePolicy):
         self.motion_dof_vel = None  # [num_frames, num_dofs] calculated from pos
         self.motion_obj_pos = None  # [num_frames, 3] world
         self.motion_obj_rot = None  # [num_frames, 4] world (wxyz)
+        self.motion_table_pos = None  # [num_frames, 3] world
+        self.motion_table_rot_wxyz = None  # [num_frames, 4] world (wxyz)
         self.motion_obj_name = None
         self.motion_root_pos_w = None  # [num_frames, 3] world
         self.motion_root_quat_w = None  # [num_frames, 4] world (wxyz)
@@ -371,6 +373,8 @@ class WholeBodyTrackingPolicy(BasePolicy):
         self.motion_align_ref_quat_wxyz = None  # [4] initial human quat used to align motion frames (wxyz)
         self.motion_obj_pos_aligned = None  # [num_frames, 3] motion obj pos aligned to initial human frame
         self.motion_obj_rot_aligned_wxyz = None  # [num_frames, 4] motion obj rot aligned (wxyz)
+        self.motion_table_pos_aligned = None  # [num_frames, 3] motion table pos aligned to initial human frame
+        self.motion_table_rot_aligned_wxyz = None  # [num_frames, 4] motion table rot aligned (wxyz)
         self.motion_root_pos_w_aligned = None  # [num_frames, 3] aligned motion root (torso) pos
         self.motion_root_quat_w_aligned = None  # [num_frames, 4] aligned motion root (torso) quat (wxyz)
         self.motion_fps = None
@@ -441,6 +445,8 @@ class WholeBodyTrackingPolicy(BasePolicy):
         self.motion_body_indices = None
         self.motion_command_dofs = 29
         self.startup_pos = None
+        self._last_sent_table_frame = None
+        self._table_pose_send_warned = False
 
         super().__init__(config)
 
@@ -1136,6 +1142,29 @@ class WholeBodyTrackingPolicy(BasePolicy):
             else:
                 # Motion clip rotations are xyzw; convert to wxyz for internal use.
                 self.motion_obj_rot = xyzw_to_wxyz(obj_rot)
+
+        table_pos_raw = clip_data.get("table_pos")
+        if table_pos_raw is None:
+            self.motion_table_pos = None
+        else:
+            table_pos = np.asarray(table_pos_raw, dtype=np.float32)
+            if table_pos.ndim != 2 or table_pos.shape[1] != 3:
+                logger.warning(f"Invalid table_pos shape {table_pos.shape}; disabling motion table pos.")
+                self.motion_table_pos = None
+            else:
+                self.motion_table_pos = table_pos
+
+        table_rot_raw = clip_data.get("table_rot")
+        if table_rot_raw is None:
+            self.motion_table_rot_wxyz = None
+        else:
+            table_rot = np.asarray(table_rot_raw, dtype=np.float32)
+            if table_rot.ndim != 2 or table_rot.shape[1] != 4:
+                logger.warning(f"Invalid table_rot shape {table_rot.shape}; disabling motion table rot.")
+                self.motion_table_rot_wxyz = None
+            else:
+                # Motion clip rotations are xyzw; convert to wxyz for internal use.
+                self.motion_table_rot_wxyz = xyzw_to_wxyz(table_rot)
         self.motion_obj_name = clip_data.get("obj_name")
 
         # Optional: motion root pose for motion-frame transforms
@@ -1171,6 +1200,12 @@ class WholeBodyTrackingPolicy(BasePolicy):
             root_pos_w=self.motion_root_pos_w,
             root_quat_wxyz=self.motion_root_quat_w,
         )
+        self._align_motion_table_to_root(
+            root_pos_w=self.motion_root_pos_w,
+            root_quat_wxyz=self.motion_root_quat_w,
+        )
+        self._last_sent_table_frame = None
+        self._table_pose_send_warned = False
         
         # Calculate velocities using finite differences
         # vel[t] = (pos[t+1] - pos[t]) * fps
@@ -1252,6 +1287,43 @@ class WholeBodyTrackingPolicy(BasePolicy):
         self.motion_obj_pos_aligned = self.motion_obj_pos.copy()
         self.motion_obj_rot_aligned_wxyz = obj_rot_h_wxyz.copy()
         logger.info("Aligned motion object poses to root xy/yaw of the first frame.")
+
+    def _align_motion_table_to_root(
+        self,
+        root_pos_w: np.ndarray | None,
+        root_quat_wxyz: np.ndarray | None,
+    ) -> None:
+        """Align motion table poses using root xy translation and yaw from the first frame."""
+        if self.motion_table_pos is None:
+            return
+        if root_pos_w is None or root_quat_wxyz is None:
+            return
+        if root_pos_w.shape[0] == 0 or root_quat_wxyz.shape[0] == 0:
+            return
+
+        root_pos0 = np.asarray(root_pos_w[0], dtype=np.float32).reshape(3,)
+        root_quat0_wxyz = np.asarray(root_quat_wxyz[0], dtype=np.float32).reshape(1, 4)
+        _, _, yaw = quat_to_rpy(root_quat0_wxyz.reshape(-1))
+        yaw_quat_wxyz = rpy_to_quat((0.0, 0.0, yaw)).reshape(1, 4)
+
+        table_pos_w = np.asarray(self.motion_table_pos, dtype=np.float32)
+        trans_xy = np.array([root_pos0[0], root_pos0[1], 0.0], dtype=np.float32)
+        rel_w = table_pos_w - trans_xy
+        q_pos = np.repeat(yaw_quat_wxyz, rel_w.shape[0], axis=0)
+        rel_h = quat_rotate_inverse(q_pos, rel_w)
+        self.motion_table_pos = rel_h.astype(np.float32, copy=False)
+        self.motion_table_pos_aligned = self.motion_table_pos.copy()
+
+        if self.motion_table_rot_wxyz is not None:
+            table_rot_wxyz = np.asarray(self.motion_table_rot_wxyz, dtype=np.float32)
+            q_w2h = quat_inverse(yaw_quat_wxyz)
+            q_w2h_rep = np.repeat(q_w2h, table_rot_wxyz.shape[0], axis=0)
+            table_rot_h_wxyz = quat_mul(q_w2h_rep, table_rot_wxyz)
+            table_rot_h_wxyz = self._normalize_quat_wxyz(table_rot_h_wxyz)
+            self.motion_table_rot_wxyz = table_rot_h_wxyz.astype(np.float32, copy=False)
+            self.motion_table_rot_aligned_wxyz = table_rot_h_wxyz.copy()
+
+        logger.info("Aligned motion table poses to root xy/yaw of the first frame.")
 
     def _convert_motion_root_to_torso(self) -> None:
         if self.motion_root_pos_w is None or self.motion_root_quat_w is None:
@@ -1670,6 +1742,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
 
         current_obs_buffer_dict = {}
         command_timestep = 0 if self.stabilization_mode else self.motion_timestep
+        self._update_table_pose_from_motion(command_timestep)
 
         # Extract joint data from robot_state_data (in config order)
         dof_pos_config = robot_state_data[:, 7 : 7 + self.num_dofs]  # [1, num_dofs]
@@ -1854,6 +1927,32 @@ class WholeBodyTrackingPolicy(BasePolicy):
 
         out = np.concatenate([rel_s_h, rel_l_h], axis=0)  # (14, 3)
         return out.reshape(1, -1).astype(np.float32, copy=False)
+
+    def _update_table_pose_from_motion(self, timestep: int) -> None:
+        if self.motion_table_pos is None or self.motion_table_pos.shape[0] == 0:
+            return
+        if not (self.motion_clip_progressing or self.stabilization_mode):
+            return
+        if not hasattr(self.interface, "set_table_pose"):
+            return
+
+        frame_idx = int(np.clip(timestep, 0, self.motion_table_pos.shape[0] - 1))
+        if self._last_sent_table_frame == frame_idx:
+            return
+
+        table_pos_w = self.motion_table_pos[frame_idx].astype(np.float32, copy=False)
+        table_quat_wxyz = None
+        if self.motion_table_rot_wxyz is not None and frame_idx < self.motion_table_rot_wxyz.shape[0]:
+            table_quat_wxyz = self.motion_table_rot_wxyz[frame_idx].astype(np.float32, copy=False)
+
+        ok = self.interface.set_table_pose(table_pos_w, table_quat_wxyz)
+        if ok:
+            self._last_sent_table_frame = frame_idx
+            return
+
+        if not self._table_pose_send_warned:
+            self.logger.warning("Failed to send table pose command to interface.")
+            self._table_pose_send_warned = True
 
     def _compute_motion_obj_ori_rel_all(self, robot_state_data, timestep: int) -> np.ndarray:
         if self.motion_obj_rot is None or self.motion_length == 0:
@@ -2697,6 +2796,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
         # Capture motion-specific start timestep for policy-level timing control
         self.motion_start_timestep = None  # will be set in rl_inference
         self.motion_timestep = 0  # Reset to start from beginning of motion
+        self._last_sent_table_frame = None
         self._last_clock_reading = None
         # Seed main policy history buffers with the current observation for smooth transition
         robot_state_data = (

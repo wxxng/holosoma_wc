@@ -14,6 +14,8 @@ OBJECT_STATE_UDP_PORT = 10002
 OBJECT_STATE_UDP_HOST = "127.0.0.1"
 ROBOT_STATE_UDP_PORT = 10003
 ROBOT_STATE_UDP_HOST = "127.0.0.1"
+TABLE_COMMAND_UDP_PORT = 10004
+TABLE_COMMAND_UDP_HOST = "127.0.0.1"
 
 # World topics UDP (JSON) receiver (for external state sources).
 # Can be overridden via environment variables.
@@ -55,6 +57,7 @@ class InterfaceWrapper:
         self.interface_str = interface_str
         self.sdk_type = robot_config.sdk_type
         self.backend = None
+        self._unitree_motor_order = None
 
         # Initialize gain levels for binding backend
         self._kp_level = 1.0
@@ -68,6 +71,9 @@ class InterfaceWrapper:
         self._object_state_cache = None
         self._robot_state_sock = None
         self._robot_state_cache = None
+        self._table_command_sock = None
+        self._table_command_addr = None
+        self._table_command_warned = False
         # World topics receiver (external pose/velocity via UDP JSON)
         self._world_topics_sock = None
         self._world_robot_pose_cache = None  # [x,y,z,qx,qy,qz,qw] in FLU
@@ -78,6 +84,7 @@ class InterfaceWrapper:
         if self.interface_str == "lo":
             self._init_object_state_receiver()
             self._init_robot_state_receiver()
+            self._init_table_command_sender()
         elif self.interface_str == "enp132s0":
             self._init_world_topics_receiver()
 
@@ -110,6 +117,20 @@ class InterfaceWrapper:
         except OSError as exc:
             self.logger.warning(f"Failed to init robot state UDP receiver: {exc}")
             self._robot_state_sock = None
+
+    def _init_table_command_sender(self):
+        """Initialize UDP sender for simulator table commands (loopback only)."""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._table_command_sock = sock
+            self._table_command_addr = (TABLE_COMMAND_UDP_HOST, TABLE_COMMAND_UDP_PORT)
+            self.logger.info(
+                f"Table command UDP sender enabled to {TABLE_COMMAND_UDP_HOST}:{TABLE_COMMAND_UDP_PORT}"
+            )
+        except OSError as exc:
+            self.logger.warning(f"Failed to init table command UDP sender: {exc}")
+            self._table_command_sock = None
+            self._table_command_addr = None
 
     def _init_world_topics_receiver(self):
         """Initialize UDP receiver for external world topics (JSON packets)."""
@@ -334,6 +355,70 @@ class InterfaceWrapper:
         if state is None or state.size < 3:
             return None
         return state[:3].reshape(1, 3)
+
+    def set_table_pose(self, pos_xyz, quat_wxyz=None):
+        """Send table pose command to simulator bridge over UDP.
+
+        Packet format (float32[8]):
+          [cmd_id, px, py, pz, qw, qx, qy, qz]
+        cmd_id=1 -> set table pose
+        """
+        if self._table_command_sock is None or self._table_command_addr is None:
+            if not self._table_command_warned:
+                self.logger.warning("Table command sender is not initialized; cannot set table pose.")
+                self._table_command_warned = True
+            return False
+
+        pos = np.asarray(pos_xyz, dtype=np.float32).reshape(-1)
+        if pos.size != 3:
+            self.logger.warning(f"Invalid table position shape {pos.shape}; expected 3 values.")
+            return False
+
+        if quat_wxyz is None:
+            quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        else:
+            quat = np.asarray(quat_wxyz, dtype=np.float32).reshape(-1)
+            if quat.size != 4:
+                self.logger.warning(f"Invalid table quaternion shape {quat.shape}; expected 4 values (wxyz).")
+                return False
+            norm = float(np.linalg.norm(quat))
+            if norm <= 0.0:
+                quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+            else:
+                quat = quat / norm
+
+        packet = np.concatenate(
+            [np.array([1.0], dtype=np.float32), pos.astype(np.float32, copy=False), quat.astype(np.float32, copy=False)],
+            axis=0,
+        )
+
+        try:
+            self._table_command_sock.sendto(packet.tobytes(), self._table_command_addr)
+            return True
+        except OSError as exc:
+            self.logger.warning(f"Failed to send table pose command: {exc}")
+            return False
+
+    def request_remove_table(self):
+        """Request simulator to remove/hide table.
+
+        Packet format (float32[8]):
+          [cmd_id, 0, 0, 0, 1, 0, 0, 0]
+        cmd_id=2 -> remove table
+        """
+        if self._table_command_sock is None or self._table_command_addr is None:
+            if not self._table_command_warned:
+                self.logger.warning("Table command sender is not initialized; cannot request table removal.")
+                self._table_command_warned = True
+            return False
+
+        packet = np.array([2.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        try:
+            self._table_command_sock.sendto(packet.tobytes(), self._table_command_addr)
+            return True
+        except OSError as exc:
+            self.logger.warning(f"Failed to send remove-table command: {exc}")
+            return False
 
     def _convert_binding_state_to_array(self):
 
