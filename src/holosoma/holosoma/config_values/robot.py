@@ -1,4 +1,5 @@
 from dataclasses import replace
+from pathlib import Path
 
 from holosoma.config_types.robot import (
     RobotAssetConfig,
@@ -1104,8 +1105,773 @@ g1_29dof_w_object = replace(
     ),
 )
 
+# G1 with 43 DOF (29 body + 14 hands)
+g1_43dof = RobotConfig(
+    num_bodies=46,  # 32 body + 14 hand links
+    dof_obs_size=43,
+    actions_dim=43,
+    policy_obs_dim=-1,
+    critic_obs_dim=-1,
+    algo_obs_dim_dict={},
+    key_bodies=["left_foot_contact_point", "right_foot_contact_point"],
+    num_feet=2,
+    foot_body_name="ankle_roll_link",
+    foot_height_name="foot_contact_point",
+    knee_name="knee_link",
+    torso_name="torso_link",
+    dof_names=[
+        # NOTE: Order MUST match MuJoCo joint order (based on body tree structure)
+        # Legs (0-11) - matches g1_29dof indices 0-11
+        "left_hip_pitch_joint",
+        "left_hip_roll_joint",
+        "left_hip_yaw_joint",
+        "left_knee_joint",
+        "left_ankle_pitch_joint",
+        "left_ankle_roll_joint",
+        "right_hip_pitch_joint",
+        "right_hip_roll_joint",
+        "right_hip_yaw_joint",
+        "right_knee_joint",
+        "right_ankle_pitch_joint",
+        "right_ankle_roll_joint",
+        # Waist (12-14) - matches g1_29dof indices 12-14
+        "waist_yaw_joint",
+        "waist_roll_joint",
+        "waist_pitch_joint",
+        # Left arm (15-21) - matches g1_29dof indices 15-21
+        "left_shoulder_pitch_joint",
+        "left_shoulder_roll_joint",
+        "left_shoulder_yaw_joint",
+        "left_elbow_joint",
+        "left_wrist_roll_joint",
+        "left_wrist_pitch_joint",
+        "left_wrist_yaw_joint",
+        # Left hand (22-28) - follows left arm in body tree
+        "left_hand_thumb_0_joint",
+        "left_hand_thumb_1_joint",
+        "left_hand_thumb_2_joint",
+        "left_hand_middle_0_joint",
+        "left_hand_middle_1_joint",
+        "left_hand_index_0_joint",
+        "left_hand_index_1_joint",
+        # Right arm (29-35) - matches g1_29dof indices 22-28
+        "right_shoulder_pitch_joint",
+        "right_shoulder_roll_joint",
+        "right_shoulder_yaw_joint",
+        "right_elbow_joint",
+        "right_wrist_roll_joint",
+        "right_wrist_pitch_joint",
+        "right_wrist_yaw_joint",
+        # Right hand (36-42) - follows right arm in body tree
+        "right_hand_thumb_0_joint",
+        "right_hand_thumb_1_joint",
+        "right_hand_thumb_2_joint",
+        "right_hand_middle_0_joint",
+        "right_hand_middle_1_joint",
+        "right_hand_index_0_joint",
+        "right_hand_index_1_joint",
+    ],
+    upper_dof_names=[
+        "waist_yaw_joint",
+        "waist_roll_joint",
+        "waist_pitch_joint",
+        "left_shoulder_pitch_joint",
+        "left_shoulder_roll_joint",
+        "left_shoulder_yaw_joint",
+        "left_elbow_joint",
+        "left_wrist_roll_joint",
+        "left_wrist_pitch_joint",
+        "left_wrist_yaw_joint",
+        "left_hand_thumb_0_joint",
+        "left_hand_thumb_1_joint",
+        "left_hand_thumb_2_joint",
+        "left_hand_middle_0_joint",
+        "left_hand_middle_1_joint",
+        "left_hand_index_0_joint",
+        "left_hand_index_1_joint",
+        "right_shoulder_pitch_joint",
+        "right_shoulder_roll_joint",
+        "right_shoulder_yaw_joint",
+        "right_elbow_joint",
+        "right_wrist_roll_joint",
+        "right_wrist_pitch_joint",
+        "right_wrist_yaw_joint",
+        "right_hand_thumb_0_joint",
+        "right_hand_thumb_1_joint",
+        "right_hand_thumb_2_joint",
+        "right_hand_middle_0_joint",
+        "right_hand_middle_1_joint",
+        "right_hand_index_0_joint",
+        "right_hand_index_1_joint",
+    ],
+    upper_left_arm_dof_names=[
+        "left_shoulder_pitch_joint",
+        "left_shoulder_roll_joint",
+        "left_shoulder_yaw_joint",
+        "left_elbow_joint",
+        "left_wrist_roll_joint",
+        "left_wrist_pitch_joint",
+        "left_wrist_yaw_joint",
+        "left_hand_thumb_0_joint",
+        "left_hand_thumb_1_joint",
+        "left_hand_thumb_2_joint",
+        "left_hand_middle_0_joint",
+        "left_hand_middle_1_joint",
+        "left_hand_index_0_joint",
+        "left_hand_index_1_joint",
+    ],
+    upper_right_arm_dof_names=[
+        "right_shoulder_pitch_joint",
+        "right_shoulder_roll_joint",
+        "right_shoulder_yaw_joint",
+        "right_elbow_joint",
+        "right_wrist_roll_joint",
+        "right_wrist_pitch_joint",
+        "right_wrist_yaw_joint",
+        "right_hand_thumb_0_joint",
+        "right_hand_thumb_1_joint",
+        "right_hand_thumb_2_joint",
+        "right_hand_middle_0_joint",
+        "right_hand_middle_1_joint",
+        "right_hand_index_0_joint",
+        "right_hand_index_1_joint",
+    ],
+    lower_dof_names=[
+        "left_hip_pitch_joint",
+        "left_hip_roll_joint",
+        "left_hip_yaw_joint",
+        "left_knee_joint",
+        "left_ankle_pitch_joint",
+        "left_ankle_roll_joint",
+        "right_hip_pitch_joint",
+        "right_hip_roll_joint",
+        "right_hip_yaw_joint",
+        "right_knee_joint",
+        "right_ankle_pitch_joint",
+        "right_ankle_roll_joint",
+    ],
+    has_torso=True,
+    has_upper_body_dof=True,
+    left_ankle_dof_names=["left_ankle_pitch_joint", "left_ankle_roll_joint"],
+    right_ankle_dof_names=["right_ankle_pitch_joint", "right_ankle_roll_joint"],
+    knee_dof_names=["left_knee_joint", "right_knee_joint"],
+    hips_dof_names=[
+        "left_hip_pitch_joint",
+        "left_hip_roll_joint",
+        "left_hip_yaw_joint",
+        "right_hip_pitch_joint",
+        "right_hip_roll_joint",
+        "right_hip_yaw_joint",
+    ],
+    dof_pos_lower_limit_list=[
+        # Legs (0-11)
+        -2.5307,  # left_hip_pitch
+        -0.5236,  # left_hip_roll
+        -2.7576,  # left_hip_yaw
+        -0.087267,  # left_knee
+        -0.87267,  # left_ankle_pitch
+        -0.2618,  # left_ankle_roll
+        -2.5307,  # right_hip_pitch
+        -2.9671,  # right_hip_roll
+        -2.7576,  # right_hip_yaw
+        -0.087267,  # right_knee
+        -0.87267,  # right_ankle_pitch
+        -0.2618,  # right_ankle_roll
+        # Waist (12-14)
+        -2.618,  # waist_yaw
+        -0.52,  # waist_roll
+        -0.52,  # waist_pitch
+        # Left arm (15-21)
+        -3.0892,  # left_shoulder_pitch
+        -1.5882,  # left_shoulder_roll
+        -2.618,  # left_shoulder_yaw
+        -1.0472,  # left_elbow
+        -1.97222,  # left_wrist_roll
+        -1.61443,  # left_wrist_pitch
+        -1.61443,  # left_wrist_yaw
+        # Left hand (22-28)
+        -1.0472,  # left_hand_thumb_0
+        -0.724312,  # left_hand_thumb_1
+        0.0,  # left_hand_thumb_2
+        -1.5708,  # left_hand_middle_0
+        -1.74533,  # left_hand_middle_1
+        -1.5708,  # left_hand_index_0
+        -1.74533,  # left_hand_index_1
+        # Right arm (29-35)
+        -3.0892,  # right_shoulder_pitch
+        -2.2515,  # right_shoulder_roll
+        -2.618,  # right_shoulder_yaw
+        -1.0472,  # right_elbow
+        -1.97222,  # right_wrist_roll
+        -1.61443,  # right_wrist_pitch
+        -1.61443,  # right_wrist_yaw
+        # Right hand (36-42)
+        -1.0472,  # right_hand_thumb_0
+        -1.0472,  # right_hand_thumb_1
+        -1.74533,  # right_hand_thumb_2
+        0.0,  # right_hand_middle_0
+        0.0,  # right_hand_middle_1
+        0.0,  # right_hand_index_0
+        0.0,  # right_hand_index_1
+    ],
+    dof_pos_upper_limit_list=[
+        # Legs (0-11)
+        2.8798,  # left_hip_pitch
+        2.9671,  # left_hip_roll
+        2.7576,  # left_hip_yaw
+        2.8798,  # left_knee
+        0.5236,  # left_ankle_pitch
+        0.2618,  # left_ankle_roll
+        2.8798,  # right_hip_pitch
+        0.5236,  # right_hip_roll
+        2.7576,  # right_hip_yaw
+        2.8798,  # right_knee
+        0.5236,  # right_ankle_pitch
+        0.2618,  # right_ankle_roll
+        # Waist (12-14)
+        2.618,  # waist_yaw
+        0.52,  # waist_roll
+        0.52,  # waist_pitch
+        # Left arm (15-21)
+        2.6704,  # left_shoulder_pitch
+        2.2515,  # left_shoulder_roll
+        2.618,  # left_shoulder_yaw
+        2.0944,  # left_elbow
+        1.97222,  # left_wrist_roll
+        1.61443,  # left_wrist_pitch
+        1.61443,  # left_wrist_yaw
+        # Left hand (22-28)
+        1.0472,  # left_hand_thumb_0
+        1.0472,  # left_hand_thumb_1
+        1.74533,  # left_hand_thumb_2
+        0.0,  # left_hand_middle_0
+        0.0,  # left_hand_middle_1
+        0.0,  # left_hand_index_0
+        0.0,  # left_hand_index_1
+        # Right arm (29-35)
+        2.6704,  # right_shoulder_pitch
+        1.5882,  # right_shoulder_roll
+        2.618,  # right_shoulder_yaw
+        2.0944,  # right_elbow
+        1.97222,  # right_wrist_roll
+        1.61443,  # right_wrist_pitch
+        1.61443,  # right_wrist_yaw
+        # Right hand (36-42)
+        1.0472,  # right_hand_thumb_0
+        0.724312,  # right_hand_thumb_1
+        0.0,  # right_hand_thumb_2
+        1.5708,  # right_hand_middle_0
+        1.74533,  # right_hand_middle_1
+        1.5708,  # right_hand_index_0
+        1.74533,  # right_hand_index_1
+    ],
+    dof_vel_limit_list=[
+        # Legs (0-11)
+        32.0,  # left_hip_pitch
+        20.0,  # left_hip_roll
+        32.0,  # left_hip_yaw
+        20.0,  # left_knee
+        37.0,  # left_ankle_pitch
+        37.0,  # left_ankle_roll
+        32.0,  # right_hip_pitch
+        20.0,  # right_hip_roll
+        32.0,  # right_hip_yaw
+        20.0,  # right_knee
+        37.0,  # right_ankle_pitch
+        37.0,  # right_ankle_roll
+        # Waist (12-14)
+        32.0,  # waist_yaw
+        37.0,  # waist_roll
+        37.0,  # waist_pitch
+        # Left arm (15-21)
+        37.0,  # left_shoulder_pitch
+        37.0,  # left_shoulder_roll
+        37.0,  # left_shoulder_yaw
+        37.0,  # left_elbow
+        37.0,  # left_wrist_roll
+        22.0,  # left_wrist_pitch
+        22.0,  # left_wrist_yaw
+        # Left hand (22-28)
+        22.0,  # left_hand_thumb_0
+        22.0,  # left_hand_thumb_1
+        22.0,  # left_hand_thumb_2
+        22.0,  # left_hand_middle_0
+        22.0,  # left_hand_middle_1
+        22.0,  # left_hand_index_0
+        22.0,  # left_hand_index_1
+        # Right arm (29-35)
+        37.0,  # right_shoulder_pitch
+        37.0,  # right_shoulder_roll
+        37.0,  # right_shoulder_yaw
+        37.0,  # right_elbow
+        37.0,  # right_wrist_roll
+        22.0,  # right_wrist_pitch
+        22.0,  # right_wrist_yaw
+        # Right hand (36-42)
+        22.0,  # right_hand_thumb_0
+        22.0,  # right_hand_thumb_1
+        22.0,  # right_hand_thumb_2
+        22.0,  # right_hand_middle_0
+        22.0,  # right_hand_middle_1
+        22.0,  # right_hand_index_0
+        22.0,  # right_hand_index_1
+    ],
+    dof_effort_limit_list=[
+        # Legs (0-11)
+        88.0,  # left_hip_pitch
+        139.0,  # left_hip_roll
+        88.0,  # left_hip_yaw
+        139.0,  # left_knee
+        50.0,  # left_ankle_pitch
+        50.0,  # left_ankle_roll
+        88.0,  # right_hip_pitch
+        139.0,  # right_hip_roll
+        88.0,  # right_hip_yaw
+        139.0,  # right_knee
+        50.0,  # right_ankle_pitch
+        50.0,  # right_ankle_roll
+        # Waist (12-14)
+        88.0,  # waist_yaw
+        50.0,  # waist_roll
+        50.0,  # waist_pitch
+        # Left arm (15-21)
+        25.0,  # left_shoulder_pitch
+        25.0,  # left_shoulder_roll
+        25.0,  # left_shoulder_yaw
+        25.0,  # left_elbow
+        25.0,  # left_wrist_roll
+        5.0,  # left_wrist_pitch
+        5.0,  # left_wrist_yaw
+        # Left hand (22-28)
+        2.45,  # left_hand_thumb_0
+        1.4,  # left_hand_thumb_1
+        1.4,  # left_hand_thumb_2
+        1.4,  # left_hand_middle_0
+        1.4,  # left_hand_middle_1
+        1.4,  # left_hand_index_0
+        1.4,  # left_hand_index_1
+        # Right arm (29-35)
+        25.0,  # right_shoulder_pitch
+        25.0,  # right_shoulder_roll
+        25.0,  # right_shoulder_yaw
+        25.0,  # right_elbow
+        25.0,  # right_wrist_roll
+        5.0,  # right_wrist_pitch
+        5.0,  # right_wrist_yaw
+        # Right hand (36-42)
+        2.45,  # right_hand_thumb_0
+        1.4,  # right_hand_thumb_1
+        1.4,  # right_hand_thumb_2
+        1.4,  # right_hand_middle_0
+        1.4,  # right_hand_middle_1
+        1.4,  # right_hand_index_0
+        1.4,  # right_hand_index_1
+    ],
+    dof_armature_list=[
+        # Legs (0-11)
+        0.010177520,  # left_hip_pitch
+        0.025101925,  # left_hip_roll
+        0.010177520,  # left_hip_yaw
+        0.025101925,  # left_knee
+        0.007219450,  # left_ankle_pitch
+        0.007219450,  # left_ankle_roll
+        0.010177520,  # right_hip_pitch
+        0.025101925,  # right_hip_roll
+        0.010177520,  # right_hip_yaw
+        0.025101925,  # right_knee
+        0.007219450,  # right_ankle_pitch
+        0.007219450,  # right_ankle_roll
+        # Waist (12-14)
+        0.010177520,  # waist_yaw
+        0.007219450,  # waist_roll
+        0.007219450,  # waist_pitch
+        # Left arm (15-21)
+        0.003609725,  # left_shoulder_pitch
+        0.003609725,  # left_shoulder_roll
+        0.003609725,  # left_shoulder_yaw
+        0.003609725,  # left_elbow
+        0.003609725,  # left_wrist_roll
+        0.00425,  # left_wrist_pitch
+        0.00425,  # left_wrist_yaw
+        # Left hand (22-28)
+        0.003,  # left_hand_thumb_0
+        0.003,  # left_hand_thumb_1
+        0.003,  # left_hand_thumb_2
+        0.003,  # left_hand_middle_0
+        0.003,  # left_hand_middle_1
+        0.003,  # left_hand_index_0
+        0.003,  # left_hand_index_1
+        # Right arm (29-35)
+        0.003609725,  # right_shoulder_pitch
+        0.003609725,  # right_shoulder_roll
+        0.003609725,  # right_shoulder_yaw
+        0.003609725,  # right_elbow
+        0.003609725,  # right_wrist_roll
+        0.00425,  # right_wrist_pitch
+        0.00425,  # right_wrist_yaw
+        # Right hand (36-42)
+        0.003,  # right_hand_thumb_0
+        0.003,  # right_hand_thumb_1
+        0.003,  # right_hand_thumb_2
+        0.003,  # right_hand_middle_0
+        0.003,  # right_hand_middle_1
+        0.003,  # right_hand_index_0
+        0.003,  # right_hand_index_1
+    ],
+    dof_joint_friction_list=[0.0] * 43,
+    body_names=[
+        "pelvis",
+        "left_hip_pitch_link",
+        "left_hip_roll_link",
+        "left_hip_yaw_link",
+        "left_knee_link",
+        "left_ankle_pitch_link",
+        "left_ankle_roll_link",
+        "left_foot_contact_point",
+        "right_hip_pitch_link",
+        "right_hip_roll_link",
+        "right_hip_yaw_link",
+        "right_knee_link",
+        "right_ankle_pitch_link",
+        "right_ankle_roll_link",
+        "right_foot_contact_point",
+        "waist_yaw_link",
+        "waist_roll_link",
+        "torso_link",
+        "left_shoulder_pitch_link",
+        "left_shoulder_roll_link",
+        "left_shoulder_yaw_link",
+        "left_elbow_link",
+        "left_wrist_roll_link",
+        "left_wrist_pitch_link",
+        "left_wrist_yaw_link",
+        "left_hand_thumb_0_link",
+        "left_hand_thumb_1_link",
+        "left_hand_thumb_2_link",
+        "left_hand_middle_0_link",
+        "left_hand_middle_1_link",
+        "left_hand_index_0_link",
+        "left_hand_index_1_link",
+        "right_shoulder_pitch_link",
+        "right_shoulder_roll_link",
+        "right_shoulder_yaw_link",
+        "right_elbow_link",
+        "right_wrist_roll_link",
+        "right_wrist_pitch_link",
+        "right_wrist_yaw_link",
+        "right_hand_thumb_0_link",
+        "right_hand_thumb_1_link",
+        "right_hand_thumb_2_link",
+        "right_hand_middle_0_link",
+        "right_hand_middle_1_link",
+        "right_hand_index_0_link",
+        "right_hand_index_1_link",
+    ],
+    terminate_after_contacts_on=["pelvis", "shoulder", "hip"],
+    penalize_contacts_on=["pelvis", "shoulder", "hip"],
+    init_state=RobotInitState(
+        pos=[0.0, 0.0, 0.8],  # x,y,z [m]
+        rot=[0.0, 0.0, 0.0, 1.0],  # x,y,z,w [quat]
+        lin_vel=[0.0, 0.0, 0.0],  # x,y,z [m/s]
+        ang_vel=[0.0, 0.0, 0.0],  # x,y,z [rad/s]
+        default_joint_angles={
+            "left_hip_pitch_joint": -0.312,
+            "left_hip_roll_joint": 0.0,
+            "left_hip_yaw_joint": 0.0,
+            "left_knee_joint": 0.669,
+            "left_ankle_pitch_joint": -0.363,
+            "left_ankle_roll_joint": 0.0,
+            "right_hip_pitch_joint": -0.312,
+            "right_hip_roll_joint": 0.0,
+            "right_hip_yaw_joint": 0.0,
+            "right_knee_joint": 0.669,
+            "right_ankle_pitch_joint": -0.363,
+            "right_ankle_roll_joint": 0.0,
+            "waist_yaw_joint": 0.0,
+            "waist_roll_joint": 0.0,
+            "waist_pitch_joint": 0.0,
+            "left_shoulder_pitch_joint": 0.2,
+            "left_shoulder_roll_joint": 0.2,
+            "left_shoulder_yaw_joint": 0.0,
+            "left_elbow_joint": 0.6,
+            "left_wrist_roll_joint": 0.0,
+            "left_wrist_pitch_joint": 0.0,
+            "left_wrist_yaw_joint": 0.0,
+            "left_hand_thumb_0_joint": 0.0,
+            "left_hand_thumb_1_joint": 0.9,
+            "left_hand_thumb_2_joint": 1.6,
+            "left_hand_middle_0_joint": -1.57,
+            "left_hand_middle_1_joint": -1.7,
+            "left_hand_index_0_joint": -1.57,
+            "left_hand_index_1_joint": -1.7,
+            "right_shoulder_pitch_joint": 0.2,
+            "right_shoulder_roll_joint": -0.2,
+            "right_shoulder_yaw_joint": 0.0,
+            "right_elbow_joint": 0.6,
+            "right_wrist_roll_joint": 0.0,
+            "right_wrist_pitch_joint": 0.0,
+            "right_wrist_yaw_joint": 0.0,
+            "right_hand_thumb_0_joint": 0.0,
+            "right_hand_thumb_1_joint": -1.0,
+            "right_hand_thumb_2_joint": -1.67,
+            "right_hand_middle_0_joint": 1.57,
+            "right_hand_middle_1_joint": 1.7,
+            "right_hand_index_0_joint": 1.57,
+            "right_hand_index_1_joint": 1.7,
+        },
+    ),
+    randomize_link_body_names=[
+        "pelvis",
+        "left_hip_yaw_link",
+        "left_hip_roll_link",
+        "left_hip_pitch_link",
+        "left_knee_link",
+        "right_hip_yaw_link",
+        "right_hip_roll_link",
+        "right_hip_pitch_link",
+        "right_knee_link",
+    ],
+    waist_dof_names=["waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint"],
+    waist_yaw_dof_name="waist_yaw_joint",
+    waist_roll_dof_name="waist_roll_joint",
+    waist_pitch_dof_name="waist_pitch_joint",
+    arm_dof_names=[
+        "left_shoulder_pitch_joint",
+        "left_shoulder_roll_joint",
+        "left_shoulder_yaw_joint",
+        "left_elbow_joint",
+        "left_wrist_roll_joint",
+        "left_wrist_pitch_joint",
+        "left_wrist_yaw_joint",
+        "left_hand_thumb_0_joint",
+        "left_hand_thumb_1_joint",
+        "left_hand_thumb_2_joint",
+        "left_hand_middle_0_joint",
+        "left_hand_middle_1_joint",
+        "left_hand_index_0_joint",
+        "left_hand_index_1_joint",
+        "right_shoulder_pitch_joint",
+        "right_shoulder_roll_joint",
+        "right_shoulder_yaw_joint",
+        "right_elbow_joint",
+        "right_wrist_roll_joint",
+        "right_wrist_pitch_joint",
+        "right_wrist_yaw_joint",
+        "right_hand_thumb_0_joint",
+        "right_hand_thumb_1_joint",
+        "right_hand_thumb_2_joint",
+        "right_hand_middle_0_joint",
+        "right_hand_middle_1_joint",
+        "right_hand_index_0_joint",
+        "right_hand_index_1_joint",
+    ],
+    left_arm_dof_names=[
+        "left_shoulder_pitch_joint",
+        "left_shoulder_roll_joint",
+        "left_shoulder_yaw_joint",
+        "left_elbow_joint",
+        "left_wrist_roll_joint",
+        "left_wrist_pitch_joint",
+        "left_wrist_yaw_joint",
+        "left_hand_thumb_0_joint",
+        "left_hand_thumb_1_joint",
+        "left_hand_thumb_2_joint",
+        "left_hand_middle_0_joint",
+        "left_hand_middle_1_joint",
+        "left_hand_index_0_joint",
+        "left_hand_index_1_joint",
+    ],
+    right_arm_dof_names=[
+        "right_shoulder_pitch_joint",
+        "right_shoulder_roll_joint",
+        "right_shoulder_yaw_joint",
+        "right_elbow_joint",
+        "right_wrist_roll_joint",
+        "right_wrist_pitch_joint",
+        "right_wrist_yaw_joint",
+        "right_hand_thumb_0_joint",
+        "right_hand_thumb_1_joint",
+        "right_hand_thumb_2_joint",
+        "right_hand_middle_0_joint",
+        "right_hand_middle_1_joint",
+        "right_hand_index_0_joint",
+        "right_hand_index_1_joint",
+    ],
+    symmetry_joint_names={
+        # Lower body joints
+        "left_hip_pitch_joint": "right_hip_pitch_joint",
+        "left_hip_roll_joint": "right_hip_roll_joint",
+        "left_hip_yaw_joint": "right_hip_yaw_joint",
+        "left_knee_joint": "right_knee_joint",
+        "left_ankle_pitch_joint": "right_ankle_pitch_joint",
+        "left_ankle_roll_joint": "right_ankle_roll_joint",
+        "right_hip_pitch_joint": "left_hip_pitch_joint",
+        "right_hip_roll_joint": "left_hip_roll_joint",
+        "right_hip_yaw_joint": "left_hip_yaw_joint",
+        "right_knee_joint": "left_knee_joint",
+        "right_ankle_pitch_joint": "left_ankle_pitch_joint",
+        "right_ankle_roll_joint": "left_ankle_roll_joint",
+        # Upper body joints
+        "left_shoulder_pitch_joint": "right_shoulder_pitch_joint",
+        "left_shoulder_roll_joint": "right_shoulder_roll_joint",
+        "left_shoulder_yaw_joint": "right_shoulder_yaw_joint",
+        "left_elbow_joint": "right_elbow_joint",
+        "left_wrist_roll_joint": "right_wrist_roll_joint",
+        "left_wrist_pitch_joint": "right_wrist_pitch_joint",
+        "left_wrist_yaw_joint": "right_wrist_yaw_joint",
+        "right_shoulder_pitch_joint": "left_shoulder_pitch_joint",
+        "right_shoulder_roll_joint": "left_shoulder_roll_joint",
+        "right_shoulder_yaw_joint": "left_shoulder_yaw_joint",
+        "right_elbow_joint": "left_elbow_joint",
+        "right_wrist_roll_joint": "left_wrist_roll_joint",
+        "right_wrist_pitch_joint": "left_wrist_pitch_joint",
+        "right_wrist_yaw_joint": "left_wrist_yaw_joint",
+        # Hand joints
+        "left_hand_thumb_0_joint": "right_hand_thumb_0_joint",
+        "left_hand_thumb_1_joint": "right_hand_thumb_1_joint",
+        "left_hand_thumb_2_joint": "right_hand_thumb_2_joint",
+        "left_hand_middle_0_joint": "right_hand_middle_0_joint",
+        "left_hand_middle_1_joint": "right_hand_middle_1_joint",
+        "left_hand_index_0_joint": "right_hand_index_0_joint",
+        "left_hand_index_1_joint": "right_hand_index_1_joint",
+        "right_hand_thumb_0_joint": "left_hand_thumb_0_joint",
+        "right_hand_thumb_1_joint": "left_hand_thumb_1_joint",
+        "right_hand_thumb_2_joint": "left_hand_thumb_2_joint",
+        "right_hand_middle_0_joint": "left_hand_middle_0_joint",
+        "right_hand_middle_1_joint": "left_hand_middle_1_joint",
+        "right_hand_index_0_joint": "left_hand_index_0_joint",
+        "right_hand_index_1_joint": "left_hand_index_1_joint",
+        # Central joints (map to themselves)
+        "waist_yaw_joint": "waist_yaw_joint",
+        "waist_roll_joint": "waist_roll_joint",
+        "waist_pitch_joint": "waist_pitch_joint",
+    },
+    flip_sign_joint_names=[
+        # Hip roll and yaw joints
+        "left_hip_roll_joint",
+        "left_hip_yaw_joint",
+        "right_hip_roll_joint",
+        "right_hip_yaw_joint",
+        # Ankle roll joints
+        "left_ankle_roll_joint",
+        "right_ankle_roll_joint",
+        # Waist roll and yaw joints
+        "waist_roll_joint",
+        "waist_yaw_joint",
+        # Shoulder roll and yaw joints
+        "left_shoulder_roll_joint",
+        "left_shoulder_yaw_joint",
+        "right_shoulder_roll_joint",
+        "right_shoulder_yaw_joint",
+        # Wrist roll and yaw joints
+        "left_wrist_roll_joint",
+        "left_wrist_yaw_joint",
+        "right_wrist_roll_joint",
+        "right_wrist_yaw_joint",
+        # Hand joints that need sign flip (thumb_1 and all z-axis rotations)
+        "left_hand_thumb_1_joint",
+        "left_hand_thumb_2_joint",
+        "left_hand_middle_0_joint",
+        "left_hand_middle_1_joint",
+        "left_hand_index_0_joint",
+        "left_hand_index_1_joint",
+        "right_hand_thumb_1_joint",
+        "right_hand_thumb_2_joint",
+        "right_hand_middle_0_joint",
+        "right_hand_middle_1_joint",
+        "right_hand_index_0_joint",
+        "right_hand_index_1_joint",
+    ],
+    apply_dof_armature_in_isaacgym=True,
+    contact_pairs_multiplier=16,
+    control=RobotControlConfig(
+        control_type="P",
+        stiffness={
+            "hip_yaw": 40.179238471,
+            "hip_roll": 99.098427777,
+            "hip_pitch": 40.179238471,
+            "knee": 99.098427777,
+            "ankle_pitch": 28.501246196,
+            "ankle_roll": 28.501246196,
+            "waist_yaw": 40.179238471,
+            "waist_roll": 28.501246196,
+            "waist_pitch": 28.501246196,
+            "shoulder_pitch": 14.250623098,
+            "shoulder_roll": 14.250623098,
+            "shoulder_yaw": 14.250623098,
+            "elbow": 14.250623098,
+            "wrist_roll": 14.250623098,
+            "wrist_pitch": 16.778327481,
+            "wrist_yaw": 16.778327481,
+            "hand_thumb_0": 10.0,
+            "hand_thumb_1": 5.0,
+            "hand_thumb_2": 5.0,
+            "hand_middle_0": 5.0,
+            "hand_middle_1": 5.0,
+            "hand_index_0": 5.0,
+            "hand_index_1": 5.0,
+        },
+        damping={
+            "hip_yaw": 2.557889765,
+            "hip_roll": 6.308801854,
+            "hip_pitch": 2.557889765,
+            "knee": 6.308801854,
+            "ankle_pitch": 1.814445687,
+            "ankle_roll": 1.814445687,
+            "waist_yaw": 2.557889765,
+            "waist_roll": 1.814445687,
+            "waist_pitch": 1.814445687,
+            "shoulder_pitch": 0.907222843,
+            "shoulder_roll": 0.907222843,
+            "shoulder_yaw": 0.907222843,
+            "elbow": 0.907222843,
+            "wrist_roll": 0.907222843,
+            "wrist_pitch": 1.068141502,
+            "wrist_yaw": 1.068141502,
+            "hand_thumb_0": 0.5,
+            "hand_thumb_1": 0.3,
+            "hand_thumb_2": 0.3,
+            "hand_middle_0": 0.3,
+            "hand_middle_1": 0.3,
+            "hand_index_0": 0.3,
+            "hand_index_1": 0.3,
+        },
+        action_scale=0.25,
+        action_clip_value=100.0,
+        clip_actions=True,
+        clip_torques=True,
+    ),
+    asset=RobotAssetConfig(
+        asset_root="@holosoma/data/robots",
+        collapse_fixed_joints=True,
+        replace_cylinder_with_capsule=True,
+        flip_visual_attachments=False,
+        armature=0.001,
+        thickness=0.01,
+        max_angular_velocity=1000.0,
+        max_linear_velocity=1000.0,
+        angular_damping=0.0,
+        linear_damping=0.0,
+        urdf_file="g1/g1_43dof.urdf",
+        usd_file=None,
+        xml_file="g1/g1_43dof.xml",
+        robot_type="g1_43dof",
+        enable_self_collisions=False,
+        default_dof_drive_mode=3,
+        fix_base_link=False,
+    ),
+    bridge=RobotBridgeConfig(
+        sdk_type="unitree",
+        motor_type="serial",
+    ),
+    has_hands=True,
+    num_hand_dofs=7,
+)
+
+
 DEFAULTS = {
     "g1_29dof": g1_29dof,
+    "g1_43dof": g1_43dof,
     "t1_29dof_waist_wrist": t1_29dof_waist_wrist,
     "g1_29dof_w_object": g1_29dof_w_object,
 }

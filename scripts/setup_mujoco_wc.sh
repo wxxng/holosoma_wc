@@ -49,9 +49,9 @@ done
 
 # Create overall workspace
 source ${SCRIPT_DIR}/source_common.sh
-ENV_ROOT=$CONDA_ROOT/envs/holomujoco
-SENTINEL_FILE=${WORKSPACE_DIR}/.env_setup_finished_mujoco
-WARP_SENTINEL_FILE=${WORKSPACE_DIR}/.env_setup_finished_mujoco_warp
+ENV_ROOT=$CONDA_ROOT/envs/holomujoco_wc
+SENTINEL_FILE=${WORKSPACE_DIR}/.env_setup_finished_mujoco_wc
+WARP_SENTINEL_FILE=${WORKSPACE_DIR}/.env_setup_finished_mujoco_warp_wc
 
 mkdir -p $WORKSPACE_DIR
 
@@ -69,10 +69,10 @@ if [[ ! -f $SENTINEL_FILE ]]; then
     $CONDA_ROOT/bin/conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
     $CONDA_ROOT/bin/conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
     $CONDA_ROOT/bin/conda install -y mamba -c conda-forge -n base
-    MAMBA_ROOT_PREFIX=$CONDA_ROOT $CONDA_ROOT/bin/mamba create -y -n holomujoco python=3.10 -c conda-forge --override-channels
+    MAMBA_ROOT_PREFIX=$CONDA_ROOT $CONDA_ROOT/bin/mamba create -y -n holomujoco_wc python=3.10 -c conda-forge --override-channels
   fi
 
-  source $CONDA_ROOT/bin/activate holomujoco
+  source $CONDA_ROOT/bin/activate holomujoco_wc
 
   # Install system dependencies for MuJoCo
   # Note: These may require sudo access - document this requirement
@@ -181,7 +181,7 @@ if [[ "$INSTALL_WARP" == "true" ]] && [[ ! -f $WARP_SENTINEL_FILE ]]; then
   echo "Installing MuJoCo Warp (GPU acceleration)..."
 
   # Ensure conda environment is activated
-  source $CONDA_ROOT/bin/activate holomujoco
+  source $CONDA_ROOT/bin/activate holomujoco_wc
 
   # Check NVIDIA driver version (required for CUDA 12.4+)
   MIN_DRIVER_VERSION="550.54.14"
