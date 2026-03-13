@@ -18,6 +18,8 @@ OBJECT_STATE_UDP_PORT = 10002
 OBJECT_STATE_UDP_HOST = "127.0.0.1"
 ROBOT_STATE_UDP_PORT = 10003
 ROBOT_STATE_UDP_HOST = "127.0.0.1"
+TABLE_COMMAND_UDP_PORT = 10004
+TABLE_COMMAND_UDP_HOST = "127.0.0.1"
 
 
 class UnitreeSdk2Bridge(BasicSdk2Bridge):
@@ -58,6 +60,10 @@ class UnitreeSdk2Bridge(BasicSdk2Bridge):
         self._robot_state_sock = None
         self._robot_state_addr = None
         self._robot_state_warned = False
+        self._table_command_sock = None
+        self._table_missing_warned = False
+        self._table_actor_available = None
+        self._table_body_id = None
         if interface_name == "lo":
             self._object_state_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self._object_state_addr = (OBJECT_STATE_UDP_HOST, OBJECT_STATE_UDP_PORT)
@@ -69,6 +75,17 @@ class UnitreeSdk2Bridge(BasicSdk2Bridge):
             logger.info(
                 f"Robot state UDP publisher enabled on {ROBOT_STATE_UDP_HOST}:{ROBOT_STATE_UDP_PORT}"
             )
+            try:
+                self._table_command_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                self._table_command_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                self._table_command_sock.bind((TABLE_COMMAND_UDP_HOST, TABLE_COMMAND_UDP_PORT))
+                self._table_command_sock.setblocking(False)
+                logger.info(
+                    f"Table command UDP receiver enabled on {TABLE_COMMAND_UDP_HOST}:{TABLE_COMMAND_UDP_PORT}"
+                )
+            except OSError as exc:
+                self._table_command_sock = None
+                logger.warning(f"Failed to init table command UDP receiver: {exc}")
 
     def _init_standard_components(self, robot_type, interface_name):
         """Initialize standard (non-hands) SDK components."""
@@ -166,6 +183,7 @@ class UnitreeSdk2Bridge(BasicSdk2Bridge):
 
     def _publish_low_state_standard(self):
         """Publish state for standard robots (no hands)."""
+        self._poll_table_commands()
         # Get simulator data
         positions, velocities, accelerations = self._get_dof_states()
         actuator_forces = self._get_actuator_forces()
@@ -199,6 +217,8 @@ class UnitreeSdk2Bridge(BasicSdk2Bridge):
     def _publish_low_state_with_hands(self):
         """Publish state for 43 DOF robots (29 body + 14 hands)."""
         from unitree_interface import HandState
+
+        self._poll_table_commands()
 
         # Read body commands from C++ interface (if any new commands available)
         self.low_cmd_handler()
@@ -389,3 +409,115 @@ class UnitreeSdk2Bridge(BasicSdk2Bridge):
             return
         state = states[0].detach().cpu().numpy().astype(np.float32, copy=False)
         self._robot_state_sock.sendto(state.tobytes(), self._robot_state_addr)
+
+    @staticmethod
+    def _wxyz_to_xyzw(quat_wxyz: np.ndarray) -> np.ndarray:
+        q = np.asarray(quat_wxyz, dtype=np.float32).reshape(-1)
+        if q.size != 4:
+            raise ValueError(f"Expected 4 quaternion values, got shape {q.shape}")
+        return np.array([q[1], q[2], q[3], q[0]], dtype=np.float32)
+
+    def _poll_table_commands(self) -> None:
+        if self._table_command_sock is None:
+            return
+        while True:
+            try:
+                data, _addr = self._table_command_sock.recvfrom(8 * 4)
+            except BlockingIOError:
+                break
+            if not data:
+                continue
+            packet = np.frombuffer(data, dtype=np.float32)
+            if packet.size < 1:
+                continue
+            cmd_id = int(round(float(packet[0])))
+            if cmd_id == 1 and packet.size >= 8:
+                pos = packet[1:4].astype(np.float32, copy=True)
+                quat_wxyz = packet[4:8].astype(np.float32, copy=True)
+                self._apply_table_pose(pos, quat_wxyz)
+            elif cmd_id == 2:
+                self._remove_table()
+
+    def _get_table_state(self):
+        if self._table_actor_available is False:
+            return None
+        try:
+            states = self.simulator.get_actor_states(["table"], env_ids=None)
+        except Exception:
+            self._table_actor_available = False
+            if not self._table_missing_warned:
+                logger.warning(
+                    "Table is not registered as actor state; using static-body fallback update for 'table'."
+                )
+                self._table_missing_warned = True
+            return None
+        if states is None or states.numel() == 0:
+            self._table_actor_available = False
+            return None
+        self._table_actor_available = True
+        return states
+
+    def _apply_table_pose_static_body(self, pos_xyz: np.ndarray, quat_wxyz: np.ndarray) -> bool:
+        """Fallback path for static MuJoCo table body without freejoint actor state."""
+        root_model = getattr(self.simulator, "root_model", None)
+        root_data = getattr(self.simulator, "root_data", None)
+        if root_model is None or root_data is None:
+            return False
+
+        try:
+            import mujoco
+        except Exception:
+            return False
+
+        if self._table_body_id is None:
+            body_name = "table"
+            body_id = mujoco.mj_name2id(root_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+            if body_id < 0 and hasattr(self.simulator, "_get_prefixed_name"):
+                prefixed = self.simulator._get_prefixed_name(body_name)
+                body_id = mujoco.mj_name2id(root_model, mujoco.mjtObj.mjOBJ_BODY, prefixed)
+            self._table_body_id = int(body_id)
+
+        if self._table_body_id < 0:
+            return False
+
+        root_model.body_pos[self._table_body_id] = np.asarray(pos_xyz, dtype=np.float32)
+        root_model.body_quat[self._table_body_id] = np.asarray(quat_wxyz, dtype=np.float32)
+        # Reflect model-body pose edits in runtime body transforms.
+        mujoco.mj_kinematics(root_model, root_data)
+        return True
+
+    def _apply_table_pose(self, pos_xyz: np.ndarray, quat_wxyz: np.ndarray) -> None:
+        quat = np.asarray(quat_wxyz, dtype=np.float32).reshape(-1)
+        norm = float(np.linalg.norm(quat))
+        if norm <= 0.0:
+            quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        else:
+            quat = quat / norm
+
+        table_states = self._get_table_state()
+        if table_states is None:
+            self._apply_table_pose_static_body(pos_xyz, quat)
+            return
+
+        quat_xyzw = self._wxyz_to_xyzw(quat)
+
+        new_states = table_states.clone()
+        new_states[0, 0:3] = new_states.new_tensor(pos_xyz, dtype=new_states.dtype)
+        new_states[0, 3:7] = new_states.new_tensor(quat_xyzw, dtype=new_states.dtype)
+        new_states[0, 7:13] = 0.0
+
+        self.simulator.set_actor_states(["table"], env_ids=None, states=new_states)
+
+    def _remove_table(self) -> None:
+        table_states = self._get_table_state()
+        if table_states is None:
+            # Static table fallback: move table body below ground.
+            self._apply_table_pose_static_body(
+                np.array([0.0, 0.0, -5.0], dtype=np.float32),
+                np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+            )
+            return
+        new_states = table_states.clone()
+        new_states[0, 2] = -5.0
+        new_states[0, 7:13] = 0.0
+        self.simulator.set_actor_states(["table"], env_ids=None, states=new_states)

@@ -143,14 +143,15 @@ class BasePolicy:
     def _init_communication_components(self):
         """Initialize appropriate robot interface."""
 
-        # 43-DOF robots require InterfaceWrapper (supports get_full_state_43dof, hand interfaces, etc.)
-        if self.robot_config.num_joints == 43:
+        # Use InterfaceWrapper for all Unitree robots (including 29-DOF),
+        # and keep the existing 43-DOF path for hand/full-state support.
+        if self.robot_config.sdk_type == "unitree" or self.robot_config.num_joints == 43:
             self.interface = InterfaceWrapper(
                 self.robot_config,
                 domain_id=self.config.task.domain_id,
                 interface_str=self.config.task.interface,
                 use_joystick=self.config.task.use_joystick,
-                use_hands=True,
+                use_hands=(self.robot_config.num_joints == 43),
             )
         else:
             self.interface = create_interface(
@@ -506,12 +507,17 @@ class BasePolicy:
             self.robot_config = replace(
                 self.robot_config, motor_kp=tuple(kp_values.tolist()), motor_kd=tuple(kd_values.tolist())
             )
-            # Update InterfaceWrapper's robot_config reference since replace() creates a new object
-            self.interface.robot_config = self.robot_config
+            # Propagate updated config to active interface since replace() creates a new object.
+            if hasattr(self.interface, "update_config"):
+                self.interface.update_config(self.robot_config)
+            else:
+                self.interface.robot_config = self.robot_config
             # Update sdk2py backend components (booster SDK only)
-            if self.interface.backend == "sdk2py":
-                self.interface.command_sender.config = self.robot_config
-                self.interface.state_processor.config = self.robot_config
+            if getattr(self.interface, "backend", None) == "sdk2py":
+                if hasattr(self.interface, "command_sender"):
+                    self.interface.command_sender.config = self.robot_config
+                if hasattr(self.interface, "state_processor"):
+                    self.interface.state_processor.config = self.robot_config
         else:
             # No values available - error
             raise ValueError(
@@ -770,7 +776,12 @@ class BasePolicy:
                         )
                     else:
                         raise NotImplementedError("Upper body controller not implemented")
-                q_target = scaled_policy_action  # + self.default_dof_angles
+                # Most policies output residual joint offsets around default pose.
+                # Tracking policies can opt into absolute joint commands.
+                if self.config.task.use_absolute_action:
+                    q_target = scaled_policy_action
+                else:
+                    q_target = scaled_policy_action + self.default_dof_angles
 
                 # Clip target positions to motor limits (in-place for speed)
                 if self.q_min_arr is not None and self.q_max_arr is not None:
@@ -786,7 +797,7 @@ class BasePolicy:
         # Stage 5: Action Pub
         with self.latency_tracker.measure("action_pub"):
             # Expand 29-DOF command to 43-DOF if needed (add hand defaults)
-            if self.num_dofs == 29:
+            if self.num_dofs == 29 and getattr(self.interface, "use_hands", False):
                 # Robot supports 43-DOF but policy only controls 29-DOF
                 # Insert hand defaults at correct positions in config order
                 cmd_q_43 = np.zeros(43, dtype=np.float32)
