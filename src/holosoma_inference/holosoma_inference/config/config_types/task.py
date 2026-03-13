@@ -58,6 +58,12 @@ class TaskConfig:
     print_observations: bool = False
     """Print observation vectors for debugging."""
 
+    motion_pkl_path: str | None = None
+    """Path to motion PKL file. If None, uses the default path in the policy."""
+
+    motion_clip_key: str | None = None
+    """Clip key to use from the motion PKL file. If None, uses the first clip."""
+
     motion_start_timestep: int = 0
     """Starting timestep for motion clip playback."""
 

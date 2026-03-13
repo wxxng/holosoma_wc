@@ -616,7 +616,15 @@ class BasePolicy:
                         )
                     else:
                         raise NotImplementedError("Upper body controller not implemented")
-                q_target = scaled_policy_action + self.default_dof_angles
+                actor_obs_terms = self.obs_dict.get("actor_obs", [])
+                is_g1_tracking = (
+                    self.config.robot.robot_type == "g1_29dof"
+                    and "motion_command_sequence" in actor_obs_terms
+                )
+                if is_g1_tracking:
+                    q_target = scaled_policy_action
+                else:
+                    q_target = scaled_policy_action + self.default_dof_angles
 
             # Prepare command (reuse pre-allocated arrays)
             self.cmd_q[:] = q_target

@@ -143,6 +143,39 @@ wbt = ObservationConfig(
     },
 )
 
+wbt_tracking = ObservationConfig(
+    obs_dict={
+        "actor_obs": [
+            "dof_pos",
+            "dof_vel",
+            "base_ang_vel",
+            "projected_gravity",
+            "actions",
+            "motion_command_sequence",
+        ]
+    },
+    obs_dims={
+        "dof_pos": 29,
+        "dof_vel": 29,
+        "base_ang_vel": 3,
+        "projected_gravity": 3,
+        "actions": 29,
+        "motion_command_sequence": 580,  # 10 frames × (29*2)
+    },
+    obs_scales={
+        "dof_pos": 1.0,
+        "dof_vel": 1.0,
+        "base_ang_vel": 1.0,
+        "projected_gravity": 1.0,
+        "actions": 1.0,
+        "motion_command_sequence": 1.0,
+    },
+    history_length_dict={
+        "actor_obs": 1,
+    },
+)
+
+
 # =============================================================================
 # Default Configurations Dictionary
 # =============================================================================
