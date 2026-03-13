@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import typing
-from typing import Any
 
 from pydantic.dataclasses import dataclass
 
@@ -186,7 +185,7 @@ class RobotConfig:
     # SDK-Specific Configuration (optional)
     # =========================================================================
 
-    unitree_legged_const: dict[str, Any] | None = None
+    unitree_legged_const: dict[str, int | float] | None = None
     """Unitree SDK-specific constants.
 
     Contains protocol-specific values like HIGHLEVEL, LOWLEVEL, etc.

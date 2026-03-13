@@ -122,6 +122,11 @@ class MuJoCo(BaseSimulator):
         self.device = device
         self.robot_config = tyro_config.robot
 
+        # Object registry support (MuJoCo scene objects)
+        self.object_names: list[str] = []
+        self._object_body_ids: dict[str, int] = {}
+        self._object_freejoint_addrs: dict[str, tuple[int, int]] = {}
+
         # Save num_envs on init() rather than create_envs() so other modules can rely on it
         self.num_envs = self.training_config.num_envs
 
@@ -398,7 +403,10 @@ class MuJoCo(BaseSimulator):
 
         # Always add robot after terrain, in case it references ground/floor, etc for contacts
         self.scene_manager.add_robot(
-            terrain_state, self.robot_config, xml_filter=self.simulator_config.robot_mjcf_filter
+            terrain_state,
+            self.robot_config,
+            xml_filter=self.simulator_config.robot_mjcf_filter,
+            motion_init_cfg=getattr(self.simulator_config, "mujoco_motion_init", None),
         )
 
     def _set_robot_properties(self) -> None:
@@ -431,9 +439,15 @@ class MuJoCo(BaseSimulator):
         # Use map lookup for clean names
         self.dof_names = [self._get_clean_name(name) for name in robot_joint_names]
         self.num_bodies = self.root_model.nbody
-        # Use map lookup for body names
-        all_body_names = [self._get_clean_name(self.root_model.body(i).name) for i in range(self.root_model.nbody)]
-        self.body_names = [name for name in all_body_names if name != "world"]
+        # Use prefixed names to filter robot bodies only (exclude scene objects like table/object)
+        prefix = self.scene_manager.robot_prefix
+        robot_body_names_prefixed = [
+            self.root_model.body(i).name
+            for i in range(self.root_model.nbody)
+            if self.root_model.body(i).name.startswith(prefix)
+        ]
+        robot_body_names = [self._get_clean_name(name) for name in robot_body_names_prefixed]
+        self.body_names = [name for name in robot_body_names if name]
 
         # Build body index mapping for contact forces (after body_names is defined)
         self._build_body_index_mapping()
@@ -659,8 +673,19 @@ class MuJoCo(BaseSimulator):
 
         self._set_robot_initial_state()
 
-        # Setup ObjectRegistry for robot-only (scenes not yet implemented)
-        self.object_registry.setup_ranges(self.num_envs, robot_count=1, scene_count=0, individual_count=0)
+        # Apply object initial states (if configured)
+        self._load_mujoco_objects_from_config()
+
+        # Refresh kinematics after any state changes
+        mujoco.mj_forward(self.root_model, self.root_data)
+
+        # Setup ObjectRegistry for robot + configured objects
+        self.object_registry.setup_ranges(
+            self.num_envs,
+            robot_count=1,
+            scene_count=0,
+            individual_count=len(self.object_names),
+        )
 
         # Register robot with initial pose
         # TODO: use robot model/data rather than config here?
@@ -668,6 +693,17 @@ class MuJoCo(BaseSimulator):
         robot_poses[:, :3] = torch.tensor(self.robot_config.init_state.pos, device=self.sim_device)
         robot_poses[:, 3:7] = torch.tensor(self.robot_config.init_state.rot, device=self.sim_device)  # [x,y,z,w]
         self.object_registry.register_object("robot", ObjectType.ROBOT, 0, robot_poses)
+
+        # Register objects with initial poses from current simulation state
+        for position, obj_name in enumerate(self.object_names):
+            obj_pose = self._get_body_pose_xyzw(obj_name)
+            object_init_poses = obj_pose.unsqueeze(0).repeat(self.num_envs, 1)
+            self.object_registry.register_object(
+                name=obj_name,
+                object_type=ObjectType.INDIVIDUAL,
+                position_in_type=position,
+                initial_poses=object_init_poses,
+            )
         self.object_registry.finalize_registration()
 
         # Calculate indices for robot freejoint components
@@ -685,8 +721,10 @@ class MuJoCo(BaseSimulator):
         }
         self.robot_root_states = self.backend.create_root_view(root_addrs)  # type: ignore[assignment]
 
-        # Create all_root_states as a view of robot_root_states (single robot case)
-        self.all_root_states = self.robot_root_states
+        # Create all_root_states tensor for robot + objects
+        total_objects = self.object_registry.objects_per_env * self.num_envs
+        self.all_root_states = torch.zeros(total_objects, 13, device=self.sim_device, dtype=torch.float32)
+        self._update_all_root_states()
 
         # Calculate indices for DOF positions and velocities
         dof_pos_indices = (
@@ -830,6 +868,9 @@ class MuJoCo(BaseSimulator):
         if hasattr(self, "contact_forces_history") and hasattr(self, "contact_forces"):
             self.backend.refresh_sim_tensors(self.contact_forces_history)
 
+        # Keep unified root state tensor in sync (robot + objects)
+        self._update_all_root_states()
+
     def clear_contact_forces_history(self, env_ids: torch.Tensor) -> None:
         """Clear contact forces history for specified environments.
 
@@ -932,44 +973,12 @@ class MuJoCo(BaseSimulator):
         resolved_objects = self.object_registry.resolve_indices(indices)
         all_states: list[torch.Tensor] = []
         for obj_name, env_ids in resolved_objects:
-            # TODO: objects, scenes
-            if obj_name != "robot":
-                raise NotImplementedError(
-                    f"MuJoCo simulator currently only supports robot state access. "
-                    f"Object '{obj_name}' is not supported."
-                )
+            if obj_name == "robot":
+                state = self._get_robot_root_state()
+            else:
+                state = self._get_body_state(obj_name)
 
-            robot_body_id = 1  # FIXME: Assuming robot root is body 1 (after world body 0)
-
-            assert self.root_model is not None
-            if robot_body_id >= self.root_model.nbody:
-                raise RuntimeError(f"Robot body ID {robot_body_id} exceeds model bodies {self.root_model.nbody}")
-
-            # Use data.xpos/xquat for positions/orientations (global coordinates)
-            pos = torch.from_numpy(self.root_data.xpos[robot_body_id]).float().to(self.sim_device)  # [3]
-            quat_mj = self.root_data.xquat[robot_body_id]  # [w,x,y,z] MuJoCo format
-
-            # Convert quaternion: MuJoCo [w,x,y,z] → holosoma [x,y,z,w]
-            quat_holosoma = torch.tensor(
-                [quat_mj[1], quat_mj[2], quat_mj[3], quat_mj[0]], device=self.sim_device, dtype=torch.float32
-            )
-
-            # Use data.cvel for velocities: angular velocity
-            angular_velocity = torch.from_numpy(self.root_data.cvel[robot_body_id, 0:3]).float().to(self.sim_device)
-            linear_velocity = torch.from_numpy(self.root_data.cvel[robot_body_id, 3:6]).float().to(self.sim_device)
-
-            # Convert COM velocity to body origin velocity
-            offset = (
-                torch.from_numpy(self.root_data.xpos[robot_body_id] - self.root_data.subtree_com[robot_body_id])
-                .float()
-                .to(self.sim_device)
-            )
-            lin_world = linear_velocity + torch.cross(angular_velocity, offset)
-
-            # Pack in holosoma format [x,y,z,qx,qy,qz,qw,vx,vy,vz,wx,wy,wz]
-            state = torch.cat([pos, quat_holosoma, lin_world, angular_velocity])  # [13]
-
-            # Repeat for all requested environments (currently just 1)
+            # Repeat for all requested environments (MuJoCo classic supports 1 env)
             states_for_envs = state.unsqueeze(0).repeat(len(env_ids), 1)  # [num_envs, 13]
             all_states.append(states_for_envs)
 
@@ -1000,45 +1009,24 @@ class MuJoCo(BaseSimulator):
 
         state_offset = 0
         for obj_name, env_ids in resolved_objects:
-            if obj_name != "robot":
-                # TODO: objects, scenes
-                raise NotImplementedError(
-                    f"MuJoCo simulator currently only supports robot state setting. "
-                    f"Object '{obj_name}' is not supported."
-                )
-
             num_states = len(env_ids)
             obj_states = states[state_offset : state_offset + num_states]  # [num_envs, 13]
             state_offset += num_states
 
-            # Set robot state for each environment
-            for i, _ in enumerate(env_ids):
+            # Set state for each environment (MuJoCo classic supports 1 env)
+            for i, env_id in enumerate(env_ids):
+                if self.num_envs == 1 and env_id != 0:
+                    continue
+
                 state = obj_states[i]  # [13]
-
-                pos = state[:3].detach().cpu().numpy()
-                quat_holosoma = state[3:7].detach().cpu().numpy()  # [x,y,z,w]
-                lin_vel = state[7:10].detach().cpu().numpy()
-                ang_vel = state[10:13].detach().cpu().numpy()
-
-                # Convert quaternion: holosoma [x,y,z,w] → MuJoCo [w,x,y,z]
-                quat_mj = np.array([quat_holosoma[3], quat_holosoma[0], quat_holosoma[1], quat_holosoma[2]])
-
-                # Set via freejoint (assuming robot has freejoint)
-                # For single environment, we update qpos/qvel directly
-                if len(self.root_data.qpos) >= 7:  # Ensure we have enough qpos elements
-                    self.root_data.qpos[0:3] = pos  # Root position
-                    self.root_data.qpos[3:7] = quat_mj  # Root orientation [w,x,y,z]
+                if obj_name == "robot":
+                    self._set_robot_root_state(state)
                 else:
-                    raise RuntimeError(f"Insufficient qpos elements: {len(self.root_data.qpos)}, need at least 7")
-
-                if len(self.root_data.qvel) >= 6:  # Ensure we have enough qvel elements
-                    self.root_data.qvel[0:3] = lin_vel  # Root linear velocity
-                    self.root_data.qvel[3:6] = ang_vel  # Root angular velocity
-                else:
-                    raise RuntimeError(f"Insufficient qvel elements: {len(self.root_data.qvel)}, need at least 6")
+                    self._set_body_state(obj_name, state)
 
         if write_updates:
             mujoco.mj_forward(self.root_model, self.root_data)
+            self._update_all_root_states()
 
     def get_actor_indices(self, names: str | ActorNames, env_ids: EnvIds | None = None) -> ActorIndices:
         """Get actor indices using ObjectRegistry with robot-only validation.
@@ -1063,12 +1051,12 @@ class MuJoCo(BaseSimulator):
         if isinstance(names, str):
             names = [names]
 
+        available = {"robot", *self.object_names}
         for name in names:
-            # TODO: objects, scenes
-            if name != "robot":
+            if name not in available:
                 raise NotImplementedError(
-                    f"MuJoCo simulator currently only supports robot access. "
-                    f"Requested object '{name}' is not supported. Only 'robot' is available."
+                    f"MuJoCo simulator does not have object '{name}'. "
+                    f"Available: {sorted(available)}"
                 )
 
         if env_ids is None:
@@ -1096,12 +1084,12 @@ class MuJoCo(BaseSimulator):
         NotImplementedError
             If non-robot objects are requested.
         """
+        available = {"robot", *self.object_names}
         for name in names:
-            # TODO: objects, scenes
-            if name != "robot":
+            if name not in available:
                 raise NotImplementedError(
-                    f"MuJoCo simulator currently only supports robot initial poses. "
-                    f"Requested object '{name}' is not supported. Only 'robot' is available."
+                    f"MuJoCo simulator does not have object '{name}'. "
+                    f"Available: {sorted(available)}"
                 )
 
         if env_ids is None:
@@ -1118,6 +1106,156 @@ class MuJoCo(BaseSimulator):
             This method is not yet implemented.
         """
         raise NotImplementedError("WIP")
+
+    # ----- Object helpers -----
+
+    def _load_mujoco_objects_from_config(self) -> None:
+        """Load object names from scene config and cache body/joint info."""
+        if not hasattr(self.simulator_config, "scene"):
+            return
+
+        scene_cfg = self.simulator_config.scene
+        if not scene_cfg or not getattr(scene_cfg, "rigid_objects", None):
+            return
+
+        self.object_names = [obj.name for obj in scene_cfg.rigid_objects]
+        self._object_body_ids.clear()
+        self._object_freejoint_addrs.clear()
+
+        assert self.root_model is not None
+        for obj_cfg in scene_cfg.rigid_objects:
+            body_name = obj_cfg.name
+            body_id = mujoco.mj_name2id(self.root_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+            if body_id < 0:
+                prefixed_name = self._get_prefixed_name(body_name)
+                if prefixed_name != body_name:
+                    body_id = mujoco.mj_name2id(self.root_model, mujoco.mjtObj.mjOBJ_BODY, prefixed_name)
+            if body_id < 0:
+                raise RuntimeError(f"MuJoCo object body '{obj_cfg.name}' not found in model.")
+
+            self._object_body_ids[obj_cfg.name] = body_id
+
+            # Cache freejoint addresses if available (dynamic objects)
+            jnt_adr = self.root_model.body_jntadr[body_id]
+            jnt_num = self.root_model.body_jntnum[body_id]
+            if jnt_num == 1 and self.root_model.jnt_type[jnt_adr] == mujoco.mjtJoint.mjJNT_FREE:
+                qpos_adr = self.root_model.jnt_qposadr[jnt_adr]
+                qvel_adr = self.root_model.jnt_dofadr[jnt_adr]
+                self._object_freejoint_addrs[obj_cfg.name] = (qpos_adr, qvel_adr)
+
+            # Apply initial pose override if object is dynamic
+            if obj_cfg.name in self._object_freejoint_addrs:
+                pos = np.array(obj_cfg.position, dtype=np.float32)
+                quat_wxyz = np.array(obj_cfg.orientation, dtype=np.float32)
+                self._set_body_state_raw(
+                    obj_cfg.name, pos, quat_wxyz, np.zeros(3, dtype=np.float32), np.zeros(3, dtype=np.float32)
+                )
+
+    def _get_robot_root_state(self) -> torch.Tensor:
+        """Get robot root state [13] from MuJoCo data."""
+        assert self.root_model is not None
+        assert self.root_data is not None
+        robot_body_id = 1  # robot root is body 1 (after world body 0)
+        if robot_body_id >= self.root_model.nbody:
+            raise RuntimeError(f"Robot body ID {robot_body_id} exceeds model bodies {self.root_model.nbody}")
+        return self._get_body_state_by_id(robot_body_id)
+
+    def _get_body_pose_xyzw(self, body_name: str) -> torch.Tensor:
+        """Get body pose [x,y,z,qx,qy,qz,qw] from MuJoCo data."""
+        assert self.root_data is not None
+        body_id = self._object_body_ids.get(body_name)
+        if body_id is None:
+            raise RuntimeError(f"Object body '{body_name}' not found.")
+        pos = torch.from_numpy(self.root_data.xpos[body_id]).float().to(self.sim_device)
+        quat_mj = self.root_data.xquat[body_id]  # [w,x,y,z]
+        quat_xyzw = torch.tensor(
+            [quat_mj[1], quat_mj[2], quat_mj[3], quat_mj[0]], device=self.sim_device, dtype=torch.float32
+        )
+        return torch.cat([pos, quat_xyzw])
+
+    def _get_body_state(self, body_name: str) -> torch.Tensor:
+        """Get full body state [13] for a named object."""
+        body_id = self._object_body_ids.get(body_name)
+        if body_id is None:
+            raise RuntimeError(f"Object body '{body_name}' not found.")
+        return self._get_body_state_by_id(body_id)
+
+    def _get_body_state_by_id(self, body_id: int) -> torch.Tensor:
+        """Get full body state [13] for a MuJoCo body id."""
+        assert self.root_data is not None
+        assert self.root_model is not None
+        pos = torch.from_numpy(self.root_data.xpos[body_id]).float().to(self.sim_device)
+        quat_mj = self.root_data.xquat[body_id]  # [w,x,y,z]
+        quat_xyzw = torch.tensor(
+            [quat_mj[1], quat_mj[2], quat_mj[3], quat_mj[0]], device=self.sim_device, dtype=torch.float32
+        )
+        body_vel = np.zeros(6)
+        mujoco.mj_objectVelocity(
+            self.root_model, self.root_data, mujoco.mjtObj.mjOBJ_BODY, body_id, body_vel, 0
+        )
+        ang_vel = torch.from_numpy(body_vel[:3]).float().to(self.sim_device)
+        lin_vel = torch.from_numpy(body_vel[3:]).float().to(self.sim_device)
+        return torch.cat([pos, quat_xyzw, lin_vel, ang_vel])
+
+    def _set_robot_root_state(self, state: torch.Tensor) -> None:
+        """Set robot root state for MuJoCo."""
+        pos = state[:3].detach().cpu().numpy()
+        quat_holosoma = state[3:7].detach().cpu().numpy()  # [x,y,z,w]
+        lin_vel = state[7:10].detach().cpu().numpy()
+        ang_vel = state[10:13].detach().cpu().numpy()
+        quat_mj = np.array([quat_holosoma[3], quat_holosoma[0], quat_holosoma[1], quat_holosoma[2]])
+        if len(self.root_data.qpos) >= 7:
+            self.root_data.qpos[0:3] = pos
+            self.root_data.qpos[3:7] = quat_mj
+        else:
+            raise RuntimeError(f"Insufficient qpos elements: {len(self.root_data.qpos)}, need at least 7")
+        if len(self.root_data.qvel) >= 6:
+            self.root_data.qvel[0:3] = lin_vel
+            self.root_data.qvel[3:6] = ang_vel
+        else:
+            raise RuntimeError(f"Insufficient qvel elements: {len(self.root_data.qvel)}, need at least 6")
+
+    def _set_body_state(self, body_name: str, state: torch.Tensor) -> None:
+        """Set object body state from full [13] state tensor."""
+        pos = state[:3].detach().cpu().numpy()
+        quat_holosoma = state[3:7].detach().cpu().numpy()  # [x,y,z,w]
+        lin_vel = state[7:10].detach().cpu().numpy()
+        ang_vel = state[10:13].detach().cpu().numpy()
+        quat_mj = np.array([quat_holosoma[3], quat_holosoma[0], quat_holosoma[1], quat_holosoma[2]])
+        self._set_body_state_raw(body_name, pos, quat_mj, lin_vel, ang_vel)
+
+    def _set_body_state_raw(
+        self,
+        body_name: str,
+        pos: np.ndarray,
+        quat_mj: np.ndarray,
+        lin_vel: np.ndarray,
+        ang_vel: np.ndarray,
+    ) -> None:
+        """Set object state directly in MuJoCo data using freejoint addresses."""
+        assert self.root_data is not None
+        addrs = self._object_freejoint_addrs.get(body_name)
+        if addrs is None:
+            raise RuntimeError(f"Object '{body_name}' has no freejoint; cannot set state.")
+        qpos_adr, qvel_adr = addrs
+        self.root_data.qpos[qpos_adr : qpos_adr + 3] = pos
+        self.root_data.qpos[qpos_adr + 3 : qpos_adr + 7] = quat_mj
+        self.root_data.qvel[qvel_adr : qvel_adr + 3] = lin_vel
+        self.root_data.qvel[qvel_adr + 3 : qvel_adr + 6] = ang_vel
+
+    def _update_all_root_states(self) -> None:
+        """Update unified root state tensor for robot + objects."""
+        if not hasattr(self, "all_root_states") or self.all_root_states.numel() == 0:
+            return
+
+        env_ids = torch.arange(self.num_envs, device=self.sim_device)
+        robot_indices = self.object_registry.get_object_indices("robot", env_ids)
+        self.all_root_states[robot_indices] = self.robot_root_states[env_ids]
+
+        for obj_name in self.object_names:
+            obj_indices = self.object_registry.get_object_indices(obj_name, env_ids)
+            obj_state = self._get_body_state(obj_name).unsqueeze(0).repeat(len(env_ids), 1)
+            self.all_root_states[obj_indices] = obj_state
 
     def set_actor_root_state_tensor(self, set_env_ids: torch.Tensor | None, root_states: torch.Tensor | None) -> None:
         """Legacy compatibility method for LeggedRobotBase.

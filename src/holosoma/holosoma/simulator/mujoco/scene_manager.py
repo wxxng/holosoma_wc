@@ -11,7 +11,7 @@ import numpy as np
 from loguru import logger
 
 from holosoma.config_types.robot import RobotConfig
-from holosoma.config_types.simulator import MujocoXMLFilterCfg, SimulatorConfig
+from holosoma.config_types.simulator import MujocoMotionInitConfig, MujocoXMLFilterCfg, SimulatorConfig
 from holosoma.managers.terrain.base import TerrainTermBase
 from holosoma.utils.module_utils import get_holosoma_root
 
@@ -314,11 +314,99 @@ class MujocoSceneManager:
             solref=[0.001, 1],
         )
 
+    def _maybe_patch_robot_mjcf_for_motion_init(
+        self,
+        robot_xml_path: str,
+        motion_init_cfg: MujocoMotionInitConfig,
+    ) -> str:
+        """Patch robot MJCF body positions from motion-clip PKL before loading.
+
+        The table is a static body (no freejoint) so it cannot be repositioned
+        after loading. This method patches the XML on disk before MjSpec loads it.
+        Returns the path to the patched file (or the original if no change needed).
+        """
+        import hashlib
+        import xml.etree.ElementTree as ET
+        from pathlib import Path
+
+        from holosoma.utils.motion_clip_init import load_motion_clip_init_poses  # noqa: PLC0415
+
+        table_body_name = getattr(motion_init_cfg, "table_body_name", "table")
+        object_body_name = getattr(motion_init_cfg, "object_body_name", "object")
+        apply_table_pos = getattr(motion_init_cfg, "apply_table_pos", True)
+        apply_table_quat = getattr(motion_init_cfg, "apply_table_quat", True)
+        apply_object_pos = True  # always apply object pos from PKL
+        apply_object_quat = getattr(motion_init_cfg, "apply_object_quat", False)
+
+        # Parse XML to check which bodies are present
+        try:
+            ET.register_namespace("", "")
+            tree = ET.parse(robot_xml_path)
+            root_elem = tree.getroot()
+        except (ET.ParseError, OSError) as exc:
+            logger.warning(f"Failed to parse robot XML for motion init patching: {exc}")
+            return robot_xml_path
+
+        has_table = any(b.get("name") == table_body_name for b in root_elem.iter("body"))
+        has_object = any(b.get("name") == object_body_name for b in root_elem.iter("body"))
+
+        if not has_table and not has_object:
+            return robot_xml_path
+
+        # Load poses from PKL
+        try:
+            stem = Path(robot_xml_path).stem
+            obj_name_hint = stem[len("g1_43dof_"):] if stem.startswith("g1_43dof_") else None
+            poses = load_motion_clip_init_poses(
+                str(motion_init_cfg.pkl_path),
+                clip_key=getattr(motion_init_cfg, "clip_key", None),
+                obj_name_hint=obj_name_hint,
+                align_to_root_xy_yaw=getattr(motion_init_cfg, "align_to_root_xy_yaw", True),
+                require_clip_key=getattr(motion_init_cfg, "require_clip_key", True),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Failed to load motion init poses for XML patching: {exc}")
+            return robot_xml_path
+
+        # Generate stable patched filename based on clip key hash
+        clip_hash = hashlib.md5(poses.clip_key.encode()).hexdigest()[:8]
+        xml_path = Path(robot_xml_path)
+        patched_path = xml_path.parent / f"{xml_path.stem}__motioninit_{clip_hash}.xml"
+
+        # Patch table and/or object body positions in the XML tree
+        modified = False
+        for body in root_elem.iter("body"):
+            bname = body.get("name")
+            if bname == table_body_name and has_table:
+                if apply_table_pos and poses.table_pos is not None:
+                    body.set("pos", " ".join(f"{v:.8f}" for v in poses.table_pos))
+                    modified = True
+                    logger.info(f"Patched table body pos={poses.table_pos}")
+                if apply_table_quat and poses.table_quat_wxyz is not None:
+                    body.set("quat", " ".join(f"{v:.8f}" for v in poses.table_quat_wxyz))
+                    modified = True
+            elif bname == object_body_name and has_object:
+                if apply_object_pos and poses.object_pos is not None:
+                    body.set("pos", " ".join(f"{v:.8f}" for v in poses.object_pos))
+                    modified = True
+                    logger.info(f"Patched object body pos={poses.object_pos}")
+                if apply_object_quat and poses.object_quat_wxyz is not None:
+                    body.set("quat", " ".join(f"{v:.8f}" for v in poses.object_quat_wxyz))
+                    modified = True
+
+        if not modified:
+            return robot_xml_path
+
+        tree.write(str(patched_path), encoding="unicode", xml_declaration=False)
+        logger.info(f"Written patched robot XML: {patched_path}")
+        return str(patched_path)
+
     def add_robot(
         self,
         terrain_state: TerrainTermBase,
         robot_config: RobotConfig,
         xml_filter: MujocoXMLFilterCfg | None = None,
+        motion_init_cfg: MujocoMotionInitConfig | None = None,
         prefix: str = "robot_",
     ) -> None:
         """Add robot from XML file with namespace prefix and optional filtering.
@@ -340,6 +428,10 @@ class MujocoSceneManager:
         if asset_root.startswith("@holosoma/"):
             asset_root = asset_root.replace("@holosoma", get_holosoma_root())
         robot_xml_path = os.path.join(asset_root, robot_config.asset.xml_file)
+
+        # Patch XML for motion init (needed for static bodies like table that can't be moved via qpos)
+        if motion_init_cfg and getattr(motion_init_cfg, "pkl_path", None):
+            robot_xml_path = self._maybe_patch_robot_mjcf_for_motion_init(robot_xml_path, motion_init_cfg)
 
         logger.info(f"Adding robot from: {robot_xml_path} with prefix: {prefix}")
         self.robot_model_path = robot_xml_path

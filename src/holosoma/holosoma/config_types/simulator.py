@@ -469,6 +469,41 @@ class BridgeConfig:
 
 
 @dataclass(frozen=True)
+class MujocoMotionInitConfig:
+    """Configuration for initialising simulation state from a motion-clip PKL."""
+
+    enabled: bool = False
+    """Whether to use motion-clip PKL to set the initial object/robot pose."""
+
+    pkl_path: str | None = None
+    """Path to the motion-clip PKL file."""
+
+    clip_key: str | None = None
+    """Clip key to use inside the PKL. If None, auto-selected by obj_name_hint."""
+
+    align_to_root_xy_yaw: bool = True
+    """Translate/rotate so the robot starts at world (0,0) facing forward."""
+
+    require_clip_key: bool = True
+    """Raise an error if the specified clip_key is not found in the PKL."""
+
+    apply_object_quat: bool = False
+    """Whether to also override the object orientation from the PKL."""
+
+    apply_table_pos: bool = True
+    """Whether to override the table body position from the PKL."""
+
+    apply_table_quat: bool = True
+    """Whether to also override the table body orientation from the PKL."""
+
+    table_body_name: str = "table"
+    """Name of the table body in the robot MJCF."""
+
+    object_body_name: str = "object"
+    """Name of the object body in the robot MJCF."""
+
+
+@dataclass(frozen=True)
 class SimulatorInitConfig:
     """Top-level simulator initialisation configuration."""
 
@@ -548,6 +583,9 @@ class SimulatorInitConfig:
 
     virtual_gantry: VirtualGantryCfg = field(default_factory=VirtualGantryCfg)
     """Virtual gantry system configuration."""
+
+    mujoco_motion_init: MujocoMotionInitConfig = field(default_factory=lambda: MujocoMotionInitConfig())
+    """Motion clip initialisation configuration for object/robot pose from PKL."""
 
 
 @dataclass(frozen=True)

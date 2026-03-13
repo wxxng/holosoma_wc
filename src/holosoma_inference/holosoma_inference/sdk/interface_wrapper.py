@@ -2,11 +2,34 @@ import json
 import os
 import socket
 import numpy as np
+from loguru import logger
 from termcolor import colored
 
 from holosoma_inference.config.config_types import RobotConfig
 from holosoma_inference.sdk.command_sender import create_command_sender
 from holosoma_inference.sdk.state_processor import create_state_processor
+from holosoma_inference.utils.math.quat import quat_inverse, quat_mul, wxyz_to_xyzw, xyzw_to_wxyz
+
+OBJECT_STATE_UDP_PORT = 10002
+OBJECT_STATE_UDP_HOST = "127.0.0.1"
+ROBOT_STATE_UDP_PORT = 10003
+ROBOT_STATE_UDP_HOST = "127.0.0.1"
+TABLE_COMMAND_UDP_PORT = 10004
+TABLE_COMMAND_UDP_HOST = "127.0.0.1"
+
+# World topics UDP (JSON) receiver (for external state sources).
+# Can be overridden via environment variables.
+WORLD_TOPICS_UDP_BIND_IP = os.environ.get("HOLOSOMA_WORLD_TOPIC_UDP_BIND_IP", "0.0.0.0")
+WORLD_TOPICS_UDP_PORT = int(os.environ.get("HOLOSOMA_WORLD_TOPIC_UDP_PORT", "5005"))
+# If enabled, use /world/robot_pose quaternion for base orientation (instead of IMU quaternion).
+# Angular velocity still comes from IMU.
+WORLD_TOPICS_USE_ROBOT_POSE_QUAT = os.environ.get("HOLOSOMA_WORLD_USE_ROBOT_POSE_QUAT", "0") == "1"
+
+# Coordinate/frame conventions:
+# - Incoming UDP world topics are in RDF axes (x=Right, y=Down, z=Forward) with quats in xyzw.
+# - Internal code expects FLU world axes (x=Forward, y=Left, z=Up).
+_Q_RDF_TO_FLU_WXYZ = np.array([[0.5, -0.5, 0.5, -0.5]], dtype=np.float32)  # wxyz
+_Q_RDF_TO_FLU_INV_WXYZ = quat_inverse(_Q_RDF_TO_FLU_WXYZ)
 
 class InterfaceWrapper:
     """
@@ -26,6 +49,7 @@ class InterfaceWrapper:
     # ============================================================================
 
     def __init__(self, robot_config: RobotConfig, domain_id=0, interface_str=None, use_joystick=True, use_hands=False):
+        self.logger = logger
         self.use_joystick = use_joystick
         self.use_hands = use_hands
         self.robot_config = robot_config
@@ -33,6 +57,7 @@ class InterfaceWrapper:
         self.interface_str = interface_str
         self.sdk_type = robot_config.sdk_type
         self.backend = None
+        self._unitree_motor_order = None
 
         # Initialize gain levels for binding backend
         self._kp_level = 1.0
@@ -40,6 +65,179 @@ class InterfaceWrapper:
 
         # Initialize sdk components
         self._init_sdk_components()
+
+        # Object/robot world-state receivers
+        self._object_state_sock = None
+        self._object_state_cache = None
+        self._robot_state_sock = None
+        self._robot_state_cache = None
+        self._table_command_sock = None
+        self._table_command_addr = None
+        self._table_command_warned = False
+        # World topics receiver (external pose/velocity via UDP JSON)
+        self._world_topics_sock = None
+        self._world_robot_pose_cache = None  # [x,y,z,qx,qy,qz,qw] in FLU
+        self._world_object_pose_cache = None  # [x,y,z,qx,qy,qz,qw] in FLU
+        self._world_robot_twist_cache = None  # [vx,vy,vz,wx,wy,wz] in FLU
+        self._world_robot_quat_warned = False
+
+        if self.interface_str == "lo":
+            self._init_object_state_receiver()
+            self._init_robot_state_receiver()
+            self._init_table_command_sender()
+        elif self.interface_str == "enp132s0":
+            self._init_world_topics_receiver()
+
+    def _init_object_state_receiver(self):
+        """Initialize UDP receiver for simulator object state (loopback only)."""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((OBJECT_STATE_UDP_HOST, OBJECT_STATE_UDP_PORT))
+            sock.setblocking(False)
+            self._object_state_sock = sock
+            self.logger.info(
+                f"Object state UDP receiver enabled on {OBJECT_STATE_UDP_HOST}:{OBJECT_STATE_UDP_PORT}"
+            )
+        except OSError as exc:
+            self.logger.warning(f"Failed to init object state UDP receiver: {exc}")
+            self._object_state_sock = None
+
+    def _init_robot_state_receiver(self):
+        """Initialize UDP receiver for simulator robot state (loopback only)."""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((ROBOT_STATE_UDP_HOST, ROBOT_STATE_UDP_PORT))
+            sock.setblocking(False)
+            self._robot_state_sock = sock
+            self.logger.info(
+                f"Robot state UDP receiver enabled on {ROBOT_STATE_UDP_HOST}:{ROBOT_STATE_UDP_PORT}"
+            )
+        except OSError as exc:
+            self.logger.warning(f"Failed to init robot state UDP receiver: {exc}")
+            self._robot_state_sock = None
+
+    def _init_table_command_sender(self):
+        """Initialize UDP sender for simulator table commands (loopback only)."""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._table_command_sock = sock
+            self._table_command_addr = (TABLE_COMMAND_UDP_HOST, TABLE_COMMAND_UDP_PORT)
+            self.logger.info(
+                f"Table command UDP sender enabled to {TABLE_COMMAND_UDP_HOST}:{TABLE_COMMAND_UDP_PORT}"
+            )
+        except OSError as exc:
+            self.logger.warning(f"Failed to init table command UDP sender: {exc}")
+            self._table_command_sock = None
+            self._table_command_addr = None
+
+    def _init_world_topics_receiver(self):
+        """Initialize UDP receiver for external world topics (JSON packets)."""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((WORLD_TOPICS_UDP_BIND_IP, WORLD_TOPICS_UDP_PORT))
+            sock.setblocking(False)
+            self._world_topics_sock = sock
+            self.logger.info(
+                f"World topics UDP receiver enabled on {WORLD_TOPICS_UDP_BIND_IP}:{WORLD_TOPICS_UDP_PORT}"
+            )
+        except OSError as exc:
+            self.logger.warning(f"Failed to init world topics UDP receiver: {exc}")
+            self._world_topics_sock = None
+
+    @staticmethod
+    def _rdf_to_flu_vec3(vec: np.ndarray) -> np.ndarray:
+        """Convert a 3D vector from RDF (Right-Down-Forward) to FLU (Forward-Left-Up)."""
+        v = np.asarray(vec, dtype=np.float32).reshape(-1)
+        if v.size != 3:
+            raise ValueError(f"Expected 3D vector, got shape {v.shape}")
+        # [x_fwd, y_left, z_up] = [z_fwd, -x_right, -y_down]
+        return np.array([v[2], -v[0], -v[1]], dtype=np.float32)
+
+    @staticmethod
+    def _rdf_to_flu_quat_xyzw(quat_xyzw: np.ndarray) -> np.ndarray:
+        """Convert quaternion from RDF basis to FLU basis. Input/output are xyzw."""
+        q = np.asarray(quat_xyzw, dtype=np.float32).reshape(-1)
+        if q.size != 4:
+            raise ValueError(f"Expected quaternion xyzw, got shape {q.shape}")
+        q_wxyz = xyzw_to_wxyz(q.reshape(1, 4))
+        q_flu_wxyz = quat_mul(quat_mul(_Q_RDF_TO_FLU_WXYZ, q_wxyz), _Q_RDF_TO_FLU_INV_WXYZ)
+        q_flu_xyzw = wxyz_to_xyzw(q_flu_wxyz)
+        norm = np.linalg.norm(q_flu_xyzw, axis=1, keepdims=True)
+        norm = np.where(norm == 0.0, 1.0, norm)
+        q_flu_xyzw = q_flu_xyzw / norm
+        return q_flu_xyzw.reshape(-1)
+
+    def _poll_world_topics(self) -> None:
+        """Drain pending world-topic packets and update caches (best-effort, non-blocking)."""
+        if self._world_topics_sock is None:
+            return
+        while True:
+            try:
+                data, _addr = self._world_topics_sock.recvfrom(8192)
+            except BlockingIOError:
+                break
+            if not data:
+                continue
+            try:
+                packet = json.loads(data.decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+
+            topic = str(packet.get("topic", ""))
+            msg_type = str(packet.get("type", ""))
+
+            if msg_type == "PoseStamped":
+                pos_raw = packet.get("pos", None)
+                if pos_raw is None:
+                    continue
+                try:
+                    pos_flu = self._rdf_to_flu_vec3(np.asarray(pos_raw, dtype=np.float32))
+                except ValueError:
+                    continue
+
+                if "robot_pose" in topic:
+                    # Default: root orientation comes from IMU; only use UDP quat if explicitly enabled.
+                    quat_flu_xyzw = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+                    if WORLD_TOPICS_USE_ROBOT_POSE_QUAT:
+                        quat_raw = packet.get("quat_xyzw", packet.get("quat", None))
+                        if quat_raw is None:
+                            if not self._world_robot_quat_warned:
+                                self.logger.warning("Robot pose quaternion missing in UDP packet; using identity.")
+                                self._world_robot_quat_warned = True
+                        else:
+                            try:
+                                quat_flu_xyzw = self._rdf_to_flu_quat_xyzw(np.asarray(quat_raw, dtype=np.float32))
+                            except ValueError:
+                                continue
+                    pose = np.concatenate([pos_flu, quat_flu_xyzw], axis=0).astype(np.float32, copy=False)
+                    self._world_robot_pose_cache = pose
+                elif "object_pose" in topic:
+                    quat_raw = packet.get("quat_xyzw", packet.get("quat", None))
+                    if quat_raw is None:
+                        continue
+                    try:
+                        quat_flu_xyzw = self._rdf_to_flu_quat_xyzw(np.asarray(quat_raw, dtype=np.float32))
+                    except ValueError:
+                        continue
+                    pose = np.concatenate([pos_flu, quat_flu_xyzw], axis=0).astype(np.float32, copy=False)
+                    self._world_object_pose_cache = pose
+
+            elif msg_type == "TwistStamped":
+                # Only use base linear velocity from UDP; angular velocity comes from robot IMU.
+                lin_raw = packet.get("lin", None)
+                if lin_raw is None:
+                    continue
+                try:
+                    lin_flu = self._rdf_to_flu_vec3(np.asarray(lin_raw, dtype=np.float32))
+                except ValueError:
+                    continue
+
+                twist = np.concatenate([lin_flu, np.zeros(3, dtype=np.float32)], axis=0).astype(np.float32, copy=False)
+                if "robot_lin_vel" in topic or topic.endswith("/lin_vel"):
+                    self._world_robot_twist_cache = twist
 
     def _init_sdk_components(self):
         """Initialize the appropriate backend based on SDK type."""
@@ -101,6 +299,127 @@ class InterfaceWrapper:
             return self._convert_binding_state_to_array()
         raise RuntimeError("InterfaceWrapper not initialized correctly.")
 
+    def get_object_state(self):
+        """Get latest object state [x,y,z,qx,qy,qz,qw,vx,vy,vz,wx,wy,wz] if available."""
+        if self._world_topics_sock is not None:
+            self._poll_world_topics()
+            if self._world_object_pose_cache is None:
+                return None
+            # Object velocity is not provided by the world topic bridge; fill with zeros.
+            pos_quat = self._world_object_pose_cache
+            return np.concatenate(
+                [
+                    pos_quat[:3],
+                    pos_quat[3:7],
+                    np.zeros(3, dtype=np.float32),  # lin vel
+                    np.zeros(3, dtype=np.float32),  # ang vel
+                ],
+                axis=0,
+            ).astype(np.float32, copy=False)
+        if self._object_state_sock is None:
+            return None
+        while True:
+            try:
+                data, _addr = self._object_state_sock.recvfrom(13 * 4)
+            except BlockingIOError:
+                break
+            if data:
+                self._object_state_cache = np.frombuffer(data, dtype=np.float32).copy()
+        return self._object_state_cache
+
+    def get_robot_state(self):
+        """Get latest robot state [x,y,z,qx,qy,qz,qw,vx,vy,vz,wx,wy,wz] if available."""
+        if self._world_topics_sock is not None:
+            self._poll_world_topics()
+            if self._world_robot_pose_cache is None:
+                return None
+            pos_quat = self._world_robot_pose_cache
+            twist = self._world_robot_twist_cache
+            if twist is None:
+                twist = np.zeros(6, dtype=np.float32)
+            return np.concatenate([pos_quat[:3], pos_quat[3:7], twist], axis=0).astype(np.float32, copy=False)
+        if self._robot_state_sock is None:
+            return None
+        while True:
+            try:
+                data, _addr = self._robot_state_sock.recvfrom(13 * 4)
+            except BlockingIOError:
+                break
+            if data:
+                self._robot_state_cache = np.frombuffer(data, dtype=np.float32).copy()
+        return self._robot_state_cache
+
+    def get_object_pos_w(self):
+        """Get object world position if available."""
+        state = self.get_object_state()
+        if state is None or state.size < 3:
+            return None
+        return state[:3].reshape(1, 3)
+
+    def set_table_pose(self, pos_xyz, quat_wxyz=None):
+        """Send table pose command to simulator bridge over UDP.
+
+        Packet format (float32[8]):
+          [cmd_id, px, py, pz, qw, qx, qy, qz]
+        cmd_id=1 -> set table pose
+        """
+        if self._table_command_sock is None or self._table_command_addr is None:
+            if not self._table_command_warned:
+                self.logger.warning("Table command sender is not initialized; cannot set table pose.")
+                self._table_command_warned = True
+            return False
+
+        pos = np.asarray(pos_xyz, dtype=np.float32).reshape(-1)
+        if pos.size != 3:
+            self.logger.warning(f"Invalid table position shape {pos.shape}; expected 3 values.")
+            return False
+
+        if quat_wxyz is None:
+            quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        else:
+            quat = np.asarray(quat_wxyz, dtype=np.float32).reshape(-1)
+            if quat.size != 4:
+                self.logger.warning(f"Invalid table quaternion shape {quat.shape}; expected 4 values (wxyz).")
+                return False
+            norm = float(np.linalg.norm(quat))
+            if norm <= 0.0:
+                quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+            else:
+                quat = quat / norm
+
+        packet = np.concatenate(
+            [np.array([1.0], dtype=np.float32), pos.astype(np.float32, copy=False), quat.astype(np.float32, copy=False)],
+            axis=0,
+        )
+
+        try:
+            self._table_command_sock.sendto(packet.tobytes(), self._table_command_addr)
+            return True
+        except OSError as exc:
+            self.logger.warning(f"Failed to send table pose command: {exc}")
+            return False
+
+    def request_remove_table(self):
+        """Request simulator to remove/hide table.
+
+        Packet format (float32[8]):
+          [cmd_id, 0, 0, 0, 1, 0, 0, 0]
+        cmd_id=2 -> remove table
+        """
+        if self._table_command_sock is None or self._table_command_addr is None:
+            if not self._table_command_warned:
+                self.logger.warning("Table command sender is not initialized; cannot request table removal.")
+                self._table_command_warned = True
+            return False
+
+        packet = np.array([2.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        try:
+            self._table_command_sock.sendto(packet.tobytes(), self._table_command_addr)
+            return True
+        except OSError as exc:
+            self.logger.warning(f"Failed to send remove-table command: {exc}")
+            return False
+
     def _convert_binding_state_to_array(self):
 
         state = self.unitree_interface.read_low_state()
@@ -111,6 +430,17 @@ class InterfaceWrapper:
         base_lin_vel = np.zeros(3)
         base_ang_vel = np.array(state.imu.omega)
         motor_vel = np.array(state.motor.dq)
+
+        # Best-effort: populate base_pos and base_lin_vel from any available world-state source (sim2sim or UDP topics).
+        robot_state = self.get_robot_state()
+        if robot_state is not None and robot_state.size >= 3:
+            base_pos = robot_state[:3].astype(np.float32, copy=False)
+            if robot_state.size >= 10:
+                base_lin_vel = robot_state[7:10].astype(np.float32, copy=False)
+            if WORLD_TOPICS_USE_ROBOT_POSE_QUAT and robot_state.size >= 7:
+                # robot_state quaternion is [qx,qy,qz,qw] in FLU.
+                quat_xyzw = robot_state[3:7].astype(np.float32, copy=False).reshape(1, 4)
+                quat = xyzw_to_wxyz(quat_xyzw).reshape(-1)
 
         # Determine how many motors are available in the body SDK
         num_available_motors = len(motor_pos)
