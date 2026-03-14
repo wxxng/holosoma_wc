@@ -380,7 +380,10 @@ class WholeBodyTrackingPolicy(BasePolicy):
         self.motion_fps = None
         self.motion_length = 0
         self.motion_clip_key = None  # Which clip key from PKL to use
+        self._motion_pkl_path = None
         self.motion_to_robot_joint_map = None  # Reorder indices
+        self._scene_object_name = None
+        self._scene_reset_counter = None
         
         # Interpolation counter for smooth transition to first frame
         self.rl_interp_count = 0
@@ -584,6 +587,21 @@ class WholeBodyTrackingPolicy(BasePolicy):
                 colored(
                     f"Debug obj_pcd UDP sender enabled on {self._debug_obj_pcd_addr} "
                     f"(stride={self._debug_obj_pcd_stride}, interval={self._debug_obj_pcd_interval})",
+                    "cyan",
+                )
+            )
+
+        # Debug: visualize future object trajectory in the MuJoCo viewer via UDP
+        self._debug_traj_viz_enabled = bool(getattr(config.task, "debug_traj_viz", False))
+        self._debug_traj_viz_port = int(getattr(config.task, "debug_traj_viz_port", 10006))
+        self._debug_traj_viz_sock = None
+        self._debug_traj_viz_addr = None
+        if self._debug_traj_viz_enabled and config.task.interface == "lo":
+            self._debug_traj_viz_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._debug_traj_viz_addr = ("127.0.0.1", self._debug_traj_viz_port)
+            logger.info(
+                colored(
+                    f"Debug trajectory viz UDP sender enabled on {self._debug_traj_viz_addr}",
                     "cyan",
                 )
             )
@@ -1663,24 +1681,35 @@ class WholeBodyTrackingPolicy(BasePolicy):
             logger.info(colored("Using training KP/KD values (43-DOF config order)", "cyan"))
 
         # Load motion data from PKL file
-        # Try multiple locations for the PKL file
+        # Prefer CLI task config overrides, then fall back to bundled defaults.
         model_dir = Path(model_path).parent
         holosoma_root = Path(__file__).parent.parent.parent.parent.parent  # Go up to holosoma root
-        
-        pkl_search_paths = [
-            model_dir / "simple_8_motions.pkl",  # Same directory as model
-            holosoma_root / "src/holosoma/holosoma/data/motions/motion_tracking/cubemediums_12_0116_with_text_traj.pkl",  # Training data location
-        ]
-        
-        pkl_path = None
-        for path in pkl_search_paths:
-            if path.exists():
-                pkl_path = path
-                break
-        
+
+        config_motion_pkl_path = getattr(self.config.task, "motion_pkl_path", None)
+        config_motion_clip_key = getattr(self.config.task, "motion_clip_key", None)
+
+        if config_motion_pkl_path:
+            pkl_path = Path(config_motion_pkl_path)
+            if not pkl_path.exists():
+                raise FileNotFoundError(f"Configured motion PKL path does not exist: {pkl_path}")
+            pkl_search_paths = [pkl_path]
+        else:
+            pkl_search_paths = [
+                model_dir / "simple_8_motions.pkl",  # Same directory as model
+                holosoma_root / "src/holosoma/holosoma/data/motions/motion_tracking/cubemediums_12_0116_with_text_traj.pkl",  # Training data location
+            ]
+
+            pkl_path = None
+            for path in pkl_search_paths:
+                if path.exists():
+                    pkl_path = path
+                    break
+
+        self._motion_pkl_path = str(pkl_path) if pkl_path is not None else None
+
         if pkl_path:
-            # Match wbt_object_prev.py default clip key.
-            self._load_motion_from_pkl(str(pkl_path), clip_key="GRAB_s1_cubemedium_pass_1")
+            clip_key = config_motion_clip_key or "GRAB_s1_cubemedium_pass_1"
+            self._load_motion_from_pkl(str(pkl_path), clip_key=clip_key)
             logger.info(colored(f"📊 Motion Clip Summary:", "cyan", attrs=["bold"]))
             logger.info(colored(f"   Clip Key: {self.motion_clip_key}", "yellow"))
             logger.info(colored(f"   Motion Length: {self.motion_length} frames", "yellow", attrs=["bold"]))
@@ -1717,6 +1746,83 @@ class WholeBodyTrackingPolicy(BasePolicy):
         self.motion_start_timestep = None
         self._last_clock_reading = None
         self.robot_yaw_offset = 0.0
+
+    @staticmethod
+    def _normalize_object_name(obj_name: str | None) -> str | None:
+        if obj_name is None:
+            return None
+        normalized = str(obj_name).strip()
+        return normalized or None
+
+    def _apply_object_identity(self, obj_name: str | None, source: str) -> None:
+        obj_name = self._normalize_object_name(obj_name)
+        if obj_name is None:
+            return
+        previous_name = self.motion_obj_name
+        self.motion_obj_name = obj_name
+        if "obj_bps" in self.obs_dims:
+            self._obj_bps = self._load_bps_code(obj_name)
+        if obj_name != previous_name:
+            logger.info(colored(f"Scene object set to '{obj_name}' via {source}", "cyan"))
+
+    def _find_clip_key_for_object(self, obj_name: str | None) -> str | None:
+        obj_name = self._normalize_object_name(obj_name)
+        if obj_name is None or self.motion_data is None:
+            return None
+
+        for clip_key, clip_data in self.motion_data.items():
+            clip_obj_name = clip_data.get("obj_name", None)
+            if isinstance(clip_obj_name, (list, np.ndarray)):
+                clip_obj_array = np.asarray(clip_obj_name).reshape(-1)
+                clip_obj_name = clip_obj_array[0] if clip_obj_array.size > 0 else None
+            clip_obj_name = self._normalize_object_name(clip_obj_name)
+            if clip_obj_name == obj_name:
+                return clip_key
+
+        for clip_key in self.motion_data.keys():
+            if obj_name in str(clip_key):
+                return clip_key
+        return None
+
+    def _sync_scene_object_name(self) -> None:
+        if not hasattr(self.interface, "get_scene_object_name"):
+            return
+
+        if hasattr(self.interface, "get_scene_reset_counter"):
+            scene_reset_counter = self.interface.get_scene_reset_counter()
+            if scene_reset_counter is not None and scene_reset_counter != self._scene_reset_counter:
+                self._scene_reset_counter = scene_reset_counter
+                if self._table_removed or self._initial_object_height is not None:
+                    self.logger.info(
+                        "Scene reset detected from simulator reset counter; restoring table-tracking state."
+                    )
+                self._table_removed = False
+                self._initial_object_height = None
+                self._last_sent_table_frame = None
+
+        scene_object_name = self._normalize_object_name(self.interface.get_scene_object_name())
+        if scene_object_name is None:
+            return
+
+        self._scene_object_name = scene_object_name
+        can_switch_clip = (
+            self._motion_pkl_path is not None
+            and not self.motion_clip_progressing
+            and not self.stabilization_mode
+        )
+        if can_switch_clip:
+            matching_clip_key = self._find_clip_key_for_object(scene_object_name)
+            if matching_clip_key is not None and matching_clip_key != self.motion_clip_key:
+                self._load_motion_from_pkl(self._motion_pkl_path, clip_key=matching_clip_key)
+                logger.info(
+                    colored(
+                        f"Auto-switched motion clip to '{matching_clip_key}' for scene object '{scene_object_name}'",
+                        "cyan",
+                    )
+                )
+
+        if self.motion_obj_name != scene_object_name:
+            self._apply_object_identity(scene_object_name, source="scene UDP")
 
     def _on_policy_switched(self, model_path: str):
         super()._on_policy_switched(model_path)
@@ -1796,7 +1902,9 @@ class WholeBodyTrackingPolicy(BasePolicy):
     def get_current_obs_buffer_dict(self, robot_state_data):
 
         current_obs_buffer_dict = {}
+        self._sync_scene_object_name()
         command_timestep = 0 if self.stabilization_mode else self.motion_timestep
+        self._send_debug_traj_viz(command_timestep)
         self._update_table_pose_from_motion(command_timestep)
 
         # Extract joint data from robot_state_data (in config order)
@@ -2006,6 +2114,8 @@ class WholeBodyTrackingPolicy(BasePolicy):
     def _update_table_pose_from_motion(self, timestep: int) -> None:
         if self.motion_table_pos is None or self.motion_table_pos.shape[0] == 0:
             return
+        if self._table_removed:
+            return
         if not (self.motion_clip_progressing or self.stabilization_mode):
             return
         if not hasattr(self.interface, "set_table_pose"):
@@ -2134,18 +2244,6 @@ class WholeBodyTrackingPolicy(BasePolicy):
             return
 
         current_height = float(obj_pos_w[0, 2])
-
-        # Detect simulator reset: table was removed but the object has returned to
-        # (or below) its initial height, meaning the episode was restarted with R.
-        if self._table_removed and self._initial_object_height is not None:
-            if current_height <= self._initial_object_height + 0.01:
-                self.logger.info(
-                    "Simulator reset detected (object back at initial height): "
-                    "clearing table-removal state"
-                )
-                self._table_removed = False
-                self._initial_object_height = None
-                self._last_sent_table_frame = None
 
         if self._table_removed:
             return
@@ -2342,6 +2440,35 @@ class WholeBodyTrackingPolicy(BasePolicy):
             )
         except OSError:
             # Best-effort debug channel; ignore send failures
+            return
+
+    def _get_motion_obj_traj_world(self, timestep: int) -> tuple[np.ndarray, np.ndarray] | None:
+        if self.motion_obj_pos is None or self.motion_length == 0:
+            return None
+        if self.motion_obj_pos.ndim != 2 or self.motion_obj_pos.shape[1] != 3:
+            return None
+
+        short_idx = np.clip(timestep + np.arange(1, 11), 0, self.motion_length - 1)
+        long_idx = np.clip(timestep + np.array([20, 40, 60, 80, 100]), 0, self.motion_length - 1)
+        return self.motion_obj_pos[short_idx], self.motion_obj_pos[long_idx]
+
+    def _send_debug_traj_viz(self, timestep: int) -> None:
+        if not self._debug_traj_viz_enabled or self._debug_traj_viz_sock is None:
+            return
+        traj_world = self._get_motion_obj_traj_world(timestep)
+        if traj_world is None:
+            return
+        short_pos_w, long_pos_w = traj_world
+        packet = np.concatenate(
+            [
+                np.asarray(short_pos_w, dtype=np.float32).reshape(-1),
+                np.asarray(long_pos_w, dtype=np.float32).reshape(-1),
+            ],
+            axis=0,
+        )
+        try:
+            self._debug_traj_viz_sock.sendto(packet.tobytes(), self._debug_traj_viz_addr)
+        except OSError:
             return
 
     def _compute_obj_pcd(self, robot_state_data) -> np.ndarray:

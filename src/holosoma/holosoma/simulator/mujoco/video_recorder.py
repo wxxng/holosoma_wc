@@ -124,6 +124,9 @@ class MuJoCoVideoRecorder(VideoRecorderInterface):
 
         # Render frame using thread-appropriate renderer
         self.renderer.update_scene(render_data, camera=self.camera)
+        bridge = getattr(self.simulator, "bridge", None)
+        if bridge is not None and hasattr(bridge, "add_traj_viz_to_scene"):
+            bridge.add_traj_viz_to_scene(self.renderer.scene, clear_existing=False)
         frame = self.renderer.render()
 
         if frame is None:

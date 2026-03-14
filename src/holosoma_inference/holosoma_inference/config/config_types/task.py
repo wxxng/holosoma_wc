@@ -75,3 +75,9 @@ class TaskConfig:
 
     use_gen_traj: bool = False
     """Whether to use trajectory generator for object motion."""
+
+    debug_traj_viz: bool = True
+    """Enable short/long-horizon trajectory visualization in the MuJoCo viewer."""
+
+    debug_traj_viz_port: int = 10006
+    """UDP port used to stream trajectory visualization points to the simulator bridge."""

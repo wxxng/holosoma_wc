@@ -1,3 +1,4 @@
+import json
 import time
 import socket
 
@@ -20,6 +21,10 @@ ROBOT_STATE_UDP_PORT = 10003
 ROBOT_STATE_UDP_HOST = "127.0.0.1"
 TABLE_COMMAND_UDP_PORT = 10004
 TABLE_COMMAND_UDP_HOST = "127.0.0.1"
+SCENE_INFO_UDP_PORT = 10005
+SCENE_INFO_UDP_HOST = "127.0.0.1"
+TRAJ_VIZ_UDP_PORT = 10006
+TRAJ_VIZ_UDP_HOST = "127.0.0.1"
 
 
 class UnitreeSdk2Bridge(BasicSdk2Bridge):
@@ -60,12 +65,19 @@ class UnitreeSdk2Bridge(BasicSdk2Bridge):
         self._robot_state_sock = None
         self._robot_state_addr = None
         self._robot_state_warned = False
+        self._scene_info_sock = None
+        self._scene_info_addr = None
+        self._scene_info_warned = False
+        self._traj_viz_sock = None
+        self._traj_viz_short_pos = None
+        self._traj_viz_long_pos = None
         self._table_command_sock = None
         self._table_missing_warned = False
         self._table_actor_available = None
         self._table_body_id = None
         self._table_original_pos = None   # saved before first move, for reset
         self._table_original_quat = None
+        self._scene_reset_counter = 0
         if interface_name == "lo":
             self._object_state_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self._object_state_addr = (OBJECT_STATE_UDP_HOST, OBJECT_STATE_UDP_PORT)
@@ -77,6 +89,22 @@ class UnitreeSdk2Bridge(BasicSdk2Bridge):
             logger.info(
                 f"Robot state UDP publisher enabled on {ROBOT_STATE_UDP_HOST}:{ROBOT_STATE_UDP_PORT}"
             )
+            self._scene_info_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._scene_info_addr = (SCENE_INFO_UDP_HOST, SCENE_INFO_UDP_PORT)
+            logger.info(
+                f"Scene info UDP publisher enabled on {SCENE_INFO_UDP_HOST}:{SCENE_INFO_UDP_PORT}"
+            )
+            try:
+                self._traj_viz_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                self._traj_viz_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                self._traj_viz_sock.bind((TRAJ_VIZ_UDP_HOST, TRAJ_VIZ_UDP_PORT))
+                self._traj_viz_sock.setblocking(False)
+                logger.info(
+                    f"Trajectory viz UDP receiver enabled on {TRAJ_VIZ_UDP_HOST}:{TRAJ_VIZ_UDP_PORT}"
+                )
+            except OSError as exc:
+                self._traj_viz_sock = None
+                logger.warning(f"Failed to init trajectory viz UDP receiver: {exc}")
             try:
                 self._table_command_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 self._table_command_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -186,6 +214,8 @@ class UnitreeSdk2Bridge(BasicSdk2Bridge):
     def _publish_low_state_standard(self):
         """Publish state for standard robots (no hands)."""
         self._poll_table_commands()
+        self._poll_traj_viz_packets()
+        self._render_traj_viz()
         # Get simulator data
         positions, velocities, accelerations = self._get_dof_states()
         actuator_forces = self._get_actuator_forces()
@@ -215,12 +245,15 @@ class UnitreeSdk2Bridge(BasicSdk2Bridge):
         self.interface.publish_low_state(self.low_state)
         self._publish_object_state_udp()
         self._publish_robot_state_udp()
+        self._publish_scene_info_udp()
 
     def _publish_low_state_with_hands(self):
         """Publish state for 43 DOF robots (29 body + 14 hands)."""
         from unitree_interface import HandState
 
         self._poll_table_commands()
+        self._poll_traj_viz_packets()
+        self._render_traj_viz()
 
         # Read body commands from C++ interface (if any new commands available)
         self.low_cmd_handler()
@@ -261,6 +294,7 @@ class UnitreeSdk2Bridge(BasicSdk2Bridge):
         self.interface.publish_low_state(self.low_state)
         self._publish_object_state_udp()
         self._publish_robot_state_udp()
+        self._publish_scene_info_udp()
 
         # === Publish hand states via C++ binding ===
         # Read any incoming hand commands from policy
@@ -412,6 +446,35 @@ class UnitreeSdk2Bridge(BasicSdk2Bridge):
         state = states[0].detach().cpu().numpy().astype(np.float32, copy=False)
         self._robot_state_sock.sendto(state.tobytes(), self._robot_state_addr)
 
+    def _get_scene_object_name(self) -> str | None:
+        robot_type = str(self.robot.asset.robot_type)
+        if robot_type.startswith("g1_43dof_"):
+            object_name = robot_type[len("g1_43dof_"):].strip()
+            return object_name or None
+        return None
+
+    def _publish_scene_info_udp(self):
+        if self._scene_info_sock is None or self._scene_info_addr is None:
+            return
+        object_name = self._get_scene_object_name()
+        if not object_name:
+            if not self._scene_info_warned:
+                logger.warning("Scene object name is unavailable; skipping scene info UDP publish.")
+                self._scene_info_warned = True
+            return
+        packet = json.dumps(
+            {
+                "object_name": object_name,
+                "reset_counter": int(self._scene_reset_counter),
+            }
+        ).encode("utf-8")
+        try:
+            self._scene_info_sock.sendto(packet, self._scene_info_addr)
+        except OSError as exc:
+            if not self._scene_info_warned:
+                logger.warning(f"Failed to publish scene info UDP packet: {exc}")
+                self._scene_info_warned = True
+
     @staticmethod
     def _wxyz_to_xyzw(quat_wxyz: np.ndarray) -> np.ndarray:
         q = np.asarray(quat_wxyz, dtype=np.float32).reshape(-1)
@@ -439,6 +502,75 @@ class UnitreeSdk2Bridge(BasicSdk2Bridge):
                 self._apply_table_pose(pos, quat_wxyz)
             elif cmd_id == 2:
                 self._remove_table()
+
+    def _poll_traj_viz_packets(self) -> None:
+        if self._traj_viz_sock is None:
+            return
+        while True:
+            try:
+                data, _addr = self._traj_viz_sock.recvfrom(15 * 3 * 4)
+            except BlockingIOError:
+                break
+            if not data:
+                continue
+            packet = np.frombuffer(data, dtype=np.float32)
+            if packet.size != 15 * 3:
+                continue
+            positions = packet.reshape(15, 3)
+            self._traj_viz_short_pos = positions[:10].copy()
+            self._traj_viz_long_pos = positions[10:].copy()
+
+    def _render_traj_viz(self) -> None:
+        if self.simulator.viewer is None:
+            return
+        if self._traj_viz_short_pos is None and self._traj_viz_long_pos is None:
+            return
+
+        try:
+            import mujoco
+        except Exception:
+            return
+
+        scn = self.simulator.viewer.user_scn
+        scn.ngeom = 0
+        self.add_traj_viz_to_scene(scn, clear_existing=False)
+
+    def add_traj_viz_to_scene(self, scn, *, clear_existing: bool = False) -> None:
+        """Append trajectory debug spheres to an arbitrary MuJoCo scene."""
+        if self._traj_viz_short_pos is None and self._traj_viz_long_pos is None:
+            return
+
+        try:
+            import mujoco
+        except Exception:
+            return
+
+        if clear_existing:
+            scn.ngeom = 0
+
+        identity_mat = np.eye(3).flatten()
+        short_rgba = np.array([0.2, 0.9, 0.2, 0.8], dtype=np.float32)
+        long_rgba = np.array([0.9, 0.2, 0.2, 0.8], dtype=np.float32)
+        size = np.array([0.015, 0.0, 0.0], dtype=np.float64)
+
+        short_pos = None if self._traj_viz_short_pos is None else self._traj_viz_short_pos.copy()
+        long_pos = None if self._traj_viz_long_pos is None else self._traj_viz_long_pos.copy()
+
+        for points, rgba in ((short_pos, short_rgba), (long_pos, long_rgba)):
+            if points is None:
+                continue
+            for pos in points:
+                if scn.ngeom >= scn.maxgeom:
+                    return
+                mujoco.mjv_initGeom(
+                    scn.geoms[scn.ngeom],
+                    mujoco.mjtGeom.mjGEOM_SPHERE,
+                    size,
+                    np.asarray(pos, dtype=np.float64),
+                    identity_mat,
+                    rgba,
+                )
+                scn.ngeom += 1
 
     def _get_table_state(self):
         if self._table_actor_available is False:
@@ -520,6 +652,7 @@ class UnitreeSdk2Bridge(BasicSdk2Bridge):
         root_model.body_pos[self._table_body_id] = self._table_original_pos.copy()
         root_model.body_quat[self._table_body_id] = self._table_original_quat.copy()
         _mujoco.mj_kinematics(root_model, root_data)
+        self._scene_reset_counter += 1
         logger.info("Table body restored to original XML position after reset.")
 
     def _apply_table_pose(self, pos_xyz: np.ndarray, quat_wxyz: np.ndarray) -> None:

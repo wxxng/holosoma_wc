@@ -16,6 +16,8 @@ ROBOT_STATE_UDP_PORT = 10003
 ROBOT_STATE_UDP_HOST = "127.0.0.1"
 TABLE_COMMAND_UDP_PORT = 10004
 TABLE_COMMAND_UDP_HOST = "127.0.0.1"
+SCENE_INFO_UDP_PORT = 10005
+SCENE_INFO_UDP_HOST = "127.0.0.1"
 
 # World topics UDP (JSON) receiver (for external state sources).
 # Can be overridden via environment variables.
@@ -74,6 +76,9 @@ class InterfaceWrapper:
         self._table_command_sock = None
         self._table_command_addr = None
         self._table_command_warned = False
+        self._scene_info_sock = None
+        self._scene_object_name_cache = None
+        self._scene_reset_counter_cache = None
         # World topics receiver (external pose/velocity via UDP JSON)
         self._world_topics_sock = None
         self._world_robot_pose_cache = None  # [x,y,z,qx,qy,qz,qw] in FLU
@@ -85,6 +90,7 @@ class InterfaceWrapper:
             self._init_object_state_receiver()
             self._init_robot_state_receiver()
             self._init_table_command_sender()
+            self._init_scene_info_receiver()
         elif self.interface_str == "enp132s0":
             self._init_world_topics_receiver()
 
@@ -131,6 +137,21 @@ class InterfaceWrapper:
             self.logger.warning(f"Failed to init table command UDP sender: {exc}")
             self._table_command_sock = None
             self._table_command_addr = None
+
+    def _init_scene_info_receiver(self):
+        """Initialize UDP receiver for simulator scene metadata (loopback only)."""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((SCENE_INFO_UDP_HOST, SCENE_INFO_UDP_PORT))
+            sock.setblocking(False)
+            self._scene_info_sock = sock
+            self.logger.info(
+                f"Scene info UDP receiver enabled on {SCENE_INFO_UDP_HOST}:{SCENE_INFO_UDP_PORT}"
+            )
+        except OSError as exc:
+            self.logger.warning(f"Failed to init scene info UDP receiver: {exc}")
+            self._scene_info_sock = None
 
     def _init_world_topics_receiver(self):
         """Initialize UDP receiver for external world topics (JSON packets)."""
@@ -238,6 +259,34 @@ class InterfaceWrapper:
                 twist = np.concatenate([lin_flu, np.zeros(3, dtype=np.float32)], axis=0).astype(np.float32, copy=False)
                 if "robot_lin_vel" in topic or topic.endswith("/lin_vel"):
                     self._world_robot_twist_cache = twist
+
+    def _poll_scene_info(self) -> None:
+        """Drain pending scene-info packets and update cached object name."""
+        if self._scene_info_sock is None:
+            return
+        while True:
+            try:
+                data, _addr = self._scene_info_sock.recvfrom(4096)
+            except BlockingIOError:
+                break
+            if not data:
+                continue
+            try:
+                packet = json.loads(data.decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            object_name = packet.get("object_name", None)
+            if object_name is not None:
+                object_name = str(object_name).strip()
+                if object_name:
+                    self._scene_object_name_cache = object_name
+
+            reset_counter = packet.get("reset_counter", None)
+            if reset_counter is not None:
+                try:
+                    self._scene_reset_counter_cache = int(reset_counter)
+                except (TypeError, ValueError):
+                    pass
 
     def _init_sdk_components(self):
         """Initialize the appropriate backend based on SDK type."""
@@ -355,6 +404,16 @@ class InterfaceWrapper:
         if state is None or state.size < 3:
             return None
         return state[:3].reshape(1, 3)
+
+    def get_scene_object_name(self):
+        """Get latest scene object name if available."""
+        self._poll_scene_info()
+        return self._scene_object_name_cache
+
+    def get_scene_reset_counter(self):
+        """Get latest simulator reset counter if available."""
+        self._poll_scene_info()
+        return self._scene_reset_counter_cache
 
     def set_table_pose(self, pos_xyz, quat_wxyz=None):
         """Send table pose command to simulator bridge over UDP.
