@@ -448,6 +448,11 @@ class WholeBodyTrackingPolicy(BasePolicy):
         self._last_sent_table_frame = None
         self._table_pose_send_warned = False
 
+        # BPS code cache (per object name) — must be initialized before super().__init__
+        # because setup_policy -> _load_motion_from_pkl may call _load_bps_code
+        self._bps_cache: dict[str, np.ndarray] = {}
+        self._obj_bps: np.ndarray | None = None  # current object BPS code (512,)
+
         super().__init__(config)
 
         # Load stiff startup parameters from robot config
@@ -1166,6 +1171,14 @@ class WholeBodyTrackingPolicy(BasePolicy):
                 # Motion clip rotations are xyzw; convert to wxyz for internal use.
                 self.motion_table_rot_wxyz = xyzw_to_wxyz(table_rot)
         self.motion_obj_name = clip_data.get("obj_name")
+        if isinstance(self.motion_obj_name, (list, np.ndarray)):
+            self.motion_obj_name = self.motion_obj_name[0]
+        if self.motion_obj_name is not None:
+            self.motion_obj_name = str(self.motion_obj_name).strip()
+
+        # Load BPS code for the object (used by g1-43dof-object-bps policy)
+        if "obj_bps" in self.obs_dims and self.motion_obj_name:
+            self._obj_bps = self._load_bps_code(self.motion_obj_name)
 
         # Optional: motion root pose for motion-frame transforms
         root_pos_raw = None
@@ -1563,47 +1576,89 @@ class WholeBodyTrackingPolicy(BasePolicy):
         else:
             # Use training KP/KD values (in config order - 43 DOF)
             # Config order: [L_leg(6), R_leg(6), waist(3), L_arm(4), L_hand(7), R_arm(4), R_hand(7)]
+            # self.onnx_kp = np.array([
+            #     # Left leg (6 joints): hip_pitch, hip_roll, hip_yaw, knee, ankle_pitch, ankle_roll
+            #     28.5012, 28.5012, 28.5012, 28.5012, 28.5012, 28.5012,
+            #     # Right leg (6 joints): hip_pitch, hip_roll, hip_yaw, knee, ankle_pitch, ankle_roll
+            #     28.5012, 28.5012, 28.5012, 28.5012, 28.5012, 28.5012,
+            #     # Waist (3 joints): yaw, roll, pitch
+            #     40.1792, 28.5012, 28.5012,
+            #     # Left arm (4 joints): shoulder_pitch, shoulder_roll, shoulder_yaw, elbow
+            #     14.2506, 14.2506, 14.2506, 14.2506,
+            #     # Left wrist (3 joints): roll, pitch, yaw
+            #     14.2506, 16.7783, 16.7783,
+            #     # Left hand (7 joints): thumb_0, thumb_1, thumb_2, middle_0, middle_1, index_0, index_1
+            #     2.0000, 0.5000, 0.5000, 0.5000, 0.5000, 0.5000, 0.5000,
+            #     # Right arm (4 joints): shoulder_pitch, shoulder_roll, shoulder_yaw, elbow
+            #     14.2506, 14.2506, 14.2506, 14.2506,
+            #     # Right wrist (3 joints): roll, pitch, yaw
+            #     14.2506, 16.7783, 16.7783,
+            #     # Right hand (7 joints): thumb_0, thumb_1, thumb_2, middle_0, middle_1, index_0, index_1
+            #     2.0000, 0.5000, 0.5000, 0.5000, 0.5000, 0.5000, 0.5000,
+            # ], dtype=np.float32)
+
             self.onnx_kp = np.array([
-                # Left leg (6 joints): hip_pitch, hip_roll, hip_yaw, knee, ankle_pitch, ankle_roll
-                28.5012, 28.5012, 28.5012, 28.5012, 28.5012, 28.5012,
-                # Right leg (6 joints): hip_pitch, hip_roll, hip_yaw, knee, ankle_pitch, ankle_roll
-                28.5012, 28.5012, 28.5012, 28.5012, 28.5012, 28.5012,
-                # Waist (3 joints): yaw, roll, pitch
-                40.1792, 28.5012, 28.5012,
-                # Left arm (4 joints): shoulder_pitch, shoulder_roll, shoulder_yaw, elbow
-                14.2506, 14.2506, 14.2506, 14.2506,
-                # Left wrist (3 joints): roll, pitch, yaw
-                14.2506, 16.7783, 16.7783,
-                # Left hand (7 joints): thumb_0, thumb_1, thumb_2, middle_0, middle_1, index_0, index_1
+                # Left leg: hip_pitch, hip_roll, hip_yaw, knee, ankle_pitch, ankle_roll
+                40.17923737, 99.09842682, 40.17923737, 99.09842682, 28.50124550, 28.50124550,
+                # Right leg
+                40.17923737, 99.09842682, 40.17923737, 99.09842682, 28.50124550, 28.50124550,
+                # Waist: yaw, roll, pitch
+                40.17923737, 28.50124550, 28.50124550,
+                # Left arm: shoulder_pitch, shoulder_roll, shoulder_yaw, elbow
+                14.25062275, 14.25062275, 14.25062275, 14.25062275,
+                # Left wrist: roll, pitch, yaw
+                14.25062275, 16.77832794, 16.77832794,
+                # Left hand
                 2.0000, 0.5000, 0.5000, 0.5000, 0.5000, 0.5000, 0.5000,
-                # Right arm (4 joints): shoulder_pitch, shoulder_roll, shoulder_yaw, elbow
-                14.2506, 14.2506, 14.2506, 14.2506,
-                # Right wrist (3 joints): roll, pitch, yaw
-                14.2506, 16.7783, 16.7783,
-                # Right hand (7 joints): thumb_0, thumb_1, thumb_2, middle_0, middle_1, index_0, index_1
+                # Right arm
+                14.25062275, 14.25062275, 14.25062275, 14.25062275,
+                # Right wrist
+                14.25062275, 16.77832794, 16.77832794,
+                # Right hand
                 2.0000, 0.5000, 0.5000, 0.5000, 0.5000, 0.5000, 0.5000,
             ], dtype=np.float32)
-            
+
             self.onnx_kd = np.array([
-                # Left leg (6 joints)
-                1.8144, 1.8144, 1.8144, 1.8144, 1.8144, 1.8144,
-                # Right leg (6 joints)
-                1.8144, 1.8144, 1.8144, 1.8144, 1.8144, 1.8144,
-                # Waist (3 joints): yaw, roll, pitch
-                2.5579, 1.8144, 1.8144,
-                # Left arm (4 joints)
-                0.9072, 0.9072, 0.9072, 0.9072,
-                # Left wrist (3 joints): roll, pitch, yaw
-                0.9072, 1.0681, 1.0681,
-                # Left hand (7 joints)
+                # Left leg: hip_pitch, hip_roll, hip_yaw, knee, ankle_pitch, ankle_roll
+                2.55788970, 6.30880185, 2.55788970, 6.30880185, 1.81444573, 1.81444573,
+                # Right leg
+                2.55788970, 6.30880185, 2.55788970, 6.30880185, 1.81444573, 1.81444573,
+                # Waist: yaw, roll, pitch
+                2.55788970, 1.81444573, 1.81444573,
+                # Left arm
+                0.90722287, 0.90722287, 0.90722287, 0.90722287,
+                # Left wrist: roll, pitch, yaw
+                0.90722287, 1.06814146, 1.06814146,
+                # Left hand
                 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000,
-                # Right arm (4 joints)
-                0.9072, 0.9072, 0.9072, 0.9072,
-                # Right wrist (3 joints): roll, pitch, yaw
-                0.9072, 1.0681, 1.0681,
-                # Right hand (7 joints)
+                # Right arm
+                0.90722287, 0.90722287, 0.90722287, 0.90722287,
+                # Right wrist
+                0.90722287, 1.06814146, 1.06814146,
+                # Right hand
                 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000,
             ], dtype=np.float32)
+
+            # self.onnx_kd = np.array([
+            #     # Left leg (6 joints)
+            #     1.8144, 1.8144, 1.8144, 1.8144, 1.8144, 1.8144,
+            #     # Right leg (6 joints)
+            #     1.8144, 1.8144, 1.8144, 1.8144, 1.8144, 1.8144,
+            #     # Waist (3 joints): yaw, roll, pitch
+            #     2.5579, 1.8144, 1.8144,
+            #     # Left arm (4 joints)
+            #     0.9072, 0.9072, 0.9072, 0.9072,
+            #     # Left wrist (3 joints): roll, pitch, yaw
+            #     0.9072, 1.0681, 1.0681,
+            #     # Left hand (7 joints)
+            #     0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000,
+            #     # Right arm (4 joints)
+            #     0.9072, 0.9072, 0.9072, 0.9072,
+            #     # Right wrist (3 joints): roll, pitch, yaw
+            #     0.9072, 1.0681, 1.0681,
+            #     # Right hand (7 joints)
+            #     0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000,
+            # ], dtype=np.float32)
             
             logger.info(colored("Using training KP/KD values (43-DOF config order)", "cyan"))
 
@@ -1839,12 +1894,32 @@ class WholeBodyTrackingPolicy(BasePolicy):
         obj_pos_diff_b = self._compute_obj_pos_diff_b(robot_state_data)
         current_obs_buffer_dict["obj_pos_diff_b"] = obj_pos_diff_b
 
+        # BPS policy observation terms (used by g1-43dof-object-bps)
+        _bps_yaw_quat = None
+        if "obj_pos_rel" in self.obs_dims or "obj_rot_6d" in self.obs_dims:
+            _bps_obj_pos, _bps_obj_rot_6d, _bps_yaw_quat = self._compute_bps_obj_state(robot_state_data)
+            current_obs_buffer_dict["obj_pos_rel"] = _bps_obj_pos
+            current_obs_buffer_dict["obj_rot_6d"] = _bps_obj_rot_6d
+        if "obj_bps" in self.obs_dims:
+            if self._obj_bps is not None:
+                current_obs_buffer_dict["obj_bps"] = self._obj_bps.reshape(1, -1)
+            else:
+                current_obs_buffer_dict["obj_bps"] = np.zeros((1, 512), dtype=np.float32)
+        if "motion_obj_pos_short" in self.obs_dims or "motion_obj_ori_short" in self.obs_dims:
+            pos_short, ori_short, pos_long, ori_long = self._compute_bps_motion_commands(
+                robot_state_data, command_timestep, _bps_yaw_quat
+            )
+            current_obs_buffer_dict["motion_obj_pos_short"] = pos_short
+            current_obs_buffer_dict["motion_obj_ori_short"] = ori_short
+            current_obs_buffer_dict["motion_obj_pos_long"] = pos_long
+            current_obs_buffer_dict["motion_obj_ori_long"] = ori_long
+
         # Motion object commands (reference motion only)
         if self.motion_data is not None and self.motion_obj_pos is not None and self.motion_obj_rot is not None:
-            obj_pos_rel = self._compute_motion_obj_pos_rel_all(robot_state_data, command_timestep)
-            obj_ori_rel = self._compute_motion_obj_ori_rel_all(robot_state_data, command_timestep)
-            current_obs_buffer_dict["motion_obj_pos_rel_all"] = obj_pos_rel
-            current_obs_buffer_dict["motion_obj_ori_rel_all"] = obj_ori_rel
+            _motion_obj_pos_rel = self._compute_motion_obj_pos_rel_all(robot_state_data, command_timestep)
+            _motion_obj_ori_rel = self._compute_motion_obj_ori_rel_all(robot_state_data, command_timestep)
+            current_obs_buffer_dict["motion_obj_pos_rel_all"] = _motion_obj_pos_rel
+            current_obs_buffer_dict["motion_obj_ori_rel_all"] = _motion_obj_ori_rel
         else:
             current_obs_buffer_dict["motion_obj_pos_rel_all"] = np.zeros((1, 42), dtype=np.float32)
             current_obs_buffer_dict["motion_obj_ori_rel_all"] = np.zeros((1, 84), dtype=np.float32)
@@ -2053,15 +2128,27 @@ class WholeBodyTrackingPolicy(BasePolicy):
 
     def _check_and_request_table_removal(self):
         """Monitor object height and request table removal when object rises 0.1m."""
-        if self._table_removed:
-            return
-        
         obj_pos_w = self._get_object_pos_w()
         if obj_pos_w is None:
             self.logger.debug("Object position not available for table removal check")
             return
-        
+
         current_height = float(obj_pos_w[0, 2])
+
+        # Detect simulator reset: table was removed but the object has returned to
+        # (or below) its initial height, meaning the episode was restarted with R.
+        if self._table_removed and self._initial_object_height is not None:
+            if current_height <= self._initial_object_height + 0.01:
+                self.logger.info(
+                    "Simulator reset detected (object back at initial height): "
+                    "clearing table-removal state"
+                )
+                self._table_removed = False
+                self._initial_object_height = None
+                self._last_sent_table_frame = None
+
+        if self._table_removed:
+            return
         
         # Store initial height on first call
         if self._initial_object_height is None:
@@ -2085,6 +2172,99 @@ class WholeBodyTrackingPolicy(BasePolicy):
                 self._table_removed = True
                 self.logger.info("✓ Table removal flag set")
     
+    def _compute_bps_obj_state(
+        self, robot_state_data
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Compute current object pos and 6D orientation in robot heading frame.
+
+        Returns:
+            obj_pos_rel  : (1, 3)  object position relative to torso in heading frame
+            obj_rot_6d   : (1, 6)  object 6D rotation in heading frame (first 2 columns of R)
+            yaw_quat     : (1, 4)  heading (yaw-only) quaternion wxyz for reuse
+        """
+        torso_pos_w, ref_quat_wxyz = self._get_ref_body_pose_in_world(robot_state_data)
+        _, _, yaw = quat_to_rpy(ref_quat_wxyz.reshape(-1))
+        yaw_quat = rpy_to_quat((0.0, 0.0, yaw)).reshape(1, 4)
+
+        obj_pos_w = self._get_object_pos_w()
+        if obj_pos_w is not None:
+            delta = obj_pos_w - torso_pos_w.reshape(1, 3)
+            obj_pos_rel = quat_rotate_inverse(yaw_quat, delta).astype(np.float32)
+        else:
+            obj_pos_rel = np.zeros((1, 3), dtype=np.float32)
+
+        obj_quat_w = self._get_object_quat_w()
+        if obj_quat_w is not None:
+            q_w2h = quat_inverse(yaw_quat)
+            q_obj_h = quat_mul(q_w2h, self._normalize_quat_wxyz(obj_quat_w))
+            R = matrix_from_quat(q_obj_h)  # (1, 3, 3)
+            obj_rot_6d = R[0, :, :2].flatten().reshape(1, 6).astype(np.float32)
+        else:
+            obj_rot_6d = np.zeros((1, 6), dtype=np.float32)
+
+        return obj_pos_rel, obj_rot_6d, yaw_quat
+
+    def _compute_bps_motion_commands(
+        self,
+        robot_state_data,
+        timestep: int,
+        yaw_quat: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Compute short- and long-horizon object trajectory in heading frame for BPS policy.
+
+        Short-horizon: t+1 .. t+10 (10 frames), absolute positions / orientations.
+        Long-horizon : t+20, t+40, t+60, t+80, t+100 (5 frames).
+
+        Returns:
+            pos_short  : (1, 30)  10×3 positions
+            ori_short  : (1, 60)  10×6 6D orientations
+            pos_long   : (1, 15)   5×3 positions
+            ori_long   : (1, 30)   5×6 6D orientations
+        """
+        if self.motion_obj_pos is None or self.motion_obj_rot is None:
+            return (
+                np.zeros((1, 30), dtype=np.float32),
+                np.zeros((1, 60), dtype=np.float32),
+                np.zeros((1, 15), dtype=np.float32),
+                np.zeros((1, 30), dtype=np.float32),
+            )
+
+        if yaw_quat is None:
+            torso_pos_w, ref_quat_wxyz = self._get_ref_body_pose_in_world(robot_state_data)
+            _, _, yaw = quat_to_rpy(ref_quat_wxyz.reshape(-1))
+            yaw_quat = rpy_to_quat((0.0, 0.0, yaw)).reshape(1, 4)
+        else:
+            torso_pos_w, _ = self._get_ref_body_pose_in_world(robot_state_data)
+
+        torso_pos = torso_pos_w.reshape(1, 3)
+
+        short_idx = np.clip(timestep + np.arange(1, 11), 0, self.motion_length - 1)
+        long_idx  = np.clip(timestep + np.array([20, 40, 60, 80, 100]), 0, self.motion_length - 1)
+
+        # Positions: (N, 3) world → heading frame relative to torso
+        def _pos_to_heading(pos_w_batch: np.ndarray) -> np.ndarray:
+            delta = pos_w_batch - torso_pos  # (N, 3)
+            q = np.repeat(yaw_quat, delta.shape[0], axis=0)
+            return quat_rotate_inverse(q, delta).astype(np.float32)
+
+        pos_short = _pos_to_heading(self.motion_obj_pos[short_idx]).reshape(1, -1)
+        pos_long  = _pos_to_heading(self.motion_obj_pos[long_idx]).reshape(1, -1)
+
+        # Orientations: (N, 4) world wxyz → heading frame → 6D
+        q_w2h = quat_inverse(yaw_quat)
+
+        def _ori_to_6d(rot_wxyz_batch: np.ndarray) -> np.ndarray:
+            n = rot_wxyz_batch.shape[0]
+            q_rep = np.repeat(q_w2h, n, axis=0)
+            q_h = self._normalize_quat_wxyz(quat_mul(q_rep, self._normalize_quat_wxyz(rot_wxyz_batch)))
+            R = matrix_from_quat(q_h)  # (N, 3, 3)
+            return R[..., :2].reshape(1, -1).astype(np.float32)  # (1, N*6)
+
+        ori_short = _ori_to_6d(self.motion_obj_rot[short_idx])
+        ori_long  = _ori_to_6d(self.motion_obj_rot[long_idx])
+
+        return pos_short, ori_short, pos_long, ori_long
+
     def _compute_obj_pos_diff_b(self, robot_state_data):
         """Compute object position delta in the previous robot frame."""
         # Check object height for table removal
@@ -2110,6 +2290,24 @@ class WholeBodyTrackingPolicy(BasePolicy):
         self._prev_robot_obj_pos_w = obj_pos_w.copy()
         self._prev_robot_anchor_quat_w = ref_quat_wxyz.copy()
         return obj_pos_diff_b.astype(np.float32, copy=False)
+
+    def _load_bps_code(self, obj_name: str) -> np.ndarray | None:
+        """Load BPS shape encoding (512,) for the given object. Returns None on failure."""
+        if obj_name in self._bps_cache:
+            return self._bps_cache[obj_name]
+        bps_root = Path("src/holosoma/holosoma/data/objects_new/objects_new")
+        bps_path = bps_root / obj_name / f"{obj_name}_bps.pkl"
+        if not bps_path.exists():
+            logger.warning(f"BPS file not found: {bps_path}")
+            return None
+        bps_data = joblib.load(str(bps_path))
+        code = bps_data["bps_code"]
+        if hasattr(code, "numpy"):
+            code = code.numpy()
+        code = np.asarray(code, dtype=np.float32).flatten()  # (512,)
+        self._bps_cache[obj_name] = code
+        logger.info(f"Loaded BPS code {code.shape} for '{obj_name}'")
+        return code
 
     def _load_mesh_points(self, obj_name: str) -> np.ndarray | None:
         if obj_name in self._mesh_points_cache:

@@ -217,6 +217,70 @@ wbt_29dof_tracking = ObservationConfig(
     },
 )
 
+wbt_43dof_object_bps = ObservationConfig(
+    obs_dict={
+        "task": [
+            "obj_pos_rel",           # current obj pos in heading frame (3)
+            "obj_rot_6d",            # current obj 6D rotation in heading frame (6)
+        ],
+        "proprio_hand": [
+            "joint_pos_hand",        # (14)
+            "joint_vel_hand",        # (14)
+        ],
+        "proprio_body": [
+            "joint_pos_body",        # (29)
+            "joint_vel_body",        # (29)
+            "base_ang_vel",          # (3)
+            "projected_gravity",     # (3)
+        ],
+        "command": [
+            "obj_bps",               # BPS shape code (512)
+            "motion_obj_pos_short",  # 10-frame short-horizon obj pos in heading frame (10×3=30)
+            "motion_obj_ori_short",  # 10-frame short-horizon obj ori 6D (10×6=60)
+            "motion_obj_pos_long",   # 5-frame long-horizon obj pos (5×3=15)
+            "motion_obj_ori_long",   # 5-frame long-horizon obj ori 6D (5×6=30)
+        ],
+    },
+    obs_dims={
+        "obj_pos_rel":          3,
+        "obj_rot_6d":           6,
+        "joint_pos_hand":      14,
+        "joint_vel_hand":      14,
+        "joint_pos_body":      29,
+        "joint_vel_body":      29,
+        "base_ang_vel":         3,
+        "projected_gravity":    3,
+        "obj_bps":            512,
+        "motion_obj_pos_short": 30,
+        "motion_obj_ori_short": 60,
+        "motion_obj_pos_long":  15,
+        "motion_obj_ori_long":  30,
+    },
+    obs_scales={
+        "obj_pos_rel":          1.0,
+        "obj_rot_6d":           1.0,
+        "joint_pos_hand":       1.0,
+        "joint_vel_hand":       1.0,
+        "joint_pos_body":       1.0,
+        "joint_vel_body":       1.0,
+        "base_ang_vel":         1.0,
+        "projected_gravity":    1.0,
+        "obj_bps":              1.0,
+        "motion_obj_pos_short": 1.0,
+        "motion_obj_ori_short": 1.0,
+        "motion_obj_pos_long":  1.0,
+        "motion_obj_ori_long":  1.0,
+    },
+    history_length_dict={
+        "task":         5,
+        "proprio_hand": 5,
+        "proprio_body": 5,
+        "command":      1,
+    },
+)
+# Obs layout: task(45) + proprio_hand(140) + proprio_body(320) + command(647) = 1152
+# command: bps(512) + short_pos(30) + short_ori(60) + long_pos(15) + long_ori(30)
+
 wbt_43dof_object = ObservationConfig(
     obs_dict={
         "command": [
@@ -299,6 +363,7 @@ DEFAULTS = {
     "wbt-29dof-dancing": wbt_29dof_dancing,
     "wbt-29dof-tracking": wbt_29dof_tracking,
     "wbt-43dof-object": wbt_43dof_object,
+    "wbt-43dof-object-bps": wbt_43dof_object_bps,
 }
 """Dictionary of all available observation configurations.
 

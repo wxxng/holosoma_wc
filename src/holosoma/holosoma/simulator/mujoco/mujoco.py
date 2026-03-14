@@ -940,6 +940,10 @@ class MuJoCo(BaseSimulator):
         mujoco.mj_resetData(self.root_model, self.root_data)
         self._set_robot_initial_state()
         self._load_mujoco_objects_from_config()
+        # Restore static table body_pos/quat that may have been moved or hidden during
+        # the episode (mj_resetData only resets mjData, not mjModel.body_pos).
+        if self.bridge is not None and hasattr(self.bridge, "restore_table"):
+            self.bridge.restore_table()
         mujoco.mj_forward(self.root_model, self.root_data)
         if self.virtual_gantry is not None:
             self.virtual_gantry.set_enable(True)

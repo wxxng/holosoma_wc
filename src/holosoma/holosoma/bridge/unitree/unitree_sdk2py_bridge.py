@@ -64,6 +64,8 @@ class UnitreeSdk2Bridge(BasicSdk2Bridge):
         self._table_missing_warned = False
         self._table_actor_available = None
         self._table_body_id = None
+        self._table_original_pos = None   # saved before first move, for reset
+        self._table_original_quat = None
         if interface_name == "lo":
             self._object_state_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self._object_state_addr = (OBJECT_STATE_UDP_HOST, OBJECT_STATE_UDP_PORT)
@@ -480,11 +482,45 @@ class UnitreeSdk2Bridge(BasicSdk2Bridge):
         if self._table_body_id < 0:
             return False
 
+        # Save the original position/orientation before the first modification so we
+        # can restore them when the simulator is reset (R key).
+        if self._table_original_pos is None:
+            self._table_original_pos = root_model.body_pos[self._table_body_id].copy()
+            self._table_original_quat = root_model.body_quat[self._table_body_id].copy()
+
         root_model.body_pos[self._table_body_id] = np.asarray(pos_xyz, dtype=np.float32)
         root_model.body_quat[self._table_body_id] = np.asarray(quat_wxyz, dtype=np.float32)
         # Reflect model-body pose edits in runtime body transforms.
         mujoco.mj_kinematics(root_model, root_data)
         return True
+
+    def restore_table(self) -> None:
+        """Restore the table body to its original XML position after a simulator reset.
+
+        mj_resetData() only resets mjData (qpos/qvel/etc.), not mjModel.body_pos,
+        so any _apply_table_pose_static_body / _remove_table edits persist across
+        resets unless we explicitly undo them here.
+        """
+        if self._table_original_pos is None:
+            return  # table was never moved; nothing to restore
+
+        root_model = getattr(self.simulator, "root_model", None)
+        root_data = getattr(self.simulator, "root_data", None)
+        if root_model is None or root_data is None:
+            return
+
+        try:
+            import mujoco as _mujoco
+        except Exception:
+            return
+
+        if self._table_body_id is None or self._table_body_id < 0:
+            return
+
+        root_model.body_pos[self._table_body_id] = self._table_original_pos.copy()
+        root_model.body_quat[self._table_body_id] = self._table_original_quat.copy()
+        _mujoco.mj_kinematics(root_model, root_data)
+        logger.info("Table body restored to original XML position after reset.")
 
     def _apply_table_pose(self, pos_xyz: np.ndarray, quat_wxyz: np.ndarray) -> None:
         quat = np.asarray(quat_wxyz, dtype=np.float32).reshape(-1)

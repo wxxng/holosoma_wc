@@ -145,6 +145,11 @@ class SimulatorBridge:
         sim_time = self.simulator.time()
         self.clock_pub.publish(sim_time)
 
+    def restore_table(self) -> None:
+        """Delegate table restore to the underlying robot bridge (called on reset)."""
+        if self.robot_bridge is not None and hasattr(self.robot_bridge, "restore_table"):
+            self.robot_bridge.restore_table()
+
     def is_enabled(self) -> bool:
         """Check if the bridge is enabled and functional.
 
