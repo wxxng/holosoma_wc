@@ -102,6 +102,48 @@ loco_t1_29dof = ObservationConfig(
 
 
 # =============================================================================
+# 43-DOF Prior Locomotion Observation Configuration
+# =============================================================================
+
+loco_g1_43dof_prior = ObservationConfig(
+    obs_dict={
+        "actor_obs": [
+            "vel_command",        # (3)  [lin_x, lin_y, ang_z]  — identifies this policy type
+            "joint_pos_body",     # (29) body joints relative to default
+            "joint_vel_body",     # (29) body joint velocities
+            "base_ang_vel",       # (3)
+            "projected_gravity",  # (3)
+            "joint_pos_hand",     # (14) hand joints relative to default
+            "joint_vel_hand",     # (14) hand joint velocities
+            "actions",            # (43) last raw action (ACTION_ORDER_43DOF)
+        ]
+    },
+    obs_dims={
+        "vel_command":       3,
+        "joint_pos_body":   29,
+        "joint_vel_body":   29,
+        "base_ang_vel":      3,
+        "projected_gravity": 3,
+        "joint_pos_hand":   14,
+        "joint_vel_hand":   14,
+        "actions":          43,
+    },
+    obs_scales={
+        "vel_command":       1.0,
+        "joint_pos_body":    1.0,
+        "joint_vel_body":    1.0,
+        "base_ang_vel":      1.0,
+        "projected_gravity": 1.0,
+        "joint_pos_hand":    1.0,
+        "joint_vel_hand":    1.0,
+        "actions":           1.0,
+    },
+    history_length_dict={
+        "actor_obs": 1,
+    },
+)
+
+# =============================================================================
 # WBT (Whole Body Tracking) Observation Configurations
 # =============================================================================
 
@@ -253,6 +295,7 @@ wbt = wbt_29dof_dancing
 DEFAULTS = {
     "loco-g1-29dof": loco_g1_29dof,
     "loco-t1-29dof": loco_t1_29dof,
+    "loco-g1-43dof-prior": loco_g1_43dof_prior,
     "wbt-29dof-dancing": wbt_29dof_dancing,
     "wbt-29dof-tracking": wbt_29dof_tracking,
     "wbt-43dof-object": wbt_43dof_object,

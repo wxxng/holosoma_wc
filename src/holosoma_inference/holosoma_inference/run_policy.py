@@ -20,6 +20,7 @@ from holosoma_inference.config.config_types.inference import InferenceConfig
 from holosoma_inference.config.config_values.inference import AnnotatedInferenceConfig
 from holosoma_inference.config.utils import TYRO_CONFIG
 from holosoma_inference.policies.locomotion import LocomotionPolicy
+from holosoma_inference.policies.locomotion_prior_43dof import LocomotionPrior43DOF
 from holosoma_inference.policies.wbt import WholeBodyTrackingPolicy
 from holosoma_inference.policies.wbt_motion import MotionTrackingPolicy
 from holosoma_inference.policies.wbt_object import WholeBodyTrackingPolicy as ObjectTrackingPolicy
@@ -108,6 +109,9 @@ def run_policy(config: InferenceConfig):
             policy_class = WholeBodyTrackingPolicy
         elif "actor_obs" not in config.observation.obs_dict:
             policy_class = ObjectTrackingPolicy
+        elif "vel_command" in actor_obs:
+            # 43-DOF prior loco: combined vel_command obs + per-joint action scaling
+            policy_class = LocomotionPrior43DOF
         else:
             policy_class = LocomotionPolicy
         logger.info(f"Using {policy_class.__name__}")

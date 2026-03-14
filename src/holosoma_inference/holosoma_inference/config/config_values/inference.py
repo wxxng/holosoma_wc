@@ -95,6 +95,48 @@ g1_29dof_tracking = InferenceConfig(
     task=task.wbt_tracking,
 )
 
+# G1 43-DOF Locomotion — walk_prior_dr ONNX (no gait phase)
+# fmt: off
+g1_43dof_loco_prior = InferenceConfig(
+    robot=replace(
+        robot.g1_43dof,
+        stiff_startup_pos=(
+            -0.312, 0.0, 0.0, 0.669, -0.363, 0.0,  # left leg
+            -0.312, 0.0, 0.0, 0.669, -0.363, 0.0,  # right leg
+            0.0, 0.0, 0.0,                           # waist
+            0.2, 0.2, 0.0, 0.6, 0.0, 0.0, 0.0,     # left arm
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,     # left hand
+            0.2, -0.2, 0.0, 0.6, 0.0, 0.0, 0.0,    # right arm
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,     # right hand
+        ),
+        # Motor KP in DOF_NAMES config order (43 joints)
+        motor_kp=(
+            40.17923737, 99.09842682, 40.17923737, 99.09842682, 28.50124550, 28.50124550,  # left leg
+            40.17923737, 99.09842682, 40.17923737, 99.09842682, 28.50124550, 28.50124550,  # right leg
+            40.17923737, 28.50124550, 28.50124550,                                          # waist
+            14.25062275, 14.25062275, 14.25062275, 14.25062275, 14.25062275, 16.77832794, 16.77832794,  # left arm
+            2.0000, 0.5000, 0.5000, 0.5000, 0.5000, 0.5000, 0.5000,                        # left hand
+            14.25062275, 14.25062275, 14.25062275, 14.25062275, 14.25062275, 16.77832794, 16.77832794,  # right arm
+            2.0000, 0.5000, 0.5000, 0.5000, 0.5000, 0.5000, 0.5000,                        # right hand
+        ),
+        # Motor KD in DOF_NAMES config order (43 joints)
+        motor_kd=(
+            2.5578897 , 6.3088017 , 2.5578897 , 6.3088017 , 1.8144457 ,
+            1.8144457 , 2.5578897 , 6.3088017 , 2.5578897 , 6.3088017 ,
+            1.8144457 , 1.8144457 , 2.5578897 , 1.8144457 , 1.8144457 ,
+            0.90722287, 0.90722287, 0.90722287, 0.90722287, 0.90722287,
+            1.0681415 , 1.0681415 , 0.1       , 0.1       , 0.1       ,
+            0.1       , 0.1       , 0.1       , 0.1       , 0.90722287,
+            0.90722287, 0.90722287, 0.90722287, 0.90722287, 1.0681415 ,
+            1.0681415 , 0.1       , 0.1       , 0.1       , 0.1       ,
+            0.1       , 0.1       , 0.1
+        ),
+    ),
+    observation=observation.loco_g1_43dof_prior,
+    task=task.locomotion_43dof_prior,
+)
+# fmt: on
+
 # G1 Whole-Body Tracking with Hands (43 DOF)
 g1_43dof_object = InferenceConfig(
     robot=replace(
@@ -156,8 +198,9 @@ DEFAULTS = {
     "g1-29dof-loco": g1_29dof_loco,
     "t1-29dof-loco": t1_29dof_loco,
     "g1-29dof-dancing": g1_29dof_dancing,
-    "g1-29dof-tracking" : g1_29dof_tracking,
-    "g1-43dof-object" : g1_43dof_object
+    "g1-29dof-tracking": g1_29dof_tracking,
+    "g1-43dof-loco-prior": g1_43dof_loco_prior,
+    "g1-43dof-object": g1_43dof_object,
 }
 
 # Auto-discover inference configs from installed extensions
