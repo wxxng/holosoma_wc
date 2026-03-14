@@ -929,8 +929,30 @@ class MuJoCo(BaseSimulator):
         if self.virtual_gantry:
             self.virtual_gantry.draw_debug()
 
+    def _do_reset(self) -> None:
+        """Perform a full environment reset to the initial spawn state.
+
+        Resets physics, restores config-defined initial robot state, repositions
+        the virtual gantry, and clears any stale bridge commands.
+        Called when the user presses 'R' during simulation.
+        """
+        assert self.root_data
+        mujoco.mj_resetData(self.root_model, self.root_data)
+        self._set_robot_initial_state()
+        self._load_mujoco_objects_from_config()
+        mujoco.mj_forward(self.root_model, self.root_data)
+        if self.virtual_gantry is not None:
+            self.virtual_gantry.set_enable(True)
+        self.on_episode_start(env_id=0)
+        logger.info("Environment reset to initial state")
+
     def simulate_at_each_physics_step(self) -> None:
         """Advance simulation by one step."""
+
+        if getattr(self, "_reset_requested", False):
+            self._reset_requested = False
+            self._do_reset()
+            return
 
         if self.virtual_gantry:
             # Apply virtual gantry forces before step
@@ -1451,6 +1473,7 @@ class MuJoCo(BaseSimulator):
             return
 
         self.viewer = mujoco.viewer.launch_passive(self.root_model, self.root_data, key_callback=self._key_callback)
+        self._reset_requested = False
         logger.info("=== Viewer setup completed with keyboard callback ===")
 
     def _add_text_overlay(
@@ -1584,7 +1607,7 @@ class MuJoCo(BaseSimulator):
             "Press '9' to toggle it \n"
             f"Camera tracking: {camera_status} \n"
             "Press 'y' to toggle camera tracking \n"
-            "Press backspace to reset the environment \n"
+            "Press 'r' to reset environment to initial state \n"
             "Press 'g' to hide this menu"
         )
 

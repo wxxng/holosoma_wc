@@ -50,6 +50,11 @@ class CommandRegistry:
             glfw.KEY_MINUS: GantryCommandData(GantryCommand.FORCE_SIGN_TOGGLE),
         }
 
+        # Sim commands
+        self.sim_commands = {
+            glfw.KEY_R: ("reset_environment", lambda: self._request_reset()),
+        }
+
     def execute_command(self, keycode: int) -> bool:
         """Execute any command for keycode. Returns True if handled.
 
@@ -63,6 +68,14 @@ class CommandRegistry:
         bool
             True if command was handled, False otherwise
         """
+
+        # Try sim commands (reset, etc.)
+        if keycode in self.sim_commands:
+            name, action = self.sim_commands[keycode]
+            action()
+            if self.on_command_executed:
+                self.on_command_executed()
+            return True
 
         # Try gantry commands first (new enum-based system)
         if keycode in self.gantry_commands and self.simulator.virtual_gantry:
@@ -96,3 +109,8 @@ class CommandRegistry:
     def _zero_commands(self):
         """Zero out movement commands."""
         self.simulator.commands[:, :4] = 0
+
+    def _request_reset(self):
+        """Request a full environment reset on the next simulation step."""
+        self.simulator._reset_requested = True
+        logger.info("Full reset requested (R key)")
