@@ -1,3 +1,16 @@
+# Sim2sim demos
+
+## Cabinet stocking
+
+```
+python test_cabinet_place_mw.py --obj-name spheremedium --stabilize-sec 1.0 --offscreen --record --release-with-hotdex --sim-hz 2000 --randomize --traj-speed-scale 0.8
+```
+
+## Repetitive pick-and-place
+```
+python test_repetitive_pnp.py --obj-name cubemedium --randomize --offscreen --record --release_with_hotdex --stabilize_sec 1 --sim-hz 2000
+```
+
 # Holosoma
 
 Holosoma (Greek: "whole-body") is a comprehensive humanoid robotics framework for training and deploying reinforcement learning policies on humanoid robots, as well as motion retargeting. Supports locomotion (velocity tracking) and whole-body tracking tasks across multiple simulators (IsaacGym, IsaacSim, MJWarp, MuJoCo) with algorithms like PPO and FastSAC.

@@ -84,7 +84,10 @@ Changed group of some visual geoms to support ray-tracing that passes through ro
                 </default>
             </default>
             <default class="hand_motor">
-                <joint damping="0.001" armature="0.01" frictionloss="0.1"/>
+                <joint damping="0.01" armature="0.01" frictionloss="0.01"/>
+            </default>
+            <default class="hand_geom">
+                <geom friction="1.0 0.005 0.0001" contype="1" conaffinity="3"/>
             </default>
 
             <default class="visual">
