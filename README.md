@@ -11,6 +11,51 @@ python test_cabinet_place_mw.py --obj-name spheremedium --stabilize-sec 1.0 --of
 python test_repetitive_pnp.py --obj-name cubemedium --randomize --offscreen --record --release_with_hotdex --stabilize_sec 1 --sim-hz 2000
 ```
 
+## Locomotion with prior
+
+In one terminal
+```
+source scripts/source_holomujoco_setup.sh
+python src/holosoma/holosoma/run_sim.py robot:g1-43dof 
+
+# 8 to lower the gantry / 7 to raise the gantry.
+# press 9 to remove the gantry
+```
+
+```
+source scripts/source_holoinference_mw.sh
+python3 src/holosoma_inference/holosoma_inference/run_policy.py inference:g1-43dof-loco-prior     --task.model-path src/holosoma_inference/holosoma_inference/models/loco/g1_43dof/walk_prior_dr_0306.onnx     --task.no-use-joystick     --task.interface lo
+
+# press ] in the terminal
+# press = to start locomotion
+# WASD to move, QE to rotate
+```
+
+## To use vscode debugger:
+```
+source scripts/source_holoinference_mw.sh
+python -m debugpy --listen 5678 --wait-for-client path/to/your_script.py --arg1 --arg2
+```
+
+and set
+
+```
+{
+    "configurations": [
+        {
+            "name": "Attach to sourced env",
+            "type": "python",
+            "request": "attach",
+            "connect": {
+                "host": "localhost",
+                "port": 5678
+            },
+            "justMyCode": false
+        }
+    ]
+}
+```
+
 # Holosoma
 
 Holosoma (Greek: "whole-body") is a comprehensive humanoid robotics framework for training and deploying reinforcement learning policies on humanoid robots, as well as motion retargeting. Supports locomotion (velocity tracking) and whole-body tracking tasks across multiple simulators (IsaacGym, IsaacSim, MJWarp, MuJoCo) with algorithms like PPO and FastSAC.
