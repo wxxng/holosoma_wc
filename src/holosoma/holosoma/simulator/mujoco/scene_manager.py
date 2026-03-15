@@ -360,6 +360,7 @@ class MujocoSceneManager:
             poses = load_motion_clip_init_poses(
                 str(motion_init_cfg.pkl_path),
                 clip_key=getattr(motion_init_cfg, "clip_key", None),
+                motion_start_timestep=getattr(motion_init_cfg, "motion_start_timestep", 0),
                 obj_name_hint=obj_name_hint,
                 align_to_root_xy_yaw=getattr(motion_init_cfg, "align_to_root_xy_yaw", True),
                 require_clip_key=getattr(motion_init_cfg, "require_clip_key", True),

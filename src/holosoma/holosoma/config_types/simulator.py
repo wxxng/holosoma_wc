@@ -481,6 +481,9 @@ class MujocoMotionInitConfig:
     clip_key: str | None = None
     """Clip key to use inside the PKL. If None, auto-selected by obj_name_hint."""
 
+    motion_start_timestep: int = 0
+    """Frame index to use when extracting the initial state from the motion clip."""
+
     align_to_root_xy_yaw: bool = True
     """Translate/rotate so the robot starts at world (0,0) facing forward."""
 

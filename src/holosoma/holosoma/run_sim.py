@@ -16,6 +16,7 @@ from pathlib import Path
 import tyro
 from loguru import logger
 
+from holosoma.config_types.robot import RobotInitState
 from holosoma.config_types.run_sim import RunSimConfig
 from holosoma.config_types.simulator import RigidObjectConfig
 from holosoma.utils.eval_utils import init_eval_logging
@@ -55,43 +56,29 @@ def _read_body_pose_from_robot_xml(xml_path: str, body_name: str) -> tuple[list[
     return None
 
 
-def _maybe_register_object_rigid_body(config: RunSimConfig) -> RunSimConfig:
-    """If the robot MJCF contains an 'object' body, register it as a scene rigid_object.
-
-    The initial pose is read from the MJCF and optionally overridden by the
-    first frame of a motion-clip PKL (when mujoco_motion_init is configured).
-    """
+def _maybe_apply_mujoco_motion_init(config: RunSimConfig) -> RunSimConfig:
+    """Apply motion-clip initial state to MuJoCo robot/object setup when configured."""
     sim_cfg = config.simulator.config
     if sim_cfg.name != "mujoco":
         return config
 
     scene_cfg = sim_cfg.scene
-    if scene_cfg.rigid_objects:
-        return config  # already registered
-
     robot_asset = config.robot.asset
     asset_root = robot_asset.asset_root
     if asset_root.startswith("@holosoma/"):
         asset_root = asset_root.replace("@holosoma", get_holosoma_root())
     xml_file = robot_asset.xml_file
-    if not xml_file:
-        return config
-    xml_path = os.path.join(asset_root, xml_file)
-
-    if not _robot_xml_has_body(xml_path, "object"):
-        return config
-
-    object_pose = _read_body_pose_from_robot_xml(xml_path, "object")
+    xml_path = os.path.join(asset_root, xml_file) if xml_file else None
+    has_object_body = bool(xml_path and _robot_xml_has_body(xml_path, "object"))
+    object_pose = _read_body_pose_from_robot_xml(xml_path, "object") if has_object_body else None
     obj_pos_xml, obj_quat_xml = object_pose if object_pose else ([0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0])
 
-    # Optional: override object pose from motion-clip PKL (first frame)
+    poses = None
     motion_init_cfg = getattr(sim_cfg, "mujoco_motion_init", None)
-    motion_obj_pos = None
-    motion_obj_quat = None
     chosen_clip_key = None
     if motion_init_cfg and getattr(motion_init_cfg, "pkl_path", None):
         obj_name_hint = None
-        stem = Path(xml_file).stem
+        stem = Path(xml_file).stem if xml_file else ""
         if stem.startswith("g1_43dof_"):
             obj_name_hint = stem[len("g1_43dof_"):]
         try:
@@ -100,20 +87,14 @@ def _maybe_register_object_rigid_body(config: RunSimConfig) -> RunSimConfig:
             poses = load_motion_clip_init_poses(
                 str(motion_init_cfg.pkl_path),
                 clip_key=getattr(motion_init_cfg, "clip_key", None),
+                motion_start_timestep=getattr(motion_init_cfg, "motion_start_timestep", 0),
                 obj_name_hint=obj_name_hint,
                 align_to_root_xy_yaw=getattr(motion_init_cfg, "align_to_root_xy_yaw", True),
                 require_clip_key=getattr(motion_init_cfg, "require_clip_key", True),
             )
             chosen_clip_key = poses.clip_key
-            motion_obj_pos = poses.object_pos
-            motion_obj_quat = poses.object_quat_wxyz
         except Exception as exc:  # noqa: BLE001 -- best-effort override
             logger.warning(f"Failed to load motion init pose from PKL; falling back to MJCF values. Error: {exc}")
-
-    obj_pos = motion_obj_pos if motion_obj_pos is not None else obj_pos_xml
-    obj_quat = obj_quat_xml
-    if motion_init_cfg and getattr(motion_init_cfg, "apply_object_quat", False) and motion_obj_quat is not None:
-        obj_quat = motion_obj_quat
 
     if chosen_clip_key and motion_init_cfg and getattr(motion_init_cfg, "clip_key", None) != chosen_clip_key:
         # Propagate resolved clip key so the MuJoCo scene builder can patch the MJCF consistently.
@@ -121,6 +102,54 @@ def _maybe_register_object_rigid_body(config: RunSimConfig) -> RunSimConfig:
         new_sim_init = dataclasses.replace(sim_cfg, mujoco_motion_init=new_motion_cfg)
         new_sim = dataclasses.replace(config.simulator, config=new_sim_init)
         config = dataclasses.replace(config, simulator=new_sim)
+        sim_cfg = config.simulator.config
+        motion_init_cfg = sim_cfg.mujoco_motion_init
+
+    if poses is not None:
+        init_state = config.robot.init_state
+        joint_angles = dict(init_state.default_joint_angles)
+        if poses.robot_joint_angles:
+            allowed_joint_names = set(joint_angles.keys())
+            joint_angles.update(
+                {
+                    joint_name: angle
+                    for joint_name, angle in poses.robot_joint_angles.items()
+                    if joint_name in allowed_joint_names
+                }
+            )
+
+        root_pos = init_state.pos
+        if poses.robot_root_pos is not None:
+            root_pos = poses.robot_root_pos
+
+        root_rot = init_state.rot
+        if poses.robot_root_quat_wxyz is not None:
+            w, x, y, z = poses.robot_root_quat_wxyz
+            root_rot = [x, y, z, w]
+
+        new_init_state = RobotInitState(
+            pos=root_pos,
+            rot=root_rot,
+            lin_vel=init_state.lin_vel,
+            ang_vel=init_state.ang_vel,
+            default_joint_angles=joint_angles,
+        )
+        new_robot = dataclasses.replace(config.robot, init_state=new_init_state)
+        config = dataclasses.replace(config, robot=new_robot)
+        logger.info(
+            "Applied robot init from motion clip "
+            f"(clip='{poses.clip_key}', timestep={poses.motion_start_timestep})"
+        )
+
+    if scene_cfg.rigid_objects or not has_object_body:
+        return config
+
+    motion_obj_pos = poses.object_pos if poses is not None else None
+    motion_obj_quat = poses.object_quat_wxyz if poses is not None else None
+    obj_pos = motion_obj_pos if motion_obj_pos is not None else obj_pos_xml
+    obj_quat = obj_quat_xml
+    if motion_init_cfg and getattr(motion_init_cfg, "apply_object_quat", False) and motion_obj_quat is not None:
+        obj_quat = motion_obj_quat
 
     logger.info("Detected 'object' body in robot MJCF; registering as scene rigid_object.")
     rigid_object = RigidObjectConfig(name="object", position=obj_pos, orientation=obj_quat)
@@ -152,7 +181,7 @@ def run_simulation(config: RunSimConfig):
                 config = dataclasses.replace(config, device="cuda:0")
 
     config = dataclasses.replace(config, device=config.device)
-    config = _maybe_register_object_rigid_body(config)
+    config = _maybe_apply_mujoco_motion_init(config)
 
     logger.info("Starting Holosoma Direct Simulation...")
     logger.info(f"Robot: {config.robot.asset.robot_type}")
