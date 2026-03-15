@@ -353,7 +353,7 @@ class PinocchioRobot:
 class WholeBodyTrackingPolicy(BasePolicy):
     def __init__(self, config: InferenceConfig):
         # initialize timestep
-        self.motion_timestep = 0
+        self.motion_timestep = max(int(config.task.motion_start_timestep), 0)
         self.motion_clip_progressing = False
         self.motion_start_timestep = None
         self.stabilization_mode = False  # Pre-motion stabilization stage
@@ -385,7 +385,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
         self._scene_object_name = None
         self._scene_reset_counter = None
         
-        # Interpolation counter for smooth transition to first frame
+        # Interpolation counter for smooth transition to the configured start frame
         self.rl_interp_count = 0
         self.rl_interp_steps = 100  # Number of steps for smooth interpolation
         self.interp_complete_dof_pos_logged = False  # Flag to log dof_pos once when interp complete
@@ -968,10 +968,49 @@ class WholeBodyTrackingPolicy(BasePolicy):
                 self._action_hand_indices_config = np.nonzero(mask)[0].astype(np.int64)
         return self._action_hand_indices_config
 
+    def _get_configured_motion_start_timestep(self) -> int:
+        return max(int(self.config.task.motion_start_timestep), 0)
+
+    def _get_motion_start_frame_index(self) -> int:
+        start_timestep = self._get_configured_motion_start_timestep()
+        if self.motion_length <= 0:
+            return start_timestep
+        return int(np.clip(start_timestep, 0, self.motion_length - 1))
+
+    def _reset_motion_timing(self) -> None:
+        self.motion_timestep = self._get_motion_start_frame_index()
+        self.motion_start_timestep = None
+        self._last_clock_reading = None
+
+    def _validate_motion_timestep_config(self) -> None:
+        if self.motion_length <= 0:
+            return
+
+        start_timestep = self._get_configured_motion_start_timestep()
+        if start_timestep >= self.motion_length:
+            raise ValueError(
+                f"motion_start_timestep={start_timestep} is out of range for clip "
+                f"'{self.motion_clip_key}' with {self.motion_length} frames"
+            )
+
+        end_timestep = self.config.task.motion_end_timestep
+        if end_timestep is None:
+            return
+        if end_timestep <= start_timestep:
+            raise ValueError(
+                f"motion_end_timestep={end_timestep} must be greater than "
+                f"motion_start_timestep={start_timestep}"
+            )
+        if end_timestep > self.motion_length:
+            raise ValueError(
+                f"motion_end_timestep={end_timestep} exceeds clip '{self.motion_clip_key}' "
+                f"length {self.motion_length}"
+            )
+
     def _get_target_pos_config_first_frame(self) -> np.ndarray | None:
         if self.motion_data is None or self.motion_dof_pos is None or self.motion_length == 0:
             return None
-        target_pos_motion_order = self.motion_dof_pos[0]
+        target_pos_motion_order = self.motion_dof_pos[self._get_motion_start_frame_index()]
 
         if self.num_dofs == 43 and target_pos_motion_order.shape[0] == 43:
             # Motion clip is 43-DOF in G1_DEX3_JOINT_NAMES order; map directly to config order.
@@ -1141,8 +1180,10 @@ class WholeBodyTrackingPolicy(BasePolicy):
         
         # Extract data
         self.motion_fps = clip_data['fps']
+        self.motion_clip_key = clip_key
         self.motion_dof_pos = clip_data['dof_pos']  
         self.motion_length = self.motion_dof_pos.shape[0]
+        self._validate_motion_timestep_config()
         obj_pos_raw = clip_data.get("obj_pos")
         if obj_pos_raw is None:
             self.motion_obj_pos = None
@@ -1276,14 +1317,14 @@ class WholeBodyTrackingPolicy(BasePolicy):
             logger.warning(f"Failed to build motion body indices: {exc}. Falling back to first 29 joints.")
             self.motion_body_indices = np.arange(min(29, self.motion_dof_pos.shape[1]), dtype=np.int64)
         
-        self.motion_clip_key = clip_key
+        self.motion_timestep = self._get_motion_start_frame_index()
 
     def _align_motion_objects_to_root(
         self,
         root_pos_w: np.ndarray | None,
         root_quat_wxyz: np.ndarray | None,
     ) -> None:
-        """Align motion object poses using root xy translation and yaw from the first frame.
+        """Align motion object poses using root xy translation and yaw from the start frame.
 
         Expects motion object rotations in wxyz and keeps them in wxyz after alignment.
         """
@@ -1294,8 +1335,9 @@ class WholeBodyTrackingPolicy(BasePolicy):
         if root_pos_w.shape[0] == 0 or root_quat_wxyz.shape[0] == 0:
             return
 
-        root_pos0 = np.asarray(root_pos_w[0], dtype=np.float32).reshape(3,)
-        root_quat0_wxyz = np.asarray(root_quat_wxyz[0], dtype=np.float32).reshape(1, 4)
+        start_idx = self._get_motion_start_frame_index()
+        root_pos0 = np.asarray(root_pos_w[start_idx], dtype=np.float32).reshape(3,)
+        root_quat0_wxyz = np.asarray(root_quat_wxyz[start_idx], dtype=np.float32).reshape(1, 4)
         _, _, yaw = quat_to_rpy(root_quat0_wxyz.reshape(-1))
         yaw_quat_wxyz = rpy_to_quat((0.0, 0.0, yaw)).reshape(1, 4)
 
@@ -1317,14 +1359,14 @@ class WholeBodyTrackingPolicy(BasePolicy):
         self.motion_obj_rot = obj_rot_h_wxyz.astype(np.float32, copy=False)
         self.motion_obj_pos_aligned = self.motion_obj_pos.copy()
         self.motion_obj_rot_aligned_wxyz = obj_rot_h_wxyz.copy()
-        logger.info("Aligned motion object poses to root xy/yaw of the first frame.")
+        logger.info(f"Aligned motion object poses to root xy/yaw of start frame {start_idx}.")
 
     def _align_motion_table_to_root(
         self,
         root_pos_w: np.ndarray | None,
         root_quat_wxyz: np.ndarray | None,
     ) -> None:
-        """Align motion table poses using root xy translation and yaw from the first frame."""
+        """Align motion table poses using root xy translation and yaw from the start frame."""
         if self.motion_table_pos is None:
             return
         if root_pos_w is None or root_quat_wxyz is None:
@@ -1332,8 +1374,9 @@ class WholeBodyTrackingPolicy(BasePolicy):
         if root_pos_w.shape[0] == 0 or root_quat_wxyz.shape[0] == 0:
             return
 
-        root_pos0 = np.asarray(root_pos_w[0], dtype=np.float32).reshape(3,)
-        root_quat0_wxyz = np.asarray(root_quat_wxyz[0], dtype=np.float32).reshape(1, 4)
+        start_idx = self._get_motion_start_frame_index()
+        root_pos0 = np.asarray(root_pos_w[start_idx], dtype=np.float32).reshape(3,)
+        root_quat0_wxyz = np.asarray(root_quat_wxyz[start_idx], dtype=np.float32).reshape(1, 4)
         _, _, yaw = quat_to_rpy(root_quat0_wxyz.reshape(-1))
         yaw_quat_wxyz = rpy_to_quat((0.0, 0.0, yaw)).reshape(1, 4)
 
@@ -1354,7 +1397,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
             self.motion_table_rot_wxyz = table_rot_h_wxyz.astype(np.float32, copy=False)
             self.motion_table_rot_aligned_wxyz = table_rot_h_wxyz.copy()
 
-        logger.info("Aligned motion table poses to root xy/yaw of the first frame.")
+        logger.info(f"Aligned motion table poses to root xy/yaw of start frame {start_idx}.")
 
     def _convert_motion_root_to_torso(self) -> None:
         if self.motion_root_pos_w is None or self.motion_root_quat_w is None:
@@ -1426,12 +1469,13 @@ class WholeBodyTrackingPolicy(BasePolicy):
         return command_seq.reshape(1, -1)
 
     def _get_motion_command_sequence_first_frame(self) -> np.ndarray:
-        """Get a 10-frame sequence repeating the first motion frame (body-only)."""
+        """Get a 10-frame sequence repeating the configured start motion frame (body-only)."""
         if self.motion_dof_pos is None or self.motion_length == 0:
             return np.zeros((1, 10 * self.motion_command_dofs * 2), dtype=np.float32)
 
-        pos0 = self.motion_dof_pos[0]
-        vel0 = self.motion_dof_vel[0] if self.motion_dof_vel is not None else np.zeros_like(pos0)
+        start_idx = self._get_motion_start_frame_index()
+        pos0 = self.motion_dof_pos[start_idx]
+        vel0 = self.motion_dof_vel[start_idx] if self.motion_dof_vel is not None else np.zeros_like(pos0)
 
         if pos0.shape[0] != self.motion_command_dofs:
             if self.motion_body_indices is not None:
@@ -1446,14 +1490,15 @@ class WholeBodyTrackingPolicy(BasePolicy):
         return seq.reshape(1, -1).astype(np.float32, copy=False)
     
     def _get_motion_command_sequence_first_pos(self) -> np.ndarray:
-        """Get a 10-frame sequence repeating the first motion pos."""
+        """Get a 10-frame sequence repeating the configured start motion position."""
         if self.motion_dof_pos is None or self.motion_length == 0:
             return np.zeros((1, 10 * self.motion_command_dofs * 2), dtype=np.float32)
 
-        pos0 = self.motion_dof_pos[0]
+        start_idx = self._get_motion_start_frame_index()
+        pos0 = self.motion_dof_pos[start_idx].copy()
         pos0[:22] = self.startup_pos[:22]
         pos0[29:36] = self.startup_pos[29:36]
-        vel0 = self.motion_dof_vel[0] if self.motion_dof_vel is not None else np.zeros_like(pos0)
+        vel0 = self.motion_dof_vel[start_idx] if self.motion_dof_vel is not None else np.zeros_like(pos0)
 
         if pos0.shape[0] != self.motion_command_dofs:
             if self.motion_body_indices is not None:
@@ -1739,7 +1784,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
 
     def _restore_policy_state(self, state):
         super()._restore_policy_state(state)
-        self.motion_timestep = state.get("motion_timestep", 0)
+        self.motion_timestep = state.get("motion_timestep", self._get_configured_motion_start_timestep())
         self.motion_clip_key = state.get("motion_clip_key", None)
         self.motion_clip_progressing = False
         self.stabilization_mode = False
@@ -1828,9 +1873,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
         super()._on_policy_switched(model_path)
         self.motion_clip_progressing = False
         self.stabilization_mode = False
-        self.motion_timestep = 0
-        self.motion_start_timestep = None
-        self._last_clock_reading = None
+        self._reset_motion_timing()
         self._stiff_hold_active = True
         self.robot_yaw_offset = 0.0
         self._prev_robot_anchor_quat_w = None
@@ -1842,8 +1885,8 @@ class WholeBodyTrackingPolicy(BasePolicy):
         if self.get_ready_state:
             # Interpolate from current dof_pos to first pose in motion
             if self.motion_data is not None:
-                # Get first frame from motion data
-                target_pos_motion_order = self.motion_dof_pos[0]
+                # Get configured start frame from motion data.
+                target_pos_motion_order = self.motion_dof_pos[self._get_motion_start_frame_index()]
 
                 if self.num_dofs == 43 and target_pos_motion_order.shape[0] == 43:
                     # Motion clip is 43-DOF in G1_DEX3_JOINT_NAMES order; map directly to config order.
@@ -1903,7 +1946,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
 
         current_obs_buffer_dict = {}
         self._sync_scene_object_name()
-        command_timestep = 0 if self.stabilization_mode else self.motion_timestep
+        command_timestep = self._get_motion_start_frame_index() if self.stabilization_mode else self.motion_timestep
         self._send_debug_traj_viz(command_timestep)
         self._update_table_pose_from_motion(command_timestep)
 
@@ -2047,7 +2090,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
 
         # Command: 10-frame motion sequence
         if self.motion_data is not None:
-            # In stabilization mode, always use first frame (timestep 0) for motion command
+            # In stabilization mode, keep using the configured start frame for motion command.
             if self.stabilization_mode:
                 current_obs_buffer_dict["motion_command_sequence"] = self._get_motion_command_sequence_first_frame()
             else:
@@ -2659,20 +2702,16 @@ class WholeBodyTrackingPolicy(BasePolicy):
             self.global_timestep += 1
             return scaled_action
         if not self.motion_clip_progressing and not self.stabilization_mode:
-            # Keep motion index pinned at the start while waiting to trigger the clip.
-            # Smoothly interpolate to first motion frame positionif not self.motion_clip_progressing and not self.stabilization_mode:
-            self.motion_timestep = 0
-            self.motion_start_timestep = None
-            self._last_clock_reading = None
+            # Keep motion index pinned at the configured start frame while waiting to trigger the clip.
+            self._reset_motion_timing()
             
             # Get current and target positions
             dof_pos = robot_state_data[:, 7 : 7 + self.num_dofs]
             
-            # Get first frame from motion data and interpolate to it
+            # Get the configured start frame from motion data and interpolate to it.
             if self.motion_data is not None:
                 self._stiff_startup_active = True
-                # Get first frame from motion data
-                target_pos_motion_order = self.motion_dof_pos[0]
+                target_pos_motion_order = self.motion_dof_pos[self._get_motion_start_frame_index()]
                 # self.startup_pos = np.array([
                 #     -0.312, 0.0, 0.0, 0.669, -0.363, 0.0,  # left leg
                 #     -0.312, 0.0, 0.0, 0.669, -0.363, 0.0,  # right leg
@@ -2725,7 +2764,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
                         target_pos_config = target_pos_asset[reorder_map]  # [29] in config order
                 
                 target_pos_config = target_pos_config.reshape(1, -1)  # [1, num_dofs]
-                # Smooth interpolation to first frame
+                # Smooth interpolation to the configured start frame.
                 interp_ratio = min(self.rl_interp_count / self.rl_interp_steps, 1.0)
                 interpolated_pos = dof_pos + (target_pos_config - dof_pos) * interp_ratio
                 self.rl_interp_count += 1
@@ -2878,6 +2917,11 @@ class WholeBodyTrackingPolicy(BasePolicy):
                 self._update_clock()
             else:
                 self.motion_timestep += 1
+
+            if (end := self.config.task.motion_end_timestep) is not None and self.motion_timestep >= end:
+                self.motion_timestep = end
+                self.motion_clip_progressing = False
+                self.logger.info(colored(f"Reached motion_end_timestep={end}, stopping motion clip", "yellow"))
         return self.scaled_policy_action
 
     def _get_motion_command_sequence_soft_stop(self) -> np.ndarray:
@@ -2955,34 +2999,34 @@ class WholeBodyTrackingPolicy(BasePolicy):
 
     def _update_clock(self):
         # Use synchronized clock with motion-relative timing
+        start_frame = self._get_motion_start_frame_index()
         current_clock = self.clock_sub.get_clock()
         if self.motion_start_timestep is None:
             # Motion just started; anchor to the first received clock tick.
             self.motion_start_timestep = current_clock
         elif self._last_clock_reading is not None and current_clock < self._last_clock_reading:
             # Simulator clock jumped backwards (e.g., reset). Re-anchor start time while preserving progress.
-            offset_ms = round(self.motion_timestep * self.timestep_interval_ms)
+            progress_frames = max(self.motion_timestep - start_frame, 0)
+            offset_ms = round(progress_frames * self.timestep_interval_ms)
             self.logger.warning("Clock sync returned earlier timestamp; adjusting motion timing anchor.")
             self.motion_start_timestep = current_clock - offset_ms
         self._last_clock_reading = current_clock
         elapsed_ms = current_clock - self.motion_start_timestep
-        if self.motion_timestep == 0 and int(elapsed_ms // self.timestep_interval_ms) > 1:
+        if self.motion_timestep == start_frame and int(elapsed_ms // self.timestep_interval_ms) > 1:
             self.logger.warning(
                 "Still at the beginning but the clock jumped ahead: elapsed_ms={elapsed_ms}, self.timestep_interval_ms="
                 "{timestep_interval_ms}, self.motion_timestep={motion_timestep}. "
-                "Re-anchoring to the current timestamp so the motion always starts from frame 0.",
+                "Re-anchoring to the current timestamp so the motion always starts from the configured frame.",
                 elapsed_ms=elapsed_ms,
                 timestep_interval_ms=self.timestep_interval_ms,
                 motion_timestep=self.motion_timestep,
             )
-            # Still at the beginning but the clock jumped ahead (e.g., due to waiting before start).
-            # Re-anchor to the current timestamp so the motion always starts from frame 0.
             self.motion_start_timestep = current_clock
             self._last_clock_reading = current_clock
-            self.motion_timestep = 0
+            self.motion_timestep = start_frame
             return
         previous_motion_timestep = self.motion_timestep
-        self.motion_timestep = int(elapsed_ms // self.timestep_interval_ms)
+        self.motion_timestep = start_frame + int(elapsed_ms // self.timestep_interval_ms)
         if self.motion_timestep != previous_motion_timestep:
             self.logger.info(
                 "Motion timestep advanced from {previous_motion_timestep} to {motion_timestep}",
@@ -3012,9 +3056,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
             # Enter stabilization mode
             self.stabilization_mode = True
             self.motion_clip_progressing = False
-            self.motion_timestep = 0
-            self.motion_start_timestep = None
-            self._last_clock_reading = None
+            self._reset_motion_timing()
             self.robot_yaw_offset = 0.0
             
             self.logger.info(colored("🟡 Soft stop activated - holding current position with stabilization policy", "yellow", attrs=["bold"]))
@@ -3034,9 +3076,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
             
             # Common cleanup for stiff mode
             self.motion_clip_progressing = False
-            self.motion_timestep = 0
-            self.motion_start_timestep = None
-            self._last_clock_reading = None
+            self._reset_motion_timing()
             self.robot_yaw_offset = 0.0
             
             self.logger.info(colored("🔴 Stiff mode activated", "red", attrs=["bold"]))
@@ -3061,7 +3101,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
                 self._save_motion_log()
 
     def _handle_start_stabilization(self):
-        """Handle start stabilization mode - policy runs with first motion frame command."""
+        """Handle start stabilization mode using the configured motion start frame."""
         if not self.use_policy_action:
             self.logger.warning("Press ']' first to enable policy, then 'd' to start stabilization")
             return
@@ -3069,11 +3109,11 @@ class WholeBodyTrackingPolicy(BasePolicy):
         self._stiff_startup_active = False
         self.stabilization_mode = True
         self.motion_clip_progressing = False
-        self.motion_timestep = 0  # Keep at first frame
-        self.motion_start_timestep = None
-        self._last_clock_reading = None
+        self._reset_motion_timing()
         self._reset_master_obs_history()
-        self.logger.info(colored("🛡️  Entering stabilization mode - policy active with first motion frame command", "yellow", attrs=["bold"]))
+        self.logger.info(
+            colored("🛡️  Entering stabilization mode - policy active with configured start-frame command", "yellow", attrs=["bold"])
+        )
         self.logger.info(colored("    Robot will stabilize and touch ground. Press 's' when ready to start motion.", "yellow"))
 
     def _handle_start_motion_clip(self):
@@ -3119,17 +3159,25 @@ class WholeBodyTrackingPolicy(BasePolicy):
         self.clock_sub.reset_origin()
         self.motion_clip_progressing = True
         # Capture motion-specific start timestep for policy-level timing control
-        self.motion_start_timestep = None  # will be set in rl_inference
-        self.motion_timestep = 0  # Reset to start from beginning of motion
+        self._reset_motion_timing()
         self._last_sent_table_frame = None
-        self._last_clock_reading = None
         # Seed main policy history buffers with the current observation for smooth transition
         robot_state_data = (
             self.interface.get_full_state_43dof() if self.num_dofs == 43 else self.interface.get_low_state()
         )
         if robot_state_data is not None:
             self._seed_obs_history_with_current(robot_state_data)
-        self.logger.info(colored("🎬 Starting motion clip playback", "blue", attrs=["bold"]))
+        start_idx = self._get_motion_start_frame_index()
+        if self.config.task.motion_end_timestep is not None:
+            self.logger.info(
+                colored(
+                    f"🎬 Starting motion clip playback from timestep {start_idx} to {self.config.task.motion_end_timestep}",
+                    "blue",
+                    attrs=["bold"],
+                )
+            )
+        else:
+            self.logger.info(colored(f"🎬 Starting motion clip playback from timestep {start_idx}", "blue", attrs=["bold"]))
 
     def handle_keyboard_button(self, keycode):
         """Add new keyboard button to start and end the motion clips"""
@@ -3139,15 +3187,14 @@ class WholeBodyTrackingPolicy(BasePolicy):
             if robot_state_data is not None:
                 dof_pos = robot_state_data[:, 7 : 7 + self.num_dofs]
                 
-                # Calculate target_pos_config (first frame of motion)
+                # Calculate target_pos_config for the configured motion start frame.
                 target_pos_config = None
                 max_diff_idx = None
                 max_diff_val = None
                 joint_name = None
                 
                 if self.motion_data is not None:
-                    # Get first frame from motion data (in G1_JOINT_NAMES order)
-                    target_pos_motion_order = self.motion_dof_pos[0]  # [29] in G1_JOINT_NAMES order
+                    target_pos_motion_order = self.motion_dof_pos[self._get_motion_start_frame_index()]
                     
                     # Reorder from G1_JOINT_NAMES to asset order
                     target_pos_asset = target_pos_motion_order[self.motion_to_asset_joint_map]  # [29] in asset order
