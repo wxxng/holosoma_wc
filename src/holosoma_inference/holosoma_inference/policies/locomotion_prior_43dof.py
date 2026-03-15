@@ -17,13 +17,20 @@ Action processing — identical to test_loco_mw.py process_action():
 
 from __future__ import annotations
 
+import atexit
+import pickle
 import re
+import signal
+from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 
 from holosoma_inference.utils.math.quat import quat_rotate_inverse
 
 from .locomotion import LocomotionPolicy
+
+_LOCOMOTION_LOG_DIR = Path("/home/rllab3/Desktop/codebase/unitreeG1/holosoma_wc/logs/sim2real/locomotion")
 
 # ── Joint ordering constants ─────────────────────────────────────────────────
 
@@ -203,6 +210,132 @@ class LocomotionPrior43DOF(LocomotionPolicy):
     Keyboard/joystick controls (WASD / QE / =) are inherited from LocomotionPolicy.
     """
 
+    def __init__(self, config):
+        super().__init__(config)
+        self._log_enabled = bool(getattr(self.config.task, "log", False))
+        self._active_log_data: dict | None = None
+        self._active_log_path: Path | None = None
+        self._walking_log_started = False
+        self._shutdown_complete = False
+        self._exit_handlers_registered = False
+
+        if self._log_enabled:
+            _LOCOMOTION_LOG_DIR.mkdir(parents=True, exist_ok=True)
+            self._register_log_exit_handlers()
+            self.logger.info(f"Locomotion logging enabled: {_LOCOMOTION_LOG_DIR}")
+
+    def _register_log_exit_handlers(self) -> None:
+        if self._exit_handlers_registered:
+            return
+        atexit.register(self.shutdown)
+        try:
+            signal.signal(signal.SIGTERM, self._handle_term_signal)
+        except ValueError:
+            # Signal handlers can only be registered from the main thread.
+            pass
+        self._exit_handlers_registered = True
+
+    def _handle_term_signal(self, signum, _frame) -> None:
+        self.shutdown()
+        raise SystemExit(128 + signum)
+
+    def _timestamped_log_path(self, stem: str) -> Path:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        return _LOCOMOTION_LOG_DIR / f"{stem}_{timestamp}.pkl"
+
+    def _start_log_session(self, stem: str) -> None:
+        self._active_log_path = self._timestamped_log_path(stem)
+        self._active_log_data = {
+            "log_name": stem,
+            "created_at": datetime.now().isoformat(),
+            "model_path": self.active_model_path,
+            "observation": [],
+            "scaled_policy_action": [],
+            "lin_vel_command": [],
+            "ang_vel_command": [],
+            "stand_command": [],
+        }
+        self.logger.info(f"Started locomotion log: {self._active_log_path}")
+
+    def _ensure_log_session(self) -> None:
+        if not self._log_enabled or self._active_log_data is not None:
+            return
+
+        if self._walking_log_started or int(self.stand_command[0, 0]) == 1:
+            self._walking_log_started = True
+            self._start_log_session("locomotion_walking")
+        else:
+            self._start_log_session("locomotion_standing")
+
+    def _append_log_step(self, obs: dict[str, np.ndarray]) -> None:
+        if not self._log_enabled or not self.use_policy_action or self.get_ready_state:
+            return
+
+        self._ensure_log_session()
+        if self._active_log_data is None:
+            return
+
+        self._active_log_data["observation"].append(np.asarray(obs["obs"][0], dtype=np.float32).copy())
+        self._active_log_data["scaled_policy_action"].append(
+            np.asarray(self.scaled_policy_action[0], dtype=np.float32).copy()
+        )
+        self._active_log_data["lin_vel_command"].append(np.asarray(self.lin_vel_command[0], dtype=np.float32).copy())
+        self._active_log_data["ang_vel_command"].append(np.asarray(self.ang_vel_command[0], dtype=np.float32).copy())
+        self._active_log_data["stand_command"].append(np.asarray(self.stand_command[0], dtype=np.float32).copy())
+
+    def _save_active_log(self) -> None:
+        if self._active_log_data is None or self._active_log_path is None:
+            return
+
+        num_samples = len(self._active_log_data["observation"])
+        if num_samples == 0:
+            self.logger.info(f"Skipping empty locomotion log: {self._active_log_path}")
+            self._active_log_data = None
+            self._active_log_path = None
+            return
+
+        payload = {
+            "log_name": self._active_log_data["log_name"],
+            "created_at": self._active_log_data["created_at"],
+            "saved_at": datetime.now().isoformat(),
+            "model_path": self._active_log_data["model_path"],
+            "observation": np.stack(self._active_log_data["observation"], axis=0).astype(np.float32, copy=False),
+            "scaled_policy_action": np.stack(
+                self._active_log_data["scaled_policy_action"], axis=0
+            ).astype(np.float32, copy=False),
+            "lin_vel_command": np.stack(self._active_log_data["lin_vel_command"], axis=0).astype(np.float32, copy=False),
+            "ang_vel_command": np.stack(self._active_log_data["ang_vel_command"], axis=0).astype(np.float32, copy=False),
+            "stand_command": np.stack(self._active_log_data["stand_command"], axis=0).astype(np.float32, copy=False),
+        }
+
+        with self._active_log_path.open("wb") as f:
+            pickle.dump(payload, f)
+
+        self.logger.info(f"Saved locomotion log: {self._active_log_path}")
+        self._active_log_data = None
+        self._active_log_path = None
+
+    def _handle_stand_command(self):
+        previous = int(self.stand_command[0, 0])
+        super()._handle_stand_command()
+        current = int(self.stand_command[0, 0])
+
+        if self._log_enabled and previous == 0 and current == 1 and not self._walking_log_started:
+            self._save_active_log()
+            self._walking_log_started = True
+            self._start_log_session("locomotion_walking")
+
+    def _handle_stop_policy(self):
+        super()._handle_stop_policy()
+        if self._log_enabled:
+            self._save_active_log()
+
+    def shutdown(self):
+        if self._shutdown_complete:
+            return
+        self._save_active_log()
+        self._shutdown_complete = True
+
     def prepare_obs_for_rl(self, robot_state_data: np.ndarray) -> dict[str, np.ndarray]:
         """Build 138-dim obs in the exact layout expected by walk_prior_dr.
 
@@ -272,4 +405,5 @@ class LocomotionPrior43DOF(LocomotionPolicy):
         target_q[_ACTION_IN_DOF] = processed
 
         self.scaled_policy_action = target_q.reshape(1, -1)
+        self._append_log_step(obs)
         return self.scaled_policy_action

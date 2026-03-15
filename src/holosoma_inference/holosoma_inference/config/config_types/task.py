@@ -81,3 +81,6 @@ class TaskConfig:
 
     debug_traj_viz_port: int = 10006
     """UDP port used to stream trajectory visualization points to the simulator bridge."""
+
+    log: bool = False
+    """Enable task-specific inference logging when supported by the active policy."""
