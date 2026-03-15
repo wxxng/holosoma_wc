@@ -20,6 +20,7 @@ locomotion = TaskConfig(
     joystick_device=0,
     use_ros=False,
     wandb_download_dir="/tmp",
+    log=False,
 )
 
 # Whole-body tracking task
@@ -38,6 +39,7 @@ wbt = TaskConfig(
     joystick_device=0,
     use_ros=False,
     wandb_download_dir="/tmp",
+    log=False,
 )
 
 # 43-DOF prior locomotion: per-joint action scaling, rl_inference returns absolute target_q
@@ -57,6 +59,7 @@ locomotion_43dof_prior = TaskConfig(
     use_ros=False,
     wandb_download_dir="/tmp",
     use_absolute_action=True,  # rl_inference returns absolute target_q (not residual)
+    log=False,
 )
 
 # Tracking task (g1-29dof-tracking, g1-43dof-object): policy returns absolute joint positions
@@ -76,6 +79,7 @@ wbt_tracking = TaskConfig(
     use_ros=False,
     wandb_download_dir="/tmp",
     use_absolute_action=True,
+    log=False,
 )
 
 DEFAULTS = {

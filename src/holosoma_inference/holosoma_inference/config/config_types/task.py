@@ -84,3 +84,6 @@ class TaskConfig:
 
     change_loco_order: bool = False
     """If True, use alternative obs order for loco prior: [last_action, proprio_hand, proprio_body, vel_command]."""
+
+    log: bool = False
+    """Enable task-specific inference logging when supported by the active policy."""

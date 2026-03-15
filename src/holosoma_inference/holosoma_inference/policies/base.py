@@ -1041,3 +1041,7 @@ class BasePolicy:
 
         except KeyboardInterrupt:
             pass
+
+    def shutdown(self):
+        """Optional cleanup hook for derived policies."""
+        return

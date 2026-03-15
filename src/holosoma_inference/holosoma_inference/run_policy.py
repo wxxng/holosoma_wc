@@ -100,6 +100,7 @@ def run_policy(config: InferenceConfig):
     logger.info(f"⚙️ RL Rate: {config.task.rl_rate} Hz")
     logger.info(f"📁 Model path: {config.task.model_path}")
 
+    policy = None
     try:
         # Determine policy class based on observation type
         actor_obs = config.observation.obs_dict.get("actor_obs", [])
@@ -115,7 +116,7 @@ def run_policy(config: InferenceConfig):
         else:
             policy_class = LocomotionPolicy
         logger.info(f"Using {policy_class.__name__}")
-        policy: LocomotionPolicy | WholeBodyTrackingPolicy = policy_class(config=config)
+        policy = policy_class(config=config)
 
         logger.info("✅ Policy initialized successfully!")
         _print_control_guide(policy_class, config.task.use_joystick)
@@ -127,6 +128,8 @@ def run_policy(config: InferenceConfig):
         traceback.print_exc()
         sys.exit(1)
     finally:
+        if policy is not None and hasattr(policy, "shutdown"):
+            policy.shutdown()
         restore_terminal_settings()
 
 
