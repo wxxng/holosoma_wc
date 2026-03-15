@@ -192,11 +192,17 @@ def build_obs(mj_data, dof_qpos_addrs, dof_qvel_addrs, vel_command, last_raw_act
     proprio_hand = np.concatenate([hand_pos, hand_vel])  # (28,)
 
     # Concatenate: vel_command(3) + proprio_body(64) + proprio_hand(28) + actions(43) = 138
+    # obs = np.concatenate([
+    #     vel_command.astype(np.float32),
+    #     proprio_body,
+    #     proprio_hand,
+    #     last_raw_action.astype(np.float32),
+    # ])
     obs = np.concatenate([
-        vel_command.astype(np.float32),
-        proprio_body,
-        proprio_hand,
         last_raw_action.astype(np.float32),
+        proprio_hand,
+        proprio_body,
+        vel_command.astype(np.float32),
     ])
     return obs.reshape(1, -1).astype(np.float32)  # (1, 138)
 

@@ -5,6 +5,10 @@
 ## generate object xmls
 python scripts/generate_g1_object_xmls.py
 
+## locomotion
+python test_loco_mw.py --offscreen --record --sim-hz 2000 --onnx src/holosoma_inference/holosoma_inference/models/loco/g1_43dof/walk_prior_dr_0315.onnx --infer
+
+
 ## Cabinet stocking
 
 ```
@@ -32,6 +36,8 @@ python src/holosoma/holosoma/run_sim.py robot:g1-43dof
 ```
 source scripts/source_holoinference_mw.sh
 python3 src/holosoma_inference/holosoma_inference/run_policy.py inference:g1-43dof-loco-prior     --task.model-path src/holosoma_inference/holosoma_inference/models/loco/g1_43dof/walk_prior_dr_0306.onnx     --task.no-use-joystick     --task.interface lo
+
+python3 src/holosoma_inference/holosoma_inference/run_policy.py inference:g1-43dof-loco-prior     --task.model-path src/holosoma_inference/holosoma_inference/models/loco/g1_43dof/walk_prior_dr_0315.onnx     --task.no-use-joystick     --task.interface lo --task.change_loco_order
 
 # press ] in the terminal
 # press = to start locomotion

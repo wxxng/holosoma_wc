@@ -81,3 +81,6 @@ class TaskConfig:
 
     debug_traj_viz_port: int = 10006
     """UDP port used to stream trajectory visualization points to the simulator bridge."""
+
+    change_loco_order: bool = False
+    """If True, use alternative obs order for loco prior: [last_action, proprio_hand, proprio_body, vel_command]."""

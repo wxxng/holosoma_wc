@@ -234,16 +234,29 @@ class LocomotionPrior43DOF(LocomotionPolicy):
         hand_vel = dof_vel[:, _HAND_IDX]                  # (1, 14)
 
         # last_policy_action: (1, 43) raw action in ACTION_ORDER_43DOF (set in rl_inference)
-        obs = np.concatenate([
-            vel_cmd,                    # (1, 3)
-            body_pos,                   # (1, 29)
-            body_vel,                   # (1, 29)
-            ang_vel,                    # (1, 3)
-            proj_grav,                  # (1, 3)
-            hand_pos,                   # (1, 14)
-            hand_vel,                   # (1, 14)
-            self.last_policy_action,    # (1, 43) ACTION_ORDER_43DOF
-        ], axis=1)  # (1, 138)
+        if self.config.task.change_loco_order:
+            # Alternative order: [last_action, proprio_hand, proprio_body, vel_command]
+            obs = np.concatenate([
+                self.last_policy_action,    # (1, 43) ACTION_ORDER_43DOF
+                hand_pos,                   # (1, 14)
+                hand_vel,                   # (1, 14)
+                body_pos,                   # (1, 29)
+                body_vel,                   # (1, 29)
+                ang_vel,                    # (1, 3)
+                proj_grav,                  # (1, 3)
+                vel_cmd,                    # (1, 3)
+            ], axis=1)  # (1, 138)
+        else:
+            obs = np.concatenate([
+                vel_cmd,                    # (1, 3)
+                body_pos,                   # (1, 29)
+                body_vel,                   # (1, 29)
+                ang_vel,                    # (1, 3)
+                proj_grav,                  # (1, 3)
+                hand_pos,                   # (1, 14)
+                hand_vel,                   # (1, 14)
+                self.last_policy_action,    # (1, 43) ACTION_ORDER_43DOF
+            ], axis=1)  # (1, 138)
 
         return {"obs": obs.astype(np.float32)}
 
