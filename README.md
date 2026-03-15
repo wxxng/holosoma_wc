@@ -1,4 +1,9 @@
+# 
+
 # Sim2sim demos
+
+## generate object xmls
+python scripts/generate_g1_object_xmls.py
 
 ## Cabinet stocking
 
@@ -10,6 +15,8 @@ python test_cabinet_place_mw.py --obj-name spheremedium --stabilize-sec 1.0 --of
 ```
 python test_repetitive_pnp.py --obj-name cubemedium --randomize --offscreen --record --release_with_hotdex --stabilize_sec 1 --sim-hz 2000
 ```
+
+# Sim2sim for sim2real
 
 ## Locomotion with prior
 
@@ -31,10 +38,58 @@ python3 src/holosoma_inference/holosoma_inference/run_policy.py inference:g1-43d
 # WASD to move, QE to rotate
 ```
 
+## Object tracking (bps)
+
+```
+source scripts/source_holomujoco_mw_setup.sh
+python src/holosoma/holosoma/run_sim.py \
+  robot:g1_43dof_cubemedium \
+  --simulator.config.mujoco-motion-init.pkl-path "/home/rllab3/Desktop/codebase/unitreeG1/holosoma/src/holosoma/holosoma/data/motions/object_tracking/grab_omomo_selected_111_filtered.pkl" \
+  --simulator.config.mujoco-motion-init.clip-key "GRAB_s1_cubemedium_pass_1" \
+  --simulator.config.mujoco-motion-init.motion-start-timestep 0
+
+python src/holosoma/holosoma/run_sim.py \
+  robot:g1_43dof_apple \
+  --simulator.config.mujoco-motion-init.pkl-path "/home/rllab3/Desktop/codebase/unitreeG1/holosoma/src/holosoma/holosoma/data/motions/object_tracking/grab_omomo_selected_111_filtered.pkl" \
+  --simulator.config.mujoco-motion-init.clip-key "GRAB_s1_apple_pass_1" \
+  --simulator.config.mujoco-motion-init.motion-start-timestep 0
+
+```
+
+Might need `pip install torch --index-url https://download.pytorch.org/whl/cpu`
+
+```
+source scripts/source_holoinference_mw.sh
+python3 src/holosoma_inference/holosoma_inference/run_policy.py inference:g1-43dof-object-bps \
+  --task.model-path src/holosoma_inference/holosoma_inference/models/wbt/object/bps_policy.onnx \
+  --task.motion-pkl-path /home/rllab3/Desktop/codebase/unitreeG1_mw/holosoma_wc/src/holosoma/holosoma/data/motions/motion_tracking/grab_omomo_selected_111_filtered.pkl \
+  --task.motion-clip-key GRAB_s1_apple_pass_1 \
+  --task.no-use-joystick \
+  --task.interface lo \
+  --task.motion-start-timestep 0
+
+# pcd based
+source scripts/source_holoinference_mw.sh
+python3 src/holosoma_inference/holosoma_inference/run_policy.py inference:g1-43dof-object   --task.model-path src/holosoma_inference/holosoma_inference/models/wbt/object/cube_tracking_policy.onnx   --task.no-use-joystick   --task.interface lo
+
+enter : go to stiff
+] : go to startup pose
+d : stabilization
+s : start
+o : pause
+oo : stop
+
+```
+`--task.use-gen-traj` for lift trajectory.
+
+Use the same timestep value for both commands when you want MuJoCo init and policy playback to start from the same motion frame.
+
+
+
 ## To use vscode debugger:
 ```
 source scripts/source_holoinference_mw.sh
-python -m debugpy --listen 5678 --wait-for-client path/to/your_script.py --arg1 --arg2
+python3 -m debugpy --listen 5678 --wait-for-client path/to/your_script.py --arg1 --arg2
 ```
 
 and set
