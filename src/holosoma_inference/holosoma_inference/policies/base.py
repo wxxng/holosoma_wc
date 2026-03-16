@@ -297,6 +297,8 @@ class BasePolicy:
         self.cmd_q = np.zeros(self.num_dofs)
         self.cmd_dq = np.zeros(self.num_dofs)
         self.cmd_tau = np.zeros(self.num_dofs)
+        self._prev_cmd_q = None
+        self._cmd_q_max_delta = 0.1  # rad/step
 
         # Used by WBT to request stiff gains during startup interpolation.
         self._stiff_startup_active = False
@@ -788,6 +790,12 @@ class BasePolicy:
                     np.clip(q_target[0], self.q_min_arr, self.q_max_arr, out=q_target[0])
                 # Prepare command (reuse pre-allocated arrays)
                 self.cmd_q[:] = q_target[0]
+                # Clip per-step delta to prevent sudden jumps
+                if self._prev_cmd_q is not None:
+                    delta = self.cmd_q - self._prev_cmd_q
+                    np.clip(delta, -self._cmd_q_max_delta, self._cmd_q_max_delta, out=delta)
+                    self.cmd_q[:] = self._prev_cmd_q + delta
+                self._prev_cmd_q = self.cmd_q.copy()
             elif self.q_min_arr is not None and self.q_max_arr is not None:
                 # Clip target positions to motor limits for manual/init modes
                 np.clip(q_target[0], self.q_min_arr, self.q_max_arr, out=q_target[0])
