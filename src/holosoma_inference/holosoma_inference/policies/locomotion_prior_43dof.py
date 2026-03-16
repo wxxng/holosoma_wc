@@ -241,7 +241,8 @@ class LocomotionPrior43DOF(LocomotionPolicy):
 
     def _timestamped_log_path(self, stem: str) -> Path:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        return _LOCOMOTION_LOG_DIR / f"{stem}_{timestamp}.pkl"
+        interface = getattr(self.config.task, "interface", "unknown")
+        return _LOCOMOTION_LOG_DIR / f"{stem}_{interface}_{timestamp}.pkl"
 
     def _start_log_session(self, stem: str) -> None:
         self._active_log_path = self._timestamped_log_path(stem)

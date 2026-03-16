@@ -1,3 +1,4 @@
+import atexit
 import csv
 import json
 import pickle
@@ -556,6 +557,13 @@ class WholeBodyTrackingPolicy(BasePolicy):
         if self.debug_mode:
             self._init_debug_logging()
 
+        # Sim2real inference logging (obs + action, saved to logs/sim2real/wbt)
+        self._sim2real_log_data: dict | None = None
+        self._sim2real_log_path: Path | None = None
+        self._sim2real_shutdown_complete = False
+        self._init_sim2real_log()
+        atexit.register(self._save_sim2real_log)
+
         # Motion pkl logging (obs + poses, starts on 's' key)
         self._motion_log_data: list[dict] | None = None
         self._motion_log_path: Path | None = None
@@ -635,6 +643,8 @@ class WholeBodyTrackingPolicy(BasePolicy):
         # Save motion pkl log
         if hasattr(self, '_motion_log_data') and self._motion_log_data:
             self._save_motion_log()
+        # Save sim2real log
+        self._save_sim2real_log()
     
     def _init_debug_logging(self):
         """Initialize debug logging for dof_pos and scaled_policy_action."""
@@ -767,10 +777,11 @@ class WholeBodyTrackingPolicy(BasePolicy):
     # -------------------------------------------------------------------------
 
     def _on_sigint(self, signum, frame):
-        """Save motion log on Ctrl+C, then propagate signal."""
-        logger.info(colored("Ctrl+C detected — saving motion log...", "yellow", attrs=["bold"]))
+        """Save logs on Ctrl+C, then propagate signal."""
+        logger.info(colored("Ctrl+C detected — saving logs...", "yellow", attrs=["bold"]))
         if self._motion_log_data:
             self._save_motion_log()
+        self._save_sim2real_log()
         # Restore previous handler and re-raise so the process exits normally
         signal.signal(signal.SIGINT, self._prev_sigint_handler)
         signal.raise_signal(signal.SIGINT)
@@ -798,6 +809,56 @@ class WholeBodyTrackingPolicy(BasePolicy):
             ))
         except Exception as e:
             logger.error(colored(f"Failed to save motion log: {e}", "red"))
+
+    # -------------------------------------------------------------------------
+    # Sim2real inference logging (obs + action → logs/sim2real/wbt)
+    # -------------------------------------------------------------------------
+
+    def _init_sim2real_log(self) -> None:
+        log_dir = Path("/home/rllab3/Desktop/codebase/unitreeG1/holosoma_wc/logs/sim2real/wbt")
+        log_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        self._sim2real_log_path = log_dir / f"wbt_{timestamp}.pkl"
+        self._sim2real_log_data = {
+            "created_at": datetime.now().isoformat(),
+            "observation": [],
+            "scaled_policy_action": [],
+        }
+        logger.info(colored(f"Sim2real log initialized: {self._sim2real_log_path}", "cyan"))
+
+    def _append_sim2real_log_step(self, obs: np.ndarray) -> None:
+        if self._sim2real_log_data is None:
+            return
+        self._sim2real_log_data["observation"].append(obs.astype(np.float32).copy())
+        self._sim2real_log_data["scaled_policy_action"].append(
+            self.scaled_policy_action[0].astype(np.float32).copy()
+        )
+
+    def _save_sim2real_log(self) -> None:
+        if self._sim2real_shutdown_complete:
+            return
+        self._sim2real_shutdown_complete = True
+        if self._sim2real_log_data is None or self._sim2real_log_path is None:
+            return
+        num_samples = len(self._sim2real_log_data["observation"])
+        if num_samples == 0:
+            logger.info(colored("Sim2real log empty, skipping save.", "yellow"))
+            return
+        payload = {
+            "created_at": self._sim2real_log_data["created_at"],
+            "saved_at": datetime.now().isoformat(),
+            "observation": np.stack(self._sim2real_log_data["observation"], axis=0),
+            "scaled_policy_action": np.stack(self._sim2real_log_data["scaled_policy_action"], axis=0),
+        }
+        try:
+            with self._sim2real_log_path.open("wb") as f:
+                pickle.dump(payload, f)
+            logger.info(colored(
+                f"Sim2real log saved: {self._sim2real_log_path} ({num_samples} steps)",
+                "cyan", attrs=["bold"],
+            ))
+        except Exception as e:
+            logger.error(colored(f"Failed to save sim2real log: {e}", "red"))
 
     def _collect_motion_log_step(self, robot_state_data, group_outputs: dict):
         """Append one timestep of obs + poses to the motion log."""
@@ -2900,6 +2961,13 @@ class WholeBodyTrackingPolicy(BasePolicy):
         if self.motion_clip_progressing and not self.stabilization_mode:
             # Log inference data (proprio_body, proprio_hand, policy_action)
             self._log_inference_data(input_feed)
+            # Sim2real log: observation + scaled_policy_action
+            obs_arr = (
+                self.current_observation[0]
+                if self.current_observation is not None
+                else np.concatenate([v for v in input_feed.values()], axis=1)[0]
+            )
+            self._append_sim2real_log_step(obs_arr)
             
             # Check if we've hit the safety limit
             if self.max_motion_length is not None and self.motion_timestep >= self.max_motion_length:
