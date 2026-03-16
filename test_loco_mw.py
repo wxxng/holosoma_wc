@@ -534,9 +534,9 @@ def run(args):
 
     vel_command = np.zeros(3, dtype=np.float32)
     vel_command[0] = 1.0
-    if "command" in traj[0]:
-        vel_command = traj[0]["command"].astype(np.float32)
-        print(f"Velocity command from pkl: {vel_command}")
+    # if "command" in traj[0]:
+    #     vel_command = traj[0]["command"].astype(np.float32)
+    #     print(f"Velocity command from pkl: {vel_command}")
 
     print(f"Trajectory: {n_steps} steps at 50Hz = {n_steps / 50.0:.3f}s")
 
@@ -675,6 +675,8 @@ def run(args):
                     raw_action = onnx_session.run(None, {"obs": obs})[0].squeeze()
                     last_raw_action = raw_action.copy()
                     target_q = process_action(raw_action, action_to_config_map)
+                    if args.ignore_hand_action:
+                        target_q[HAND_INDICES] = DEFAULT_DOF_ANGLES[HAND_INDICES]
                     infer_step += 1
                     t = infer_step / 50.0
                     if infer_step % 50 == 0:
@@ -778,6 +780,8 @@ def main():
                         help="Camera target [x y z] (default: 1.0 0.0 1.0).")
     parser.add_argument("--sim-hz", type=int, default=200, help="Simulation frequency in Hz (default: 200)")
     parser.add_argument("--policy-hz", type=int, default=50, help="Policy frequency in Hz (default: 50)")
+    parser.add_argument("--ignore-hand-action", action="store_true",
+                        help="Override hand joint targets with default positions instead of policy output.")
     args = parser.parse_args()
 
     if args.measure_one_step_error:

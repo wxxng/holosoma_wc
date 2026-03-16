@@ -85,5 +85,8 @@ class TaskConfig:
     change_loco_order: bool = False
     """If True, use alternative obs order for loco prior: [last_action, proprio_hand, proprio_body, vel_command]."""
 
+    ignore_hand_action: bool = False
+    """If True, override hand joint targets with default positions instead of policy output."""
+
     log: bool = False
     """Enable task-specific inference logging when supported by the active policy."""

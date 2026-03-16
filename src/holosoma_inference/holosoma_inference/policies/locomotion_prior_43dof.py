@@ -417,6 +417,10 @@ class LocomotionPrior43DOF(LocomotionPolicy):
         target_q = np.zeros(43, dtype=np.float32)
         target_q[_ACTION_IN_DOF] = processed
 
+        # Override hand joints with default positions if ignore_hand_action is set
+        if getattr(self.config.task, "ignore_hand_action", False):
+            target_q[_HAND_IDX] = _HAND_DEFAULT
+
         self.scaled_policy_action = target_q.reshape(1, -1)
         self._append_log_step(obs)
         return self.scaled_policy_action
