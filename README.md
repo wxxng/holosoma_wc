@@ -90,6 +90,26 @@ oo : stop
 
 Use the same timestep value for both commands when you want MuJoCo init and policy playback to start from the same motion frame.
 
+# Sim2Real 
+
+## Hand control
+```
+cd~/Desktop/codebase/unitreeG1/holosoma/unitree_sdk2_amazon/build/bin
+
+./g1_dex3_example enp132s0 # ./g1_dex3_example for repeating both hands
+```
+
+## Locomotion with Prior
+First Press L2+R2 and check the led turns to yellow
+```
+python3 src/holosoma_inference/holosoma_inference/run_policy.py inference:g1-43dof-loco-prior \
+    --task.model-path src/holosoma_inference/holosoma_inference/models/loco/g1_43dof/walk_prior_0315.onnx \
+    --task.use-joystick \
+    --task.rl-rate 50 \
+    --task.interface enp132s0 \
+    --task.change_loco_order \
+    --task.log
+```
 
 
 ## To use vscode debugger:
