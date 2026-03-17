@@ -34,13 +34,22 @@ class UnitreeSdk2Bridge(BasicSdk2Bridge):
     robots with hands (g1_43dof) in a unified implementation.
     """
 
-    SUPPORTED_ROBOT_TYPES = {"g1_29dof", "h1", "h1-2", "go2_12dof", "g1_43dof", "g1_43dof_switched"}
+    SUPPORTED_ROBOT_TYPES = {
+        "g1_29dof",
+        "h1",
+        "h1-2",
+        "go2_12dof",
+        "g1_43dof",
+        "g1_43dof_switched",
+        "g1_43dof_leftindexdisabled",
+    }
 
     def _init_sdk_components(self):
         """Initialize Unitree SDK-specific components."""
 
         robot_type = self.robot.asset.robot_type
         self.switched_hands = robot_type == "g1_43dof_switched"
+        self.left_index_disabled = robot_type == "g1_43dof_leftindexdisabled"
 
         # Validate robot type first
         if robot_type not in self.SUPPORTED_ROBOT_TYPES and not robot_type.startswith("g1_43dof_"):
@@ -205,6 +214,17 @@ class UnitreeSdk2Bridge(BasicSdk2Bridge):
             return slice(36, 43), slice(22, 29)
         return slice(22, 29), slice(36, 43)
 
+    def _get_disabled_joint_indices(self):
+        if getattr(self, "left_index_disabled", False):
+            return [27, 28]
+        return []
+
+    def _apply_disabled_joint_mask(self, values):
+        masked = np.asarray(values, dtype=np.float32).copy()
+        for joint_idx in self._get_disabled_joint_indices():
+            masked[joint_idx] = 0.0
+        return masked
+
     def low_cmd_handler(self, msg=None):
         """Handle Unitree low-level command messages."""
         # Poll for incoming commands from DDS
@@ -271,9 +291,13 @@ class UnitreeSdk2Bridge(BasicSdk2Bridge):
 
         # Get simulator data (43 DOF total in MuJoCo order)
         positions, velocities, accelerations = self._get_dof_states()
+        positions = self._apply_disabled_joint_mask(positions)
+        velocities = self._apply_disabled_joint_mask(velocities)
+        accelerations = self._apply_disabled_joint_mask(accelerations)
 
         # Use computed torques instead of actuator_forces (which is empty without explicit actuators)
         torques = self.torques if self.torques is not None else np.zeros(self.num_motor)
+        torques = self._apply_disabled_joint_mask(torques)
 
         quaternion, gyro, acceleration = self._get_base_imu_data()
 
@@ -413,6 +437,13 @@ class UnitreeSdk2Bridge(BasicSdk2Bridge):
             q_target_full[right_slice] = self.right_hand_cmd.q_target[0:7]
             dq_target_full[right_slice] = self.right_hand_cmd.dq_target[0:7]
 
+            for joint_idx in self._get_disabled_joint_indices():
+                tau_ff_full[joint_idx] = 0.0
+                kp_full[joint_idx] = 0.0
+                kd_full[joint_idx] = 0.0
+                q_target_full[joint_idx] = 0.0
+                dq_target_full[joint_idx] = 0.0
+
             # Use base class helper for PD control computation
             return self._compute_pd_torques(
                 tau_ff=tau_ff_full,
@@ -463,7 +494,7 @@ class UnitreeSdk2Bridge(BasicSdk2Bridge):
 
     def _get_scene_object_name(self) -> str | None:
         robot_type = str(self.robot.asset.robot_type)
-        if robot_type == "g1_43dof_switched":
+        if robot_type in {"g1_43dof_switched", "g1_43dof_leftindexdisabled"}:
             return None
         if robot_type.startswith("g1_43dof_"):
             object_name = robot_type[len("g1_43dof_"):].strip()

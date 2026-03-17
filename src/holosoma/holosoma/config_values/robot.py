@@ -1889,6 +1889,10 @@ _G1_43DOF_RIGHT_HAND_NAMES = [
     "right_hand_index_0_joint",
     "right_hand_index_1_joint",
 ]
+_G1_43DOF_LEFT_INDEX_NAMES = [
+    "left_hand_index_0_joint",
+    "left_hand_index_1_joint",
+]
 
 
 def _swap_g1_43dof_hand_segments(values: list[float]) -> list[float]:
@@ -1908,6 +1912,23 @@ def _swap_g1_43dof_hand_defaults(default_joint_angles: dict[str, float]) -> dict
     return swapped
 
 
+def _set_g1_43dof_joint_values(values: list[float], joint_names: list[str], value: float) -> list[float]:
+    updated = list(values)
+    dof_indices = {joint_name: idx for idx, joint_name in enumerate(g1_43dof.dof_names)}
+    for joint_name in joint_names:
+        updated[dof_indices[joint_name]] = value
+    return updated
+
+
+def _set_g1_43dof_default_joint_angles(
+    default_joint_angles: dict[str, float], joint_names: list[str], value: float
+) -> dict[str, float]:
+    updated = dict(default_joint_angles)
+    for joint_name in joint_names:
+        updated[joint_name] = value
+    return updated
+
+
 g1_43dof_switched = replace(
     g1_43dof,
     dof_pos_lower_limit_list=_swap_g1_43dof_hand_segments(g1_43dof.dof_pos_lower_limit_list),
@@ -1920,6 +1941,26 @@ g1_43dof_switched = replace(
         g1_43dof.asset,
         xml_file="g1/g1_43dof_switched.xml",
         robot_type="g1_43dof_switched",
+    ),
+)
+
+
+g1_43dof_leftindexdisabled = replace(
+    g1_43dof,
+    dof_pos_lower_limit_list=_set_g1_43dof_joint_values(g1_43dof.dof_pos_lower_limit_list, _G1_43DOF_LEFT_INDEX_NAMES, 0.0),
+    dof_pos_upper_limit_list=_set_g1_43dof_joint_values(g1_43dof.dof_pos_upper_limit_list, _G1_43DOF_LEFT_INDEX_NAMES, 0.0),
+    init_state=replace(
+        g1_43dof.init_state,
+        default_joint_angles=_set_g1_43dof_default_joint_angles(
+            g1_43dof.init_state.default_joint_angles,
+            _G1_43DOF_LEFT_INDEX_NAMES,
+            0.0,
+        ),
+    ),
+    asset=replace(
+        g1_43dof.asset,
+        xml_file="g1/g1_43dof_leftindexdisabled.xml",
+        robot_type="g1_43dof_leftindexdisabled",
     ),
 )
 
@@ -2029,6 +2070,8 @@ DEFAULTS = {
     "g1_43dof": g1_43dof,
     "g1_43dof_switched": g1_43dof_switched,
     "g1-43dof-switched": g1_43dof_switched,
+    "g1_43dof_leftindexdisabled": g1_43dof_leftindexdisabled,
+    "g1-43dof-leftindexdisabled": g1_43dof_leftindexdisabled,
     "t1_29dof_waist_wrist": t1_29dof_waist_wrist,
     "g1_29dof_w_object": g1_29dof_w_object,
     **{f"g1_43dof_{name}": _make_g1_43dof_object(name) for name in _G1_43DOF_OBJECTS},
