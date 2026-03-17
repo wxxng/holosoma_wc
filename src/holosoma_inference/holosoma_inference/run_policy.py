@@ -120,6 +120,8 @@ def run_policy(config: InferenceConfig):
 
         logger.info("✅ Policy initialized successfully!")
         _print_control_guide(policy_class, config.task.use_joystick)
+        if getattr(config.task, "debug_hand_demo", False):
+            logger.info("debug_hand_demo keyboard controls: 1=left thumb, 2=left middle, 3=left index, 4=right thumb, 5=right middle, 6=right index")
         policy.run()
         logger.info("✅ Policy execution completed!")
 

@@ -128,6 +128,107 @@ def reorder_to_mj(pkl_data, reorder_map):
     return mj_data
 
 
+def _init_hand_plot_data(enabled):
+    """Initialize optional hand target/state buffers."""
+    if not enabled:
+        return None
+    return {"target": [], "actual": []}
+
+
+def _record_hand_plot_sample(hand_plot_data, target_q, joint_pos_config):
+    """Record hand joint target and measured state in HAND_JOINT_NAMES order."""
+    if hand_plot_data is None:
+        return
+    hand_plot_data["target"].append(np.asarray(target_q[HAND_INDICES], dtype=np.float32).copy())
+    hand_plot_data["actual"].append(np.asarray(joint_pos_config[HAND_INDICES], dtype=np.float32).copy())
+
+
+def _save_hand_plot(root, hand_plot_data, policy_hz):
+    """Save a per-joint hand tracking plot to test_log/."""
+    if hand_plot_data is None:
+        return
+    if not hand_plot_data["target"]:
+        print("\n  [Hand Plot] No hand target/state samples were collected. Skipping plot save.")
+        return
+
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        print(f"\n  [Hand Plot] Failed to import matplotlib: {exc}")
+        return
+
+    target = np.asarray(hand_plot_data["target"], dtype=np.float32)
+    actual = np.asarray(hand_plot_data["actual"], dtype=np.float32)
+    time_axis = np.arange(target.shape[0], dtype=np.float32) / float(policy_hz)
+
+    log_dir = root / "test_log"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    plot_path = log_dir / f"hand_joint_tracking_{timestamp}.png"
+
+    num_cols = 2
+    num_rows = int(np.ceil(len(HAND_JOINT_NAMES) / num_cols))
+    fig, axes = plt.subplots(num_rows, num_cols, figsize=(16, 3 * num_rows), sharex=True)
+    axes = np.atleast_1d(axes).reshape(-1)
+
+    for joint_idx, joint_name in enumerate(HAND_JOINT_NAMES):
+        ax = axes[joint_idx]
+        ax.plot(time_axis, target[:, joint_idx], label="target", linewidth=1.5)
+        ax.plot(time_axis, actual[:, joint_idx], label="actual", linewidth=1.2, alpha=0.9)
+        ax.set_title(joint_name, fontsize=10)
+        ax.grid(True, alpha=0.3)
+        if joint_idx % num_cols == 0:
+            ax.set_ylabel("rad")
+
+    for ax in axes[len(HAND_JOINT_NAMES):]:
+        ax.axis("off")
+
+    for ax in axes[-num_cols:]:
+        if ax.has_data():
+            ax.set_xlabel("time [s]")
+
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper right")
+    fig.suptitle("Hand joint target vs actual")
+    fig.tight_layout(rect=(0, 0, 0.97, 0.98))
+    fig.savefig(plot_path, dpi=200)
+    plt.close(fig)
+    print(f"\n  [Hand Plot] Saved hand joint tracking plot to {plot_path}")
+
+
+def _save_hand_action_log(root, hand_plot_data, policy_hz):
+    """Save recorded hand joint targets to reusable NPZ logs in test_log/."""
+    if hand_plot_data is None:
+        return
+    if not hand_plot_data["target"]:
+        print("\n  [Hand Action] No hand target samples were collected. Skipping action save.")
+        return
+
+    target = np.asarray(hand_plot_data["target"], dtype=np.float32)
+    actual = np.asarray(hand_plot_data["actual"], dtype=np.float32)
+
+    log_dir = root / "test_log"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    action_path = log_dir / f"hand_joint_targets_{timestamp}.npz"
+    latest_action_path = log_dir / "hand_joint_targets_latest.npz"
+
+    payload = {
+        "target": target,
+        "actual": actual,
+        "joint_names": np.asarray(HAND_JOINT_NAMES),
+        "policy_hz": np.asarray(policy_hz, dtype=np.float32),
+        "created_at": np.asarray(datetime.now().isoformat()),
+    }
+    np.savez_compressed(action_path, **payload)
+    np.savez_compressed(latest_action_path, **payload)
+    print(f"\n  [Hand Action] Saved hand joint targets to {action_path}")
+    print(f"  [Hand Action] Updated latest hand joint targets at {latest_action_path}")
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Policy inference
 # ═══════════════════════════════════════════════════════════════════════════
@@ -288,6 +389,7 @@ def run_measure_one_step_error(args):
     all_diffs = []      # list of (43,) arrays in pkl joint order
     all_obs_diffs = []  # list of (138,) arrays
     all_proc_diffs = []  # list of (43,) arrays in action order (computed vs recorded processed_action)
+    hand_plot_data = _init_hand_plot_data(args.save_hand_plot)
 
     viewer_ctx = mujoco.viewer.launch_passive(model, mj_data) if args.render else None
     try:
@@ -349,6 +451,11 @@ def run_measure_one_step_error(args):
                             f"  diff={proc_diff[i]:+.6f}"
                         )
             target_q = process_action(raw_action, action_to_config_map)
+            _record_hand_plot_sample(
+                hand_plot_data,
+                target_q,
+                mj_data.qpos[dof_qpos_addrs].astype(np.float32),
+            )
             for _ in range(steps_per_policy):
                 apply_pd_control(mj_data, target_q, dof_qpos_addrs, dof_qvel_addrs, actuator_ids)
                 mujoco.mj_step(model, mj_data)
@@ -444,6 +551,8 @@ def run_measure_one_step_error(args):
     log_path = log_dir / f"one_step_error_{timestamp}.pkl"
     joblib.dump({"diffs": all_diffs, "joint_order": joint_order}, log_path)
     print(f"\nSaved error log: {log_path}")
+    _save_hand_action_log(root, hand_plot_data, args.policy_hz)
+    _save_hand_plot(root, hand_plot_data, args.policy_hz)
 
 
 def _run_state_replay(args, data, model, traj, n_steps, dof_qpos_addrs, dof_qvel_addrs,
@@ -603,6 +712,7 @@ def run(args):
 
     traj_idx = 0
     log_data = [] if args.log else None
+    hand_plot_data = _init_hand_plot_data(args.save_hand_plot)
 
     if args.state_replay:
         mode_str = "state replay"
@@ -682,6 +792,12 @@ def run(args):
                     if infer_step % 50 == 0:
                         print(f"\r  [Infer] Step {infer_step}  t={t:.3f}s", end="", flush=True)
 
+                _record_hand_plot_sample(
+                    hand_plot_data,
+                    target_q,
+                    data.qpos[dof_qpos_addrs].astype(np.float32),
+                )
+
             def _apply_ctrl(d):
                 apply_pd_control(
                     d, target_q, dof_qpos_addrs, dof_qvel_addrs, actuator_ids,
@@ -743,6 +859,8 @@ def run(args):
             video_fps = 1.0 / (sim_dt * steps_per_policy)
             video_recorder.save(fps=video_fps)
             video_recorder.cleanup()
+        _save_hand_action_log(root, hand_plot_data, args.policy_hz)
+        _save_hand_plot(root, hand_plot_data, args.policy_hz)
 
     print("\nDone.")
 
@@ -782,6 +900,8 @@ def main():
     parser.add_argument("--policy-hz", type=int, default=50, help="Policy frequency in Hz (default: 50)")
     parser.add_argument("--ignore-hand-action", action="store_true",
                         help="Override hand joint targets with default positions instead of policy output.")
+    parser.add_argument("--save_hand_plot", "--save-hand-plot", dest="save_hand_plot", action="store_true",
+                        help="Accumulate hand joint target/state, save a reusable NPZ target log, and save a plot to test_log on exit.")
     args = parser.parse_args()
 
     if args.measure_one_step_error:

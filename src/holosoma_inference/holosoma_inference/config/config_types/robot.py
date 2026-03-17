@@ -218,3 +218,21 @@ class RobotConfig:
 
     num_upper_body_joints: int = 14
     """Number of upper body degrees of freedom."""
+
+    joint_pos_min: tuple[float, ...] | None = None
+    """Per-joint lower position limits in joint order."""
+
+    joint_pos_max: tuple[float, ...] | None = None
+    """Per-joint upper position limits in joint order."""
+
+    joint_vel_limit: tuple[float, ...] | None = None
+    """Per-joint velocity limits in joint order."""
+
+    motor_effort_limit: tuple[float, ...] | None = None
+    """Per-motor effort limits."""
+
+    has_hands: bool = False
+    """Whether the robot exposes separate hand DOFs."""
+
+    num_hand_dofs: int = 0
+    """Number of hand DOFs per hand when `has_hands` is enabled."""

@@ -8,6 +8,11 @@ from termcolor import colored
 from holosoma_inference.config.config_types import RobotConfig
 from holosoma_inference.sdk.command_sender import create_command_sender
 from holosoma_inference.sdk.state_processor import create_state_processor
+from holosoma_inference.utils.hand_switch import (
+    canonical_gains_to_switched,
+    canonical_hand_to_switched,
+    switched_hand_to_canonical,
+)
 from holosoma_inference.utils.math.quat import quat_inverse, quat_mul, wxyz_to_xyzw, xyzw_to_wxyz
 
 OBJECT_STATE_UDP_PORT = 10002
@@ -50,10 +55,11 @@ class InterfaceWrapper:
     # Initialization
     # ============================================================================
 
-    def __init__(self, robot_config: RobotConfig, domain_id=0, interface_str=None, use_joystick=True, use_hands=False):
+    def __init__(self, robot_config: RobotConfig, domain_id=0, interface_str=None, use_joystick=True, use_hands=False, switch_hands=False):
         self.logger = logger
         self.use_joystick = use_joystick
         self.use_hands = use_hands
+        self.switch_hands = switch_hands
         self.robot_config = robot_config
         self.domain_id = domain_id
         self.interface_str = interface_str
@@ -79,6 +85,8 @@ class InterfaceWrapper:
         self._scene_info_sock = None
         self._scene_object_name_cache = None
         self._scene_reset_counter_cache = None
+        self._scene_robot_type_cache = None
+        self._scene_switched_hands_cache = None
         # World topics receiver (external pose/velocity via UDP JSON)
         self._world_topics_sock = None
         self._world_robot_pose_cache = None  # [x,y,z,qx,qy,qz,qw] in FLU
@@ -288,6 +296,16 @@ class InterfaceWrapper:
                 except (TypeError, ValueError):
                     pass
 
+            robot_type = packet.get("robot_type", None)
+            if robot_type is not None:
+                robot_type = str(robot_type).strip()
+                if robot_type:
+                    self._scene_robot_type_cache = robot_type
+
+            switched_hands = packet.get("switched_hands", None)
+            if switched_hands is not None:
+                self._scene_switched_hands_cache = bool(switched_hands)
+
     def _init_sdk_components(self):
         """Initialize the appropriate backend based on SDK type."""
         if self.sdk_type == "booster":
@@ -414,6 +432,16 @@ class InterfaceWrapper:
         """Get latest simulator reset counter if available."""
         self._poll_scene_info()
         return self._scene_reset_counter_cache
+
+    def get_scene_robot_type(self):
+        """Get latest simulator robot type if available."""
+        self._poll_scene_info()
+        return self._scene_robot_type_cache
+
+    def get_scene_switched_hands(self):
+        """Return whether the simulator is publishing a switched-hand robot, if known."""
+        self._poll_scene_info()
+        return self._scene_switched_hands_cache
 
     def set_table_pose(self, pos_xyz, quat_wxyz=None):
         """Send table pose command to simulator bridge over UDP.
@@ -939,17 +967,25 @@ class InterfaceWrapper:
         joint_vel_43 = np.zeros((1, 43))
         
         # Map 29 body joints to 43 DOF positions
+        if self.switch_hands:
+            lh_pos = switched_hand_to_canonical(right_hand_pos)
+            rh_pos = switched_hand_to_canonical(left_hand_pos)
+            lh_vel = switched_hand_to_canonical(right_hand_vel)
+            rh_vel = switched_hand_to_canonical(left_hand_vel)
+        else:
+            lh_pos, rh_pos = left_hand_pos, right_hand_pos
+            lh_vel, rh_vel = left_hand_vel, right_hand_vel
         joint_pos_43[:, 0:15] = body_joint_pos_29[:, 0:15]      # legs + waist
         joint_pos_43[:, 15:22] = body_joint_pos_29[:, 15:22]    # left arm
-        joint_pos_43[:, 22:29] = left_hand_pos                   # left hand
+        joint_pos_43[:, 22:29] = lh_pos                          # left hand
         joint_pos_43[:, 29:36] = body_joint_pos_29[:, 22:29]    # right arm
-        joint_pos_43[:, 36:43] = right_hand_pos                  # right hand
-        
+        joint_pos_43[:, 36:43] = rh_pos                          # right hand
+
         joint_vel_43[:, 0:15] = body_joint_vel_29[:, 0:15]      # legs + waist
         joint_vel_43[:, 15:22] = body_joint_vel_29[:, 15:22]    # left arm
-        joint_vel_43[:, 22:29] = left_hand_vel                   # left hand
+        joint_vel_43[:, 22:29] = lh_vel                          # left hand
         joint_vel_43[:, 29:36] = body_joint_vel_29[:, 22:29]    # right arm
-        joint_vel_43[:, 36:43] = right_hand_vel                  # right hand
+        joint_vel_43[:, 36:43] = rh_vel                          # right hand
         
         # Concatenate into full state
         return np.concatenate([
@@ -996,10 +1032,10 @@ class InterfaceWrapper:
         cmd_q_43 = np.asarray(cmd_q_43).flatten()
         cmd_dq_43 = np.asarray(cmd_dq_43).flatten()
         cmd_tau_43 = np.asarray(cmd_tau_43).flatten()
-        
+
         if len(cmd_q_43) != 43:
             raise ValueError(f"Expected 43 joint positions, got {len(cmd_q_43)}")
-        
+
         # Extract body commands (29 DOF)
         # Map 43 DOF -> 29 DOF: 0-14 (legs+waist), 15-21 (left arm), 29-35 (right arm)
         cmd_q_body = np.zeros(29)
@@ -1062,43 +1098,62 @@ class InterfaceWrapper:
             kd_override=kd_override_body,
         )
         
-        # Extract hand commands (7 DOF each)
+        # Extract hand commands (7 DOF each) in canonical left/right side order.
+        left_q = np.asarray(cmd_q_43[22:29], dtype=np.float32)
+        left_dq = np.asarray(cmd_dq_43[22:29], dtype=np.float32)
+        left_tau = np.asarray(cmd_tau_43[22:29], dtype=np.float32)
+        right_q = np.asarray(cmd_q_43[36:43], dtype=np.float32)
+        right_dq = np.asarray(cmd_dq_43[36:43], dtype=np.float32)
+        right_tau = np.asarray(cmd_tau_43[36:43], dtype=np.float32)
+
+        left_kp = np.asarray(kp_override_43[22:29], dtype=np.float32) if kp_override_43 is not None else np.array(
+            [2.0, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5], dtype=np.float32
+        )
+        left_kd = np.asarray(kd_override_43[22:29], dtype=np.float32) if kd_override_43 is not None else np.array(
+            [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1], dtype=np.float32
+        )
+        right_kp = np.asarray(kp_override_43[36:43], dtype=np.float32) if kp_override_43 is not None else np.array(
+            [2.0, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5], dtype=np.float32
+        )
+        right_kd = np.asarray(kd_override_43[36:43], dtype=np.float32) if kd_override_43 is not None else np.array(
+            [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1], dtype=np.float32
+        )
+
+        if self.switch_hands:
+            left_q = canonical_hand_to_switched(left_q)
+            left_dq = canonical_hand_to_switched(left_dq)
+            left_tau = canonical_hand_to_switched(left_tau)
+            left_kp = canonical_gains_to_switched(left_kp)
+            left_kd = canonical_gains_to_switched(left_kd)
+
+            right_q = canonical_hand_to_switched(right_q)
+            right_dq = canonical_hand_to_switched(right_dq)
+            right_tau = canonical_hand_to_switched(right_tau)
+            right_kp = canonical_gains_to_switched(right_kp)
+            right_kd = canonical_gains_to_switched(right_kd)
+
+            left_q, right_q = right_q, left_q
+            left_dq, right_dq = right_dq, left_dq
+            left_tau, right_tau = right_tau, left_tau
+            left_kp, right_kp = right_kp, left_kp
+            left_kd, right_kd = right_kd, left_kd
+
         left_hand_cmd = self.left_hand_interface.create_zero_command() if self.left_hand_interface else None
         right_hand_cmd = self.right_hand_interface.create_zero_command() if self.right_hand_interface else None
-        
+
         if left_hand_cmd is not None:
-            left_hand_cmd.q_target = cmd_q_43[22:29].tolist()      # indices 22-28
-            left_hand_cmd.dq_target = cmd_dq_43[22:29].tolist()
-            left_hand_cmd.tau_ff = cmd_tau_43[22:29].tolist()
-            
-            # Always set kp/kd for hands (kp_override_43 is populated from robot_config if originally None)
-            if kp_override_43 is not None:
-                left_hand_cmd.kp = kp_override_43[22:29].tolist()
-            else:
-                # Fallback: use default hand gains if robot_config didn't have motor_kp
-                left_hand_cmd.kp = [2.0, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
-            if kd_override_43 is not None:
-                left_hand_cmd.kd = kd_override_43[22:29].tolist()
-            else:
-                # Fallback: use default hand gains if robot_config didn't have motor_kd
-                left_hand_cmd.kd = [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
-        
+            left_hand_cmd.q_target = left_q.tolist()
+            left_hand_cmd.dq_target = left_dq.tolist()
+            left_hand_cmd.tau_ff = left_tau.tolist()
+            left_hand_cmd.kp = left_kp.tolist()
+            left_hand_cmd.kd = left_kd.tolist()
+
         if right_hand_cmd is not None:
-            right_hand_cmd.q_target = cmd_q_43[36:43].tolist()     # indices 36-42
-            right_hand_cmd.dq_target = cmd_dq_43[36:43].tolist()
-            right_hand_cmd.tau_ff = cmd_tau_43[36:43].tolist()
-            
-            # Always set kp/kd for hands (kp_override_43 is populated from robot_config if originally None)
-            if kp_override_43 is not None:
-                right_hand_cmd.kp = kp_override_43[36:43].tolist()
-            else:
-                # Fallback: use default hand gains if robot_config didn't have motor_kp
-                right_hand_cmd.kp = [2.0, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
-            if kd_override_43 is not None:
-                right_hand_cmd.kd = kd_override_43[36:43].tolist()
-            else:
-                # Fallback: use default hand gains if robot_config didn't have motor_kd
-                right_hand_cmd.kd = [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
-        
-        # Send hand commands
+            right_hand_cmd.q_target = right_q.tolist()
+            right_hand_cmd.dq_target = right_dq.tolist()
+            right_hand_cmd.tau_ff = right_tau.tolist()
+            right_hand_cmd.kp = right_kp.tolist()
+            right_hand_cmd.kd = right_kd.tolist()
+
+        # Send hand commands on the raw DDS topics.
         self.send_hand_command(left_hand_cmd, right_hand_cmd)

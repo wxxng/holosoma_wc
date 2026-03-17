@@ -1869,6 +1869,61 @@ g1_43dof = RobotConfig(
 )
 
 
+_G1_43DOF_LEFT_HAND_SLICE = slice(22, 29)
+_G1_43DOF_RIGHT_HAND_SLICE = slice(36, 43)
+_G1_43DOF_LEFT_HAND_NAMES = [
+    "left_hand_thumb_0_joint",
+    "left_hand_thumb_1_joint",
+    "left_hand_thumb_2_joint",
+    "left_hand_middle_0_joint",
+    "left_hand_middle_1_joint",
+    "left_hand_index_0_joint",
+    "left_hand_index_1_joint",
+]
+_G1_43DOF_RIGHT_HAND_NAMES = [
+    "right_hand_thumb_0_joint",
+    "right_hand_thumb_1_joint",
+    "right_hand_thumb_2_joint",
+    "right_hand_middle_0_joint",
+    "right_hand_middle_1_joint",
+    "right_hand_index_0_joint",
+    "right_hand_index_1_joint",
+]
+
+
+def _swap_g1_43dof_hand_segments(values: list[float]) -> list[float]:
+    swapped = list(values)
+    left_segment = list(swapped[_G1_43DOF_LEFT_HAND_SLICE])
+    right_segment = list(swapped[_G1_43DOF_RIGHT_HAND_SLICE])
+    swapped[_G1_43DOF_LEFT_HAND_SLICE] = right_segment
+    swapped[_G1_43DOF_RIGHT_HAND_SLICE] = left_segment
+    return swapped
+
+
+def _swap_g1_43dof_hand_defaults(default_joint_angles: dict[str, float]) -> dict[str, float]:
+    swapped = dict(default_joint_angles)
+    for left_name, right_name in zip(_G1_43DOF_LEFT_HAND_NAMES, _G1_43DOF_RIGHT_HAND_NAMES):
+        swapped[left_name] = default_joint_angles[right_name]
+        swapped[right_name] = default_joint_angles[left_name]
+    return swapped
+
+
+g1_43dof_switched = replace(
+    g1_43dof,
+    dof_pos_lower_limit_list=_swap_g1_43dof_hand_segments(g1_43dof.dof_pos_lower_limit_list),
+    dof_pos_upper_limit_list=_swap_g1_43dof_hand_segments(g1_43dof.dof_pos_upper_limit_list),
+    init_state=replace(
+        g1_43dof.init_state,
+        default_joint_angles=_swap_g1_43dof_hand_defaults(g1_43dof.init_state.default_joint_angles),
+    ),
+    asset=replace(
+        g1_43dof.asset,
+        xml_file="g1/g1_43dof_switched.xml",
+        robot_type="g1_43dof_switched",
+    ),
+)
+
+
 def _make_g1_43dof_object(name: str) -> "RobotConfig":
     return replace(
         g1_43dof,
@@ -1972,6 +2027,8 @@ g1_43dof_cubemedium = _make_g1_43dof_object("cubemedium")
 DEFAULTS = {
     "g1_29dof": g1_29dof,
     "g1_43dof": g1_43dof,
+    "g1_43dof_switched": g1_43dof_switched,
+    "g1-43dof-switched": g1_43dof_switched,
     "t1_29dof_waist_wrist": t1_29dof_waist_wrist,
     "g1_29dof_w_object": g1_29dof_w_object,
     **{f"g1_43dof_{name}": _make_g1_43dof_object(name) for name in _G1_43DOF_OBJECTS},

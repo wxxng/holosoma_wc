@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import math
 import sys
 import threading
 import time
@@ -25,6 +26,15 @@ from holosoma_inference.utils.latency import LatencyTracker
 from holosoma_inference.utils.math.quat import quat_rotate_inverse
 from holosoma_inference.utils.rate import RateLimiter
 from holosoma_inference.utils.wandb import load_checkpoint
+
+_DEBUG_HAND_DEMO_FINGER_GROUPS = {
+    1: ("left_thumb", np.array([22, 23, 24], dtype=np.int64)),
+    2: ("left_middle", np.array([25, 26], dtype=np.int64)),
+    3: ("left_index", np.array([27, 28], dtype=np.int64)),
+    4: ("right_thumb", np.array([36, 37, 38], dtype=np.int64)),
+    5: ("right_middle", np.array([39, 40], dtype=np.int64)),
+    6: ("right_index", np.array([41, 42], dtype=np.int64)),
+}
 
 
 class BasePolicy:
@@ -152,6 +162,7 @@ class BasePolicy:
                 interface_str=self.config.task.interface,
                 use_joystick=self.config.task.use_joystick,
                 use_hands=(self.robot_config.num_joints == 43),
+                switch_hands=getattr(self.config.task, "switch_hands", False),
             )
         else:
             self.interface = create_interface(
@@ -311,6 +322,59 @@ class BasePolicy:
             # Right hand (7 joints)
             0.0, -1.0, -1.7, 1.57, 1.7, 1.57, 1.7
         ], dtype=np.float32)
+
+        self._debug_hand_half_cycle_steps = max(1, int(round(4.0 * self.rl_rate)))
+        self._debug_hand_demo_cycle_steps = max(1, int(round(2.0 * self.rl_rate)))
+        self._debug_hand_hand_idx = np.array(list(range(22, 29)) + list(range(36, 43)), dtype=np.int64)
+        self._debug_hand_body_hold_q = np.zeros(self.num_dofs, dtype=np.float32)
+        stiff_kp_source = self.robot_config.stiff_startup_kp or self.robot_config.motor_kp
+        stiff_kd_source = self.robot_config.stiff_startup_kd or self.robot_config.motor_kd
+        self._debug_hand_kp = np.array(stiff_kp_source, dtype=np.float32) if stiff_kp_source is not None else None
+        self._debug_hand_kd = np.array(stiff_kd_source, dtype=np.float32) if stiff_kd_source is not None else None
+        self._debug_hand_open_pos = np.array([
+            0.0, -0.65, 0.1, -0.1, -0.1, -0.1, -0.1,
+            0.0, 0.65, -0.1, 0.1, 0.1, 0.1, 0.1,
+        ], dtype=np.float32)
+        self._debug_hand_grip_pos = np.array([
+            0.0, 1.0, 1.6, -1.5, -1.7, -1.5, -1.7,
+            0.0, -1.0, -1.6, 1.5, 1.7, 1.5, 1.7,
+        ], dtype=np.float32)
+        self._debug_hand_start_pos = self._debug_hand_open_pos.copy()
+        self._debug_hand_current_pos = self._debug_hand_open_pos.copy()
+        self._debug_hand_step = 0
+        self._debug_hand_demo_step = 0
+        self._debug_hand_is_opening = True
+        self._debug_hand_initialized = False
+        self.debug_hand = bool(getattr(self.config.task, "debug_hand", False))
+        self.debug_hand_demo = bool(getattr(self.config.task, "debug_hand_demo", False))
+        self.debug_hand_action = getattr(self.config.task, "debug_hand_action", None)
+        self._debug_hand_action_path: Path | None = None
+        self._debug_hand_action_sequence: np.ndarray | None = None
+        self._debug_hand_action_source_hz = float(self.rl_rate)
+        self._debug_hand_action_phase = 0.0
+        self._debug_hand_demo_selected_finger = 1
+
+        if self.debug_hand and self.num_dofs != 43:
+            logger.warning("debug_hand is only supported for 43-DOF robots. Ignoring flag for this configuration.")
+        if self.debug_hand_demo and self.num_dofs != 43:
+            logger.warning("debug_hand_demo is only supported for 43-DOF robots. Ignoring flag for this configuration.")
+        if self.debug_hand_action and self.num_dofs != 43:
+            logger.warning("debug_hand_action is only supported for 43-DOF robots. Ignoring flag for this configuration.")
+
+        if self.num_dofs == 43 and self.debug_hand_action:
+            loaded_debug_hand_action = self._load_debug_hand_action(self.debug_hand_action)
+            if loaded_debug_hand_action is not None:
+                (
+                    self._debug_hand_action_sequence,
+                    self._debug_hand_action_source_hz,
+                    self._debug_hand_action_path,
+                ) = loaded_debug_hand_action
+
+        self._debug_hand_action_enabled = self._debug_hand_action_sequence is not None
+        self._debug_hand_demo_enabled = self.num_dofs == 43 and self.debug_hand_demo
+        self._debug_hand_enabled = self.num_dofs == 43 and (
+            self.debug_hand or self._debug_hand_demo_enabled or self._debug_hand_action_enabled
+        )
 
     def _init_phase_components(self):
         """Initialize phase components."""
@@ -717,6 +781,135 @@ class BasePolicy:
 
         return self._default_kp, self._default_kd
 
+    def _reset_debug_hand_cycle(self):
+        """Reset the debug hand repeat cycle to re-seed from live hand positions."""
+        self._debug_hand_step = 0
+        self._debug_hand_demo_step = 0
+        self._debug_hand_is_opening = True
+        self._debug_hand_initialized = False
+        self._debug_hand_action_phase = 0.0
+
+    def _get_debug_hand_demo_groups(self):
+        return _DEBUG_HAND_DEMO_FINGER_GROUPS
+
+    def _select_debug_hand_demo_finger(self, finger_id: int):
+        if not self._debug_hand_demo_enabled:
+            return
+        finger_groups = self._get_debug_hand_demo_groups()
+        if finger_id not in finger_groups:
+            return
+        self._debug_hand_demo_selected_finger = finger_id
+        finger_label, _ = finger_groups[finger_id]
+        self.logger.info(f"debug_hand_demo finger: {finger_id} ({finger_label})")
+
+    def _build_debug_hand_demo_target(self):
+        """Hold the body at zero and animate one canonical finger group with the viewer demo cycle."""
+        target_q = self._debug_hand_body_hold_q.copy()
+        finger_groups = self._get_debug_hand_demo_groups()
+        finger_label, finger_indices = finger_groups[self._debug_hand_demo_selected_finger]
+
+        if self.q_min_arr is None or self.q_max_arr is None:
+            self.logger.warning("debug_hand_demo requires joint position limits; falling back to zero target.")
+            return target_q.reshape(1, -1)
+
+        phase = 0.5 * (
+            1.0 + math.sin((2.0 * math.pi * self._debug_hand_demo_step) / float(self._debug_hand_demo_cycle_steps))
+        )
+        target_q[finger_indices] = self.q_min_arr[finger_indices] + phase * (
+            self.q_max_arr[finger_indices] - self.q_min_arr[finger_indices]
+        )
+        self._debug_hand_demo_step = (self._debug_hand_demo_step + 1) % self._debug_hand_demo_cycle_steps
+        self._debug_hand_demo_active_label = finger_label
+        return target_q.reshape(1, -1)
+
+    def _load_debug_hand_action(self, action_path: str):
+        """Load saved hand joint targets from an NPZ file produced by test_loco_mw.py."""
+        resolved_path = Path(action_path).expanduser()
+        if not resolved_path.is_absolute():
+            resolved_path = (Path.cwd() / resolved_path).resolve()
+
+        try:
+            with np.load(resolved_path, allow_pickle=False) as payload:
+                target = np.asarray(payload["target"], dtype=np.float32)
+                source_hz = float(np.asarray(payload["policy_hz"], dtype=np.float32).reshape(-1)[0])
+        except FileNotFoundError:
+            logger.warning(f"debug_hand_action file not found: {resolved_path}")
+            return None
+        except KeyError as exc:
+            logger.warning(f"debug_hand_action file is missing required key {exc}: {resolved_path}")
+            return None
+        except Exception as exc:
+            logger.warning(f"Failed to load debug_hand_action from {resolved_path}: {exc}")
+            return None
+
+        num_hand_dofs = len(self._debug_hand_hand_idx)
+        if target.ndim != 2 or target.shape[1] != num_hand_dofs:
+            logger.warning(
+                f"debug_hand_action target shape {target.shape} is invalid; "
+                f"expected (N, {num_hand_dofs}): {resolved_path}"
+            )
+            return None
+        if target.shape[0] == 0:
+            logger.warning(f"debug_hand_action file has no samples: {resolved_path}")
+            return None
+
+        source_hz = max(source_hz, 1e-6)
+        logger.info(f"Loaded debug_hand_action with {target.shape[0]} samples at {source_hz:.3f} Hz from {resolved_path}")
+        return target, source_hz, resolved_path
+
+    def _next_debug_hand_action_target(self):
+        """Return the next replayed hand target, resampled to the current RL rate."""
+        if self._debug_hand_action_sequence is None:
+            raise RuntimeError("debug_hand_action sequence is not loaded")
+
+        sequence = self._debug_hand_action_sequence
+        if sequence.shape[0] == 1:
+            return sequence[0].copy()
+
+        phase = self._debug_hand_action_phase % sequence.shape[0]
+        lower_idx = int(np.floor(phase))
+        upper_idx = (lower_idx + 1) % sequence.shape[0]
+        alpha = phase - lower_idx
+        blended_target = (1.0 - alpha) * sequence[lower_idx] + alpha * sequence[upper_idx]
+
+        rl_rate = max(float(self.rl_rate), 1e-6)
+        phase_step = self._debug_hand_action_source_hz / rl_rate
+        self._debug_hand_action_phase = (phase + phase_step) % sequence.shape[0]
+        return blended_target.astype(np.float32, copy=False)
+
+    def _build_debug_hand_target(self, robot_state_data):
+        """Hold the body at zero position and drive the hands with a debug target source."""
+        target_q = self._debug_hand_body_hold_q.copy()
+
+        if self._debug_hand_action_enabled:
+            target_q[self._debug_hand_hand_idx] = self._next_debug_hand_action_target()
+            return target_q.reshape(1, -1)
+
+        if self._debug_hand_demo_enabled:
+            return self._build_debug_hand_demo_target()
+
+        current_q = np.asarray(robot_state_data[0, 7 : 7 + self.num_dofs], dtype=np.float32).copy()
+
+        if not self._debug_hand_initialized:
+            self._debug_hand_start_pos = current_q[self._debug_hand_hand_idx].copy()
+            self._debug_hand_current_pos = self._debug_hand_start_pos.copy()
+            self._debug_hand_step = 0
+            self._debug_hand_is_opening = True
+            self._debug_hand_initialized = True
+
+        target_pos = self._debug_hand_open_pos if self._debug_hand_is_opening else self._debug_hand_grip_pos
+        if self._debug_hand_step < self._debug_hand_half_cycle_steps:
+            alpha = self._debug_hand_step / float(self._debug_hand_half_cycle_steps)
+            self._debug_hand_current_pos = self._debug_hand_start_pos + alpha * (target_pos - self._debug_hand_start_pos)
+            self._debug_hand_step += 1
+        else:
+            self._debug_hand_step = 0
+            self._debug_hand_start_pos = self._debug_hand_current_pos.copy()
+            self._debug_hand_is_opening = not self._debug_hand_is_opening
+
+        target_q[self._debug_hand_hand_idx] = self._debug_hand_current_pos
+        return target_q.reshape(1, -1)
+
     def policy_action(self):
         """Execute policy action and send commands to robot."""
 
@@ -784,6 +977,13 @@ class BasePolicy:
                     q_target = scaled_policy_action
                 else:
                     q_target = scaled_policy_action + self.default_dof_angles
+                
+                if self._debug_hand_enabled:
+                    q_target = self._build_debug_hand_target(robot_state_data)
+                    if self._debug_hand_kp is not None:
+                        kp_override = self._debug_hand_kp
+                    if self._debug_hand_kd is not None:
+                        kd_override = self._debug_hand_kd
 
                 # Clip target positions to motor limits (in-place for speed)
                 if self.q_min_arr is not None and self.q_max_arr is not None:
@@ -922,6 +1122,8 @@ class BasePolicy:
         """Handle keyboard button presses."""
         if self._try_switch_policy_key(keycode):
             pass
+        elif self._debug_hand_demo_enabled and keycode in {"1", "2", "3", "4", "5", "6"}:
+            self._select_debug_hand_demo_finger(int(keycode))
         elif keycode == "]":
             self._handle_start_policy()
         elif keycode == "o":
@@ -962,6 +1164,22 @@ class BasePolicy:
         self.use_policy_action = True
         self.get_ready_state = False
         self.safety_enabled = True  # Enable safety checks when policy starts
+        if self._debug_hand_enabled:
+            self._reset_debug_hand_cycle()
+            if self._debug_hand_action_enabled and self._debug_hand_action_path is not None:
+                self.logger.info(
+                    f"debug_hand_action enabled: body joints will hold zero position while hands replay "
+                    f"{self._debug_hand_action_path}."
+                )
+            elif self._debug_hand_demo_enabled:
+                finger_groups = self._get_debug_hand_demo_groups()
+                finger_label, _ = finger_groups[self._debug_hand_demo_selected_finger]
+                self.logger.info(
+                    "debug_hand_demo enabled: body joints will hold zero position while finger groups "
+                    f"1-6 drive the hands. Current finger: {self._debug_hand_demo_selected_finger} ({finger_label})."
+                )
+            else:
+                self.logger.info("debug_hand enabled: body joints will hold zero position while hands repeat open/grip.")
         self.logger.info(colored("Using policy actions - Safety monitoring ENABLED", "blue"))
         self.phase = np.array([[0.0, np.pi]])
         if hasattr(self.interface, "no_action"):
@@ -973,6 +1191,8 @@ class BasePolicy:
         self.get_ready_state = False
         self.safety_enabled = False  # Disable safety checks when policy is stopped
         self.damping_mode_active = False  # Reset damping mode
+        if self._debug_hand_enabled:
+            self._reset_debug_hand_cycle()
         self.logger.info("Actions set to zero")
         if hasattr(self.interface, "no_action"):
             self.interface.no_action = 1
@@ -1020,6 +1240,10 @@ class BasePolicy:
             debug_str = (
                 f"Active policy [{self.active_policy_index + 1}/{total}]: {name} Kp level {self.interface.kp_level:.2f}"
             )
+            if self._debug_hand_demo_enabled:
+                finger_groups = self._get_debug_hand_demo_groups()
+                finger_label, _ = finger_groups[self._debug_hand_demo_selected_finger]
+                debug_str += f" debug_hand_demo={self._debug_hand_demo_selected_finger}:{finger_label}"
             self.logger.info(debug_str)
 
     # ============================================================================

@@ -26,7 +26,7 @@ python test_repetitive_pnp.py --obj-name cubemedium --randomize --offscreen --re
 
 In one terminal
 ```
-source scripts/source_holomujoco_setup.sh
+source scripts/source_holomujoco_wc_setup.sh
 python src/holosoma/holosoma/run_sim.py robot:g1-43dof 
 
 # 8 to lower the gantry / 7 to raise the gantry.
@@ -94,7 +94,7 @@ Use the same timestep value for both commands when you want MuJoCo init and poli
 
 ## Hand control
 ```
-cd~/Desktop/codebase/unitreeG1/holosoma/unitree_sdk2_amazon/build/bin
+cd ~/Desktop/codebase/unitreeG1/holosoma/unitree_sdk2_amazon/build/bin
 
 ./g1_dex3_example enp132s0 # ./g1_dex3_example for repeating both hands
 ```
@@ -109,6 +109,18 @@ python3 src/holosoma_inference/holosoma_inference/run_policy.py inference:g1-43d
     --task.interface enp132s0 \
     --task.change_loco_order \
     --task.log
+
+# Debug hand-only mode: body holds current joints, Dex3 hands repeat open/grip forever
+python3 src/holosoma_inference/holosoma_inference/run_policy.py inference:g1-43dof-loco-prior \
+    --task.model-path src/holosoma_inference/holosoma_inference/models/loco/g1_43dof/walk_prior_0315.onnx \
+    --task.use-joystick \
+    
+    --task.rl-rate 50 \
+    --task.interface enp132s0 \
+    --task.change_loco_order \
+    --task.log \
+    --task.debug_hand \
+    --task.debug_hand_action test_log/hand_joint_targets_latest.npz
 ```
 
 

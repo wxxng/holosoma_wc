@@ -34,12 +34,13 @@ class UnitreeSdk2Bridge(BasicSdk2Bridge):
     robots with hands (g1_43dof) in a unified implementation.
     """
 
-    SUPPORTED_ROBOT_TYPES = {"g1_29dof", "h1", "h1-2", "go2_12dof", "g1_43dof"}
+    SUPPORTED_ROBOT_TYPES = {"g1_29dof", "h1", "h1-2", "go2_12dof", "g1_43dof", "g1_43dof_switched"}
 
     def _init_sdk_components(self):
         """Initialize Unitree SDK-specific components."""
 
         robot_type = self.robot.asset.robot_type
+        self.switched_hands = robot_type == "g1_43dof_switched"
 
         # Validate robot type first
         if robot_type not in self.SUPPORTED_ROBOT_TYPES and not robot_type.startswith("g1_43dof_"):
@@ -194,6 +195,16 @@ class UnitreeSdk2Bridge(BasicSdk2Bridge):
 
         logger.info("Initialized C++ SDK bridge: 29 body motors + 14 hand motors (all via C++ binding)")
 
+    def _get_hand_topic_indices(self):
+        if self.switched_hands:
+            return self.mujoco_right_hand_indices, self.mujoco_left_hand_indices
+        return self.mujoco_left_hand_indices, self.mujoco_right_hand_indices
+
+    def _get_hand_command_slices(self):
+        if self.switched_hands:
+            return slice(36, 43), slice(22, 29)
+        return slice(22, 29), slice(36, 43)
+
     def low_cmd_handler(self, msg=None):
         """Handle Unitree low-level command messages."""
         # Poll for incoming commands from DDS
@@ -301,19 +312,21 @@ class UnitreeSdk2Bridge(BasicSdk2Bridge):
         self.left_hand_cmd = self.left_hand_interface.read_incoming_command()
         self.right_hand_cmd = self.right_hand_interface.read_incoming_command()
 
-        # Left hand state (MuJoCo indices 22-28)
+        left_indices, right_indices = self._get_hand_topic_indices()
+
+        # Left hand topic state
         left_hand_state = HandState()
-        left_hand_state.motor.q = [float(positions[22 + i]) for i in range(7)]
-        left_hand_state.motor.dq = [float(velocities[22 + i]) for i in range(7)]
-        left_hand_state.motor.tau_est = [float(torques[22 + i]) for i in range(7)]
+        left_hand_state.motor.q = [float(positions[i]) for i in left_indices]
+        left_hand_state.motor.dq = [float(velocities[i]) for i in left_indices]
+        left_hand_state.motor.tau_est = [float(torques[i]) for i in left_indices]
         left_hand_state.motor.temperature = [[0, 0] for _ in range(7)]  # Not simulated
         left_hand_state.motor.voltage = [0.0] * 7  # Not simulated
 
-        # Right hand state (MuJoCo indices 36-42)
+        # Right hand topic state
         right_hand_state = HandState()
-        right_hand_state.motor.q = [float(positions[36 + i]) for i in range(7)]
-        right_hand_state.motor.dq = [float(velocities[36 + i]) for i in range(7)]
-        right_hand_state.motor.tau_est = [float(torques[36 + i]) for i in range(7)]
+        right_hand_state.motor.q = [float(positions[i]) for i in right_indices]
+        right_hand_state.motor.dq = [float(velocities[i]) for i in right_indices]
+        right_hand_state.motor.tau_est = [float(torques[i]) for i in right_indices]
         right_hand_state.motor.temperature = [[0, 0] for _ in range(7)]  # Not simulated
         right_hand_state.motor.voltage = [0.0] * 7  # Not simulated
 
@@ -384,19 +397,21 @@ class UnitreeSdk2Bridge(BasicSdk2Bridge):
             dq_target_full[29:36] = self.low_cmd.dq_target[22:29]
 
             # === Hand commands ===
-            # Left hand: SDK [0-6] -> MuJoCo [22-28]
-            tau_ff_full[22:29] = self.left_hand_cmd.tau_ff[0:7]
-            kp_full[22:29] = self.left_hand_cmd.kp[0:7]
-            kd_full[22:29] = self.left_hand_cmd.kd[0:7]
-            q_target_full[22:29] = self.left_hand_cmd.q_target[0:7]
-            dq_target_full[22:29] = self.left_hand_cmd.dq_target[0:7]
+            left_slice, right_slice = self._get_hand_command_slices()
 
-            # Right hand: SDK [0-6] -> MuJoCo [36-42]
-            tau_ff_full[36:43] = self.right_hand_cmd.tau_ff[0:7]
-            kp_full[36:43] = self.right_hand_cmd.kp[0:7]
-            kd_full[36:43] = self.right_hand_cmd.kd[0:7]
-            q_target_full[36:43] = self.right_hand_cmd.q_target[0:7]
-            dq_target_full[36:43] = self.right_hand_cmd.dq_target[0:7]
+            # Left hand DDS topic -> physical hand slice.
+            tau_ff_full[left_slice] = self.left_hand_cmd.tau_ff[0:7]
+            kp_full[left_slice] = self.left_hand_cmd.kp[0:7]
+            kd_full[left_slice] = self.left_hand_cmd.kd[0:7]
+            q_target_full[left_slice] = self.left_hand_cmd.q_target[0:7]
+            dq_target_full[left_slice] = self.left_hand_cmd.dq_target[0:7]
+
+            # Right hand DDS topic -> physical hand slice.
+            tau_ff_full[right_slice] = self.right_hand_cmd.tau_ff[0:7]
+            kp_full[right_slice] = self.right_hand_cmd.kp[0:7]
+            kd_full[right_slice] = self.right_hand_cmd.kd[0:7]
+            q_target_full[right_slice] = self.right_hand_cmd.q_target[0:7]
+            dq_target_full[right_slice] = self.right_hand_cmd.dq_target[0:7]
 
             # Use base class helper for PD control computation
             return self._compute_pd_torques(
@@ -448,6 +463,8 @@ class UnitreeSdk2Bridge(BasicSdk2Bridge):
 
     def _get_scene_object_name(self) -> str | None:
         robot_type = str(self.robot.asset.robot_type)
+        if robot_type == "g1_43dof_switched":
+            return None
         if robot_type.startswith("g1_43dof_"):
             object_name = robot_type[len("g1_43dof_"):].strip()
             return object_name or None
@@ -456,18 +473,16 @@ class UnitreeSdk2Bridge(BasicSdk2Bridge):
     def _publish_scene_info_udp(self):
         if self._scene_info_sock is None or self._scene_info_addr is None:
             return
+        robot_type = str(self.robot.asset.robot_type)
         object_name = self._get_scene_object_name()
-        if not object_name:
-            if not self._scene_info_warned:
-                logger.warning("Scene object name is unavailable; skipping scene info UDP publish.")
-                self._scene_info_warned = True
-            return
-        packet = json.dumps(
-            {
-                "object_name": object_name,
-                "reset_counter": int(self._scene_reset_counter),
-            }
-        ).encode("utf-8")
+        payload = {
+            "robot_type": robot_type,
+            "switched_hands": bool(self.switched_hands),
+            "reset_counter": int(self._scene_reset_counter),
+        }
+        if object_name:
+            payload["object_name"] = object_name
+        packet = json.dumps(payload).encode("utf-8")
         try:
             self._scene_info_sock.sendto(packet, self._scene_info_addr)
         except OSError as exc:

@@ -33,6 +33,9 @@ class TaskConfig:
     use_joystick: bool = False
     """Enable joystick control input."""
 
+    switch_hands: bool = False
+    """Canonicalize swapped-hand DDS topics, including side swap, middle/index remap, and sign fixes."""
+
     joystick_type: str = "xbox"
     """Joystick type."""
 
@@ -87,6 +90,15 @@ class TaskConfig:
 
     ignore_hand_action: bool = False
     """If True, override hand joint targets with default positions instead of policy output."""
+
+    debug_hand: bool = False
+    """If True on 43-DOF robots, hold body joints at current positions and repeat the Dex3 open/grip cycle on the hands."""
+
+    debug_hand_demo: bool = False
+    """If True on 43-DOF robots, hold body joints at zero and drive canonical finger groups 1-6 for switched/non-switched hand debugging."""
+
+    debug_hand_action: str | None = None
+    """Optional path to saved hand joint targets. When provided on 43-DOF robots, replays that sequence instead of the default debug_hand cycle."""
 
     log: bool = False
     """Enable task-specific inference logging when supported by the active policy."""
