@@ -2340,6 +2340,23 @@ class WholeBodyTrackingPolicy(BasePolicy):
 
         return self._cached_object_pos_w
 
+    def _get_object_pose_torso(self) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Best-effort access to object pose in torso_link frame."""
+        if not hasattr(self.interface, "get_object_pose_torso"):
+            return None, None
+
+        pose = self.interface.get_object_pose_torso()
+        if pose is None:
+            return None, None
+
+        pose = np.asarray(pose, dtype=np.float32).reshape(-1)
+        if pose.size < 7:
+            return None, None
+
+        pos_torso = pose[:3].reshape(1, 3)
+        quat_torso_wxyz = xyzw_to_wxyz(pose[3:7].reshape(1, 4))
+        return pos_torso, quat_torso_wxyz
+
     def _check_and_request_table_removal(self):
         """Monitor object height and request table removal when object rises 0.1m."""
         obj_pos_w = self._get_object_pos_w()
@@ -2388,14 +2405,24 @@ class WholeBodyTrackingPolicy(BasePolicy):
         _, _, yaw = quat_to_rpy(ref_quat_wxyz.reshape(-1))
         yaw_quat = rpy_to_quat((0.0, 0.0, yaw)).reshape(1, 4)
 
-        obj_pos_w = self._get_object_pos_w()
-        if obj_pos_w is not None:
-            delta = obj_pos_w - torso_pos_w.reshape(1, 3)
-            obj_pos_rel = quat_rotate_inverse(yaw_quat, delta).astype(np.float32)
+        obj_pos_torso, obj_quat_torso_wxyz = self._get_object_pose_torso()
+        if obj_pos_torso is not None:
+            # Convert torso-frame measurement into the policy heading frame.
+            delta_w = quat_apply(ref_quat_wxyz, obj_pos_torso)
+            obj_pos_rel = quat_rotate_inverse(yaw_quat, delta_w).astype(np.float32)
         else:
-            obj_pos_rel = np.zeros((1, 3), dtype=np.float32)
+            obj_pos_w = self._get_object_pos_w()
+            if obj_pos_w is not None:
+                delta = obj_pos_w - torso_pos_w.reshape(1, 3)
+                obj_pos_rel = quat_rotate_inverse(yaw_quat, delta).astype(np.float32)
+            else:
+                obj_pos_rel = np.zeros((1, 3), dtype=np.float32)
 
-        obj_quat_w = self._get_object_quat_w()
+        if obj_quat_torso_wxyz is not None:
+            obj_quat_w = quat_mul(ref_quat_wxyz, self._normalize_quat_wxyz(obj_quat_torso_wxyz))
+        else:
+            obj_quat_w = self._get_object_quat_w()
+
         if obj_quat_w is not None:
             q_w2h = quat_inverse(yaw_quat)
             q_obj_h = quat_mul(q_w2h, self._normalize_quat_wxyz(obj_quat_w))

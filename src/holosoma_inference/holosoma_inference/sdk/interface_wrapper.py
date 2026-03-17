@@ -28,13 +28,16 @@ SCENE_INFO_UDP_HOST = "127.0.0.1"
 # Can be overridden via environment variables.
 WORLD_TOPICS_UDP_BIND_IP = os.environ.get("HOLOSOMA_WORLD_TOPIC_UDP_BIND_IP", "0.0.0.0")
 WORLD_TOPICS_UDP_PORT = int(os.environ.get("HOLOSOMA_WORLD_TOPIC_UDP_PORT", "5005"))
-# If enabled, use /world/robot_pose quaternion for base orientation (instead of IMU quaternion).
+# If enabled, use external pelvis/root pose quaternion for base orientation (instead of IMU quaternion).
 # Angular velocity still comes from IMU.
 WORLD_TOPICS_USE_ROBOT_POSE_QUAT = os.environ.get("HOLOSOMA_WORLD_USE_ROBOT_POSE_QUAT", "0") == "1"
 
 # Coordinate/frame conventions:
-# - Incoming UDP world topics are in RDF axes (x=Right, y=Down, z=Forward) with quats in xyzw.
 # - Internal code expects FLU world axes (x=Forward, y=Left, z=Up).
+# - External UDP world topics can be sent either in FLU directly or in RDF
+#   (x=Right, y=Down, z=Forward) with quaternions in xyzw.
+# - Default is FLU for sim2real ROS bridges.
+WORLD_TOPICS_INPUT_FRAME = os.environ.get("HOLOSOMA_WORLD_TOPIC_FRAME", "FLU").upper()
 _Q_RDF_TO_FLU_WXYZ = np.array([[0.5, -0.5, 0.5, -0.5]], dtype=np.float32)  # wxyz
 _Q_RDF_TO_FLU_INV_WXYZ = quat_inverse(_Q_RDF_TO_FLU_WXYZ)
 
@@ -89,8 +92,9 @@ class InterfaceWrapper:
         self._scene_switched_hands_cache = None
         # World topics receiver (external pose/velocity via UDP JSON)
         self._world_topics_sock = None
-        self._world_robot_pose_cache = None  # [x,y,z,qx,qy,qz,qw] in FLU
-        self._world_object_pose_cache = None  # [x,y,z,qx,qy,qz,qw] in FLU
+        self._world_robot_pose_cache = None  # [x,y,z,qx,qy,qz,qw] in FLU, typically pelvis/root pose in world
+        self._world_object_pose_cache = None  # [x,y,z,qx,qy,qz,qw] in FLU, object pose in world
+        self._torso_object_pose_cache = None  # [x,y,z,qx,qy,qz,qw] in FLU, object pose in torso_link
         self._world_robot_twist_cache = None  # [vx,vy,vz,wx,wy,wz] in FLU
         self._world_robot_quat_warned = False
 
@@ -172,6 +176,7 @@ class InterfaceWrapper:
             self.logger.info(
                 f"World topics UDP receiver enabled on {WORLD_TOPICS_UDP_BIND_IP}:{WORLD_TOPICS_UDP_PORT}"
             )
+            self.logger.info(f"World topics input frame: {WORLD_TOPICS_INPUT_FRAME}")
         except OSError as exc:
             self.logger.warning(f"Failed to init world topics UDP receiver: {exc}")
             self._world_topics_sock = None
@@ -199,6 +204,40 @@ class InterfaceWrapper:
         q_flu_xyzw = q_flu_xyzw / norm
         return q_flu_xyzw.reshape(-1)
 
+    @staticmethod
+    def _normalize_quat_xyzw(quat_xyzw: np.ndarray) -> np.ndarray:
+        """Normalize xyzw quaternion without changing basis."""
+        q = np.asarray(quat_xyzw, dtype=np.float32).reshape(-1)
+        if q.size != 4:
+            raise ValueError(f"Expected quaternion xyzw, got shape {q.shape}")
+        norm = np.linalg.norm(q)
+        if norm == 0.0:
+            return np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        return (q / norm).astype(np.float32, copy=False)
+
+    def _topic_vec3_to_flu(self, vec: np.ndarray) -> np.ndarray:
+        """Convert incoming topic vector to internal FLU coordinates."""
+        if WORLD_TOPICS_INPUT_FRAME == "FLU":
+            v = np.asarray(vec, dtype=np.float32).reshape(-1)
+            if v.size != 3:
+                raise ValueError(f"Expected 3D vector, got shape {v.shape}")
+            return v.astype(np.float32, copy=False)
+        if WORLD_TOPICS_INPUT_FRAME == "RDF":
+            return self._rdf_to_flu_vec3(vec)
+        raise ValueError(
+            f"Unsupported HOLOSOMA_WORLD_TOPIC_FRAME='{WORLD_TOPICS_INPUT_FRAME}'. Expected 'FLU' or 'RDF'."
+        )
+
+    def _topic_quat_xyzw_to_flu(self, quat_xyzw: np.ndarray) -> np.ndarray:
+        """Convert incoming topic quaternion to internal FLU coordinates."""
+        if WORLD_TOPICS_INPUT_FRAME == "FLU":
+            return self._normalize_quat_xyzw(quat_xyzw)
+        if WORLD_TOPICS_INPUT_FRAME == "RDF":
+            return self._rdf_to_flu_quat_xyzw(quat_xyzw)
+        raise ValueError(
+            f"Unsupported HOLOSOMA_WORLD_TOPIC_FRAME='{WORLD_TOPICS_INPUT_FRAME}'. Expected 'FLU' or 'RDF'."
+        )
+
     def _poll_world_topics(self) -> None:
         """Drain pending world-topic packets and update caches (best-effort, non-blocking)."""
         if self._world_topics_sock is None:
@@ -223,36 +262,54 @@ class InterfaceWrapper:
                 if pos_raw is None:
                     continue
                 try:
-                    pos_flu = self._rdf_to_flu_vec3(np.asarray(pos_raw, dtype=np.float32))
+                    pos_flu = self._topic_vec3_to_flu(np.asarray(pos_raw, dtype=np.float32))
                 except ValueError:
                     continue
 
-                if "robot_pose" in topic:
-                    # Default: root orientation comes from IMU; only use UDP quat if explicitly enabled.
+                quat_raw = packet.get("quat_xyzw", packet.get("quat", None))
+
+                def _pose_with_quat(identity_ok: bool) -> np.ndarray | None:
                     quat_flu_xyzw = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
-                    if WORLD_TOPICS_USE_ROBOT_POSE_QUAT:
-                        quat_raw = packet.get("quat_xyzw", packet.get("quat", None))
-                        if quat_raw is None:
-                            if not self._world_robot_quat_warned:
-                                self.logger.warning("Robot pose quaternion missing in UDP packet; using identity.")
-                                self._world_robot_quat_warned = True
-                        else:
-                            try:
-                                quat_flu_xyzw = self._rdf_to_flu_quat_xyzw(np.asarray(quat_raw, dtype=np.float32))
-                            except ValueError:
-                                continue
-                    pose = np.concatenate([pos_flu, quat_flu_xyzw], axis=0).astype(np.float32, copy=False)
-                    self._world_robot_pose_cache = pose
-                elif "object_pose" in topic:
-                    quat_raw = packet.get("quat_xyzw", packet.get("quat", None))
                     if quat_raw is None:
-                        continue
-                    try:
-                        quat_flu_xyzw = self._rdf_to_flu_quat_xyzw(np.asarray(quat_raw, dtype=np.float32))
-                    except ValueError:
-                        continue
-                    pose = np.concatenate([pos_flu, quat_flu_xyzw], axis=0).astype(np.float32, copy=False)
-                    self._world_object_pose_cache = pose
+                        if not identity_ok:
+                            return None
+                    else:
+                        try:
+                            quat_flu_xyzw = self._topic_quat_xyzw_to_flu(np.asarray(quat_raw, dtype=np.float32))
+                        except ValueError:
+                            return None
+                    return np.concatenate([pos_flu, quat_flu_xyzw], axis=0).astype(np.float32, copy=False)
+
+                if topic.endswith("/object_pose_torso") or topic == "object_pose_torso":
+                    pose = _pose_with_quat(identity_ok=False)
+                    if pose is not None:
+                        self._torso_object_pose_cache = pose
+                elif topic.endswith("/object_pose_world") or topic == "object_pose_world":
+                    pose = _pose_with_quat(identity_ok=False)
+                    if pose is not None:
+                        self._world_object_pose_cache = pose
+                elif topic.endswith("/pelvis_pose_world") or topic == "pelvis_pose_world":
+                    pose = _pose_with_quat(identity_ok=True)
+                    if pose is None:
+                        if not self._world_robot_quat_warned:
+                            self.logger.warning("Pelvis pose quaternion missing in UDP packet; using identity.")
+                            self._world_robot_quat_warned = True
+                    else:
+                        self._world_robot_pose_cache = pose
+                elif "robot_pose" in topic:
+                    # Legacy fallback topic name.
+                    pose = _pose_with_quat(identity_ok=True)
+                    if pose is None:
+                        if not self._world_robot_quat_warned:
+                            self.logger.warning("Robot pose quaternion missing in UDP packet; using identity.")
+                            self._world_robot_quat_warned = True
+                    else:
+                        self._world_robot_pose_cache = pose
+                elif "object_pose" in topic:
+                    # Legacy fallback topic name. Specific world/torso topics are matched first above.
+                    pose = _pose_with_quat(identity_ok=False)
+                    if pose is not None:
+                        self._world_object_pose_cache = pose
 
             elif msg_type == "TwistStamped":
                 # Only use base linear velocity from UDP; angular velocity comes from robot IMU.
@@ -367,7 +424,7 @@ class InterfaceWrapper:
         raise RuntimeError("InterfaceWrapper not initialized correctly.")
 
     def get_object_state(self):
-        """Get latest object state [x,y,z,qx,qy,qz,qw,vx,vy,vz,wx,wy,wz] if available."""
+        """Get latest world-frame object state [x,y,z,qx,qy,qz,qw,vx,vy,vz,wx,wy,wz] if available."""
         if self._world_topics_sock is not None:
             self._poll_world_topics()
             if self._world_object_pose_cache is None:
@@ -395,7 +452,7 @@ class InterfaceWrapper:
         return self._object_state_cache
 
     def get_robot_state(self):
-        """Get latest robot state [x,y,z,qx,qy,qz,qw,vx,vy,vz,wx,wy,wz] if available."""
+        """Get latest world-frame robot root/pelvis state [x,y,z,qx,qy,qz,qw,vx,vy,vz,wx,wy,wz] if available."""
         if self._world_topics_sock is not None:
             self._poll_world_topics()
             if self._world_robot_pose_cache is None:
@@ -422,6 +479,15 @@ class InterfaceWrapper:
         if state is None or state.size < 3:
             return None
         return state[:3].reshape(1, 3)
+
+    def get_object_pose_torso(self):
+        """Get latest object pose in torso_link frame as [x,y,z,qx,qy,qz,qw] if available."""
+        if self._world_topics_sock is None:
+            return None
+        self._poll_world_topics()
+        if self._torso_object_pose_cache is None:
+            return None
+        return self._torso_object_pose_cache.copy()
 
     def get_scene_object_name(self):
         """Get latest scene object name if available."""
