@@ -1,12 +1,12 @@
 import numpy as np
 
-MODES = ["lift", "right", "left", "back"]
+MODES = ["lift", "right", "left", "back", "stay"]
 
 class TrajectoryGenerator:
     def __init__(
         self,
         rl_rate: float,
-        hold_time_s: float = 2.5,
+        hold_time_s: float = 10.0,
         lift_height_m: float = 0.5,
         lift_speed_mps: float = 0.8,
         mode: str = "lift"
@@ -16,6 +16,7 @@ class TrajectoryGenerator:
         self.lift_height_m = float(lift_height_m)
         self.lift_speed_mps = float(lift_speed_mps)
         self.mode = mode
+
     def build_gen_traj(
         self,
         start_pos: np.ndarray,
@@ -27,6 +28,11 @@ class TrajectoryGenerator:
         # segment lengths (in frames)
         n_hold = int(round(self.hold_time_s * self.rl_rate))
         n_hold = max(n_hold, 1)
+
+        if self.mode == "stay":
+            pos = np.repeat(start_pos.reshape(1, 3), n_hold, axis=0)
+            quat = np.repeat(start_quat_wxyz.reshape(1, 4), n_hold, axis=0)
+            return pos, quat
 
         lift_time_s = self.lift_height_m / self.lift_speed_mps
         n_lift = int(round(lift_time_s * self.rl_rate))

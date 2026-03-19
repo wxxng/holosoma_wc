@@ -150,6 +150,10 @@ class BasePolicy:
 
             self.obs_buf_dict[group] = np.concatenate(flattened_terms, axis=1) if flattened_terms else np.zeros((1, 0))
 
+    def _policy_step_hook(self, robot_state_data):
+        """Optional per-cycle hook for derived policies."""
+        return None
+
     def _init_communication_components(self):
         """Initialize appropriate robot interface."""
 
@@ -922,6 +926,8 @@ class BasePolicy:
                 robot_state_data = self.interface.get_full_state_43dof()
             else:
                 robot_state_data = self.interface.get_low_state()
+
+        self._policy_step_hook(robot_state_data)
 
         # Safety Check: Monitor for unsafe conditions after policy starts
         if self.safety_enabled and self.use_policy_action:

@@ -1,4 +1,3 @@
-import atexit
 import csv
 import json
 import pickle
@@ -457,6 +456,16 @@ class WholeBodyTrackingPolicy(BasePolicy):
         self._bps_cache: dict[str, np.ndarray] = {}
         self._obj_bps: np.ndarray | None = None  # current object BPS code (512,)
 
+        # Optional recorded object trajectory in world frame for BPS motion commands.
+        self.record_traj = bool(getattr(config.task, "record_traj", False))
+        self._record_traj_active = False
+        self._recorded_obj_pos_w = None  # [num_frames, 3]
+        self._recorded_obj_rot_wxyz = None  # [num_frames, 4]
+        self._recorded_traj_time_buffer: list[float] = []
+        self._recorded_traj_pos_buffer: list[np.ndarray] = []
+        self._recorded_traj_rot_buffer: list[np.ndarray] = []
+        self._recorded_traj_path: Path | None = None
+
         super().__init__(config)
 
         # Load stiff startup parameters from robot config
@@ -493,10 +502,10 @@ class WholeBodyTrackingPolicy(BasePolicy):
         self._traj_gen = None
         self._gen_traj_initialized = False
         if self.use_gen_traj:
-            self._traj_gen = TrajectoryGenerator(rl_rate=config.task.rl_rate)
-        
-        # self.current_object_pos_w = np.array([[0.8, 0.0, 0.9]], dtype=np.float32)
-        # self.current_object_quat_w = np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32)  # wxyz
+            self._traj_gen = TrajectoryGenerator(
+                rl_rate=config.task.rl_rate,
+                mode="stay",
+            )
         
         # Prompt user before entering stiff mode (only if stdin is available)
         def _show_warning():
@@ -520,17 +529,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
         else:
             _show_warning()
         
-        # Initialize NPZ logging for lo/eth0 interface
-        self.npz_log_data = None  # Dictionary to store logged data
-        self.npz_log_path = None  # Path to save NPZ file
-        self.npz_save_interval = 10  # Save every N timesteps
         self.max_motion_length = None  # Safety limit for motion clip length
-        self.current_observation = None  # Store current observation for logging
-        self.current_torques = None  # Store current torques for logging
-        
-        # Inference logging (proprio_body, proprio_hand, policy_action)
-        self.inference_log_data = None
-        self.inference_log_path = None
         
         # Debug mode flag
         self.debug_mode = getattr(config.task, 'debug', False)
@@ -545,9 +544,6 @@ class WholeBodyTrackingPolicy(BasePolicy):
         logger.info(colored(f"DEBUG: config.task.interface = '{config.task.interface}'", "cyan", attrs=["bold"]))
         
         if config.task.interface in ["lo", "eth0", "enp123s0"]:
-            self._init_inference_logging()  # Initialize inference logging
-            # Safety: Limit motion length to first 3 seconds (adjust based on motion fps)
-            # Set to None to disable limit after verifying safety
             self.max_motion_length = None  # ~3 seconds at 50 fps
             logger.info(colored(f"Safety mode: Motion limited to {self.max_motion_length} frames", "yellow", attrs=["bold"]))
         else:
@@ -557,14 +553,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
         if self.debug_mode:
             self._init_debug_logging()
 
-        # Sim2real inference logging (obs + action, saved to logs/sim2real/wbt)
-        self._sim2real_log_data: dict | None = None
-        self._sim2real_log_path: Path | None = None
-        self._sim2real_shutdown_complete = False
-        self._init_sim2real_log()
-        atexit.register(self._save_sim2real_log)
-
-        # Motion pkl logging (obs + poses, starts on 's' key)
+        # Motion logging (per-term observations + poses, starts on 's' key)
         self._motion_log_data: list[dict] | None = None
         self._motion_log_path: Path | None = None
 
@@ -613,6 +602,33 @@ class WholeBodyTrackingPolicy(BasePolicy):
                     "cyan",
                 )
             )
+
+        # Debug: stream sampled motion object trajectory poses for RViz via UDP
+        self._debug_rviz_obj_traj_viz_enabled = bool(getattr(config.task, "debug_rviz_obj_traj_viz", False))
+        self._debug_rviz_obj_traj_viz_host = str(
+            getattr(config.task, "debug_rviz_obj_traj_viz_host", "127.0.0.1")
+        ).strip()
+        self._debug_rviz_obj_traj_viz_port = int(getattr(config.task, "debug_rviz_obj_traj_viz_port", 10007))
+        self._debug_rviz_obj_traj_viz_dt = max(
+            float(getattr(config.task, "debug_rviz_obj_traj_viz_dt", 0.2)),
+            1e-3,
+        )
+        self._debug_rviz_obj_traj_viz_sock = None
+        self._debug_rviz_obj_traj_viz_addr = None
+        if self._debug_rviz_obj_traj_viz_enabled:
+            self._debug_rviz_obj_traj_viz_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._debug_rviz_obj_traj_viz_addr = (
+                self._debug_rviz_obj_traj_viz_host,
+                self._debug_rviz_obj_traj_viz_port,
+            )
+            logger.info(
+                colored(
+                    "RViz sampled object trajectory UDP sender enabled on "
+                    f"{self._debug_rviz_obj_traj_viz_addr} "
+                    f"(dt={self._debug_rviz_obj_traj_viz_dt:.3f}s)",
+                    "cyan",
+                )
+            )
         
     def _initialize_history_state(self):
         """Override to use listed (not sorted) obs term order to match training."""
@@ -631,20 +647,13 @@ class WholeBodyTrackingPolicy(BasePolicy):
             self.obs_buf_dict[group] = np.concatenate(flattened_terms, axis=1) if flattened_terms else np.zeros((1, 0))
 
     def __del__(self):
-        """Save NPZ files on cleanup."""
-        if hasattr(self, 'npz_log_data') and self.npz_log_data is not None and len(self.npz_log_data.get("global_timestep", [])) > 0:
-            self._save_npz_log()
-        # Save inference log
-        if hasattr(self, 'inference_log_data') and self.inference_log_data is not None and len(self.inference_log_data.get("proprio_body", [])) > 0:
-            self._save_inference_log()
+        """Save log files on cleanup."""
         # Save debug log
         if hasattr(self, 'debug_log_data') and self.debug_log_data is not None and len(self.debug_log_data.get("dof_pos", [])) > 0:
             self._save_debug_log()
         # Save motion pkl log
         if hasattr(self, '_motion_log_data') and self._motion_log_data:
             self._save_motion_log()
-        # Save sim2real log
-        self._save_sim2real_log()
     
     def _init_debug_logging(self):
         """Initialize debug logging for dof_pos and scaled_policy_action."""
@@ -665,6 +674,12 @@ class WholeBodyTrackingPolicy(BasePolicy):
         }
         
         logger.info(colored(f"✓ Debug logging initialized: {self.debug_log_path.resolve()}", "magenta", attrs=["bold"]))
+
+    def _get_interface_log_tag(self) -> str:
+        interface = str(getattr(self.config.task, "interface", "unknown")).strip()
+        if not interface:
+            interface = "unknown"
+        return "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in interface)
 
     def _save_debug_log(self):
         """Save debug log data to NPZ file."""
@@ -689,91 +704,8 @@ class WholeBodyTrackingPolicy(BasePolicy):
         except Exception as e:
             logger.error(colored(f"Failed to save debug log: {e}", "red"))
 
-    def _init_inference_logging(self):
-        """Initialize inference logging for proprio_body, proprio_hand, and policy_action."""
-        # Create logs directory if it doesn't exist
-        log_dir = Path("logs/action_logs")
-        log_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Create NPZ file path with timestamp
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.inference_log_path = log_dir / f"inference_log_{timestamp}.npz"
-        
-        # Initialize data storage
-        self.inference_log_data = {
-            "proprio_body": [],  # obs[0, 6500:6835]
-            "proprio_hand": [],  # obs[0, 6835:]
-            "policy_action": [],  # self.scaled_policy_action
-            "motion_timestep": [],  # motion timestep for reference
-        }
-        
-        logger.info(colored(f"✓ Inference logging initialized: {self.inference_log_path.resolve()}", "cyan", attrs=["bold"]))
-
-    def _log_inference_data(self, input_feed: dict):
-        """Log proprio_body, proprio_hand, and policy_action during motion clip progression."""
-        if self.inference_log_data is None:
-            return
-        
-        try:
-            obs = input_feed.get("obs")
-            if obs is None:
-                return
-            
-            # Extract proprio_body and proprio_hand from observation
-            proprio_body = obs[0, 6500:6835].copy()  # [335]
-            proprio_hand = obs[0, 6835:].copy()  # remaining dims
-            
-            # Store data
-            self.inference_log_data["proprio_body"].append(proprio_body)
-            self.inference_log_data["proprio_hand"].append(proprio_hand)
-            self.inference_log_data["policy_action"].append(self.scaled_policy_action.copy().flatten())
-            self.inference_log_data["motion_timestep"].append(self.motion_timestep)
-            
-        except Exception as e:
-            logger.warning(colored(f"Failed to log inference data: {e}", "yellow"))
-
-    def _save_inference_log(self):
-        """Save inference log data to NPZ file."""
-        if self.inference_log_path is None or self.inference_log_data is None:
-            return
-        if len(self.inference_log_data.get("proprio_body", [])) == 0:
-            return
-        
-        try:
-            # Convert lists to numpy arrays
-            save_dict = {
-                key: np.array(value) for key, value in self.inference_log_data.items()
-            }
-            
-            # Save to NPZ file
-            np.savez_compressed(self.inference_log_path, **save_dict)
-            logger.info(colored(
-                f"✓ Inference log saved: {self.inference_log_path.resolve()} "
-                f"({len(self.inference_log_data['proprio_body'])} timesteps)",
-                "cyan", attrs=["bold"]
-            ))
-        except Exception as e:
-            logger.error(colored(f"Failed to save inference log: {e}", "red"))
-    
-    def _save_npz_log(self):
-        """Save collected data to NPZ file."""
-        if self.npz_log_path is None or self.npz_log_data is None:
-            return
-        
-        try:
-            # Convert lists to numpy arrays
-            save_dict = {
-                key: np.array(value) for key, value in self.npz_log_data.items()
-            }
-            
-            # Save to NPZ file
-            np.savez_compressed(self.npz_log_path, **save_dict)
-            logger.info(colored(f"✓ NPZ file saved: {self.npz_log_path.resolve()} ({len(self.npz_log_data['global_timestep'])} timesteps)", "green", attrs=["bold"]))
-        except Exception as e:
-            logger.error(colored(f"Failed to save NPZ file: {e}", "red"))
-
     # -------------------------------------------------------------------------
-    # Motion pkl logging (obs + poses, collected after 's' key)
+    # Motion logging (observation terms + poses, collected after 's' key)
     # -------------------------------------------------------------------------
 
     def _on_sigint(self, signum, frame):
@@ -781,17 +713,17 @@ class WholeBodyTrackingPolicy(BasePolicy):
         logger.info(colored("Ctrl+C detected — saving logs...", "yellow", attrs=["bold"]))
         if self._motion_log_data:
             self._save_motion_log()
-        self._save_sim2real_log()
         # Restore previous handler and re-raise so the process exits normally
         signal.signal(signal.SIGINT, self._prev_sigint_handler)
         signal.raise_signal(signal.SIGINT)
 
     def _init_motion_log(self):
         """Initialize per-motion-clip pkl log buffer."""
-        log_dir = Path("logs/motion_logs")
+        log_dir = Path("logs/sim2real/wbt")
         log_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self._motion_log_path = log_dir / f"motion_log_{timestamp}.pkl"
+        interface_tag = self._get_interface_log_tag()
+        self._motion_log_path = log_dir / f"wbt_log_{interface_tag}_{timestamp}.pkl"
         self._motion_log_data = []
         logger.info(colored(f"✓ Motion log initialized: {self._motion_log_path.resolve()}", "green", attrs=["bold"]))
 
@@ -810,73 +742,257 @@ class WholeBodyTrackingPolicy(BasePolicy):
         except Exception as e:
             logger.error(colored(f"Failed to save motion log: {e}", "red"))
 
-    # -------------------------------------------------------------------------
-    # Sim2real inference logging (obs + action → logs/sim2real/wbt)
-    # -------------------------------------------------------------------------
+    @staticmethod
+    def _pose_to_log_array(
+        pos: np.ndarray | None,
+        quat_wxyz: np.ndarray | None,
+    ) -> np.ndarray | None:
+        if pos is None or quat_wxyz is None:
+            return None
+        pos_arr = np.asarray(pos, dtype=np.float32).reshape(-1)
+        quat_arr = np.asarray(quat_wxyz, dtype=np.float32).reshape(-1)
+        if pos_arr.size != 3 or quat_arr.size != 4:
+            return None
+        return np.concatenate([pos_arr, quat_arr], axis=0).astype(np.float32, copy=False)
 
-    def _init_sim2real_log(self) -> None:
-        log_dir = Path("/home/rllab3/Desktop/codebase/unitreeG1/holosoma_wc/logs/sim2real/wbt")
+    def _init_recorded_traj_path(self) -> Path:
+        log_dir = Path("logs/recorded_object_traj")
         log_dir.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        self._sim2real_log_path = log_dir / f"wbt_{timestamp}.pkl"
-        self._sim2real_log_data = {
-            "created_at": datetime.now().isoformat(),
-            "observation": [],
-            "scaled_policy_action": [],
-        }
-        logger.info(colored(f"Sim2real log initialized: {self._sim2real_log_path}", "cyan"))
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return log_dir / f"recorded_object_traj_{timestamp}.pkl"
 
-    def _append_sim2real_log_step(self, obs: np.ndarray) -> None:
-        if self._sim2real_log_data is None:
-            return
-        self._sim2real_log_data["observation"].append(obs.astype(np.float32).copy())
-        self._sim2real_log_data["scaled_policy_action"].append(
-            self.scaled_policy_action[0].astype(np.float32).copy()
+    def _start_record_traj(self) -> None:
+        self._recorded_traj_time_buffer = []
+        self._recorded_traj_pos_buffer = []
+        self._recorded_traj_rot_buffer = []
+        self._recorded_traj_path = self._init_recorded_traj_path()
+        self._record_traj_active = True
+        logger.info(
+            colored(
+                "⏺️  Started recording object trajectory in world frame. Press the same button again to stop.",
+                "yellow",
+                attrs=["bold"],
+            )
         )
 
-    def _save_sim2real_log(self) -> None:
-        if self._sim2real_shutdown_complete:
+    def _stop_record_traj(self) -> None:
+        self._record_traj_active = False
+        if (
+            not self._recorded_traj_time_buffer
+            or not self._recorded_traj_pos_buffer
+            or not self._recorded_traj_rot_buffer
+        ):
+            logger.warning("Recorded trajectory is empty; keeping the existing motion object trajectory.")
             return
-        self._sim2real_shutdown_complete = True
-        if self._sim2real_log_data is None or self._sim2real_log_path is None:
-            return
-        num_samples = len(self._sim2real_log_data["observation"])
-        if num_samples == 0:
-            logger.info(colored("Sim2real log empty, skipping save.", "yellow"))
-            return
-        payload = {
-            "created_at": self._sim2real_log_data["created_at"],
-            "saved_at": datetime.now().isoformat(),
-            "observation": np.stack(self._sim2real_log_data["observation"], axis=0),
-            "scaled_policy_action": np.stack(self._sim2real_log_data["scaled_policy_action"], axis=0),
-        }
-        try:
-            with self._sim2real_log_path.open("wb") as f:
-                pickle.dump(payload, f)
-            logger.info(colored(
-                f"Sim2real log saved: {self._sim2real_log_path} ({num_samples} steps)",
-                "cyan", attrs=["bold"],
-            ))
-        except Exception as e:
-            logger.error(colored(f"Failed to save sim2real log: {e}", "red"))
 
-    def _collect_motion_log_step(self, robot_state_data, group_outputs: dict):
-        """Append one timestep of obs + poses to the motion log."""
+        raw_time = np.asarray(self._recorded_traj_time_buffer, dtype=np.float64)
+        raw_time = raw_time - raw_time[0]
+        raw_pos = np.stack(self._recorded_traj_pos_buffer, axis=0).astype(np.float32, copy=False)
+        raw_quat = self._normalize_quat_wxyz(
+            np.stack(self._recorded_traj_rot_buffer, axis=0).astype(np.float32, copy=False)
+        )
+
+        resampled_time, pos, quat = self._resample_recorded_traj(
+            raw_time,
+            raw_pos,
+            raw_quat,
+            float(self.config.task.rl_rate),
+        )
+        source_fps = self._estimate_sample_rate(raw_time)
+        self._recorded_obj_pos_w = pos
+        self._recorded_obj_rot_wxyz = quat
+
+        payload = {
+            "created_at": datetime.now().isoformat(),
+            "fps": float(self.config.task.rl_rate),
+            "source_fps_estimate": None if source_fps is None else float(source_fps),
+            "source_time_from_start_sec": raw_time.astype(np.float32, copy=False),
+            "source_obj_pos_w": raw_pos,
+            "source_obj_rot_wxyz": raw_quat,
+            "resampled_time_from_start_sec": resampled_time,
+            "obj_pos_w": pos,
+            "obj_rot_wxyz": quat,
+            "motion_clip_key": self.motion_clip_key,
+            "motion_obj_name": self.motion_obj_name,
+        }
+        if self._recorded_traj_path is not None:
+            try:
+                with self._recorded_traj_path.open("wb") as f:
+                    pickle.dump(payload, f)
+                logger.info(
+                    colored(
+                        f"✓ Recorded object trajectory saved: {self._recorded_traj_path.resolve()} "
+                        f"({raw_pos.shape[0]} raw frames -> {pos.shape[0]} frames @ {self.config.task.rl_rate:.1f}Hz)",
+                        "green",
+                        attrs=["bold"],
+                    )
+                )
+            except Exception as exc:
+                logger.error(colored(f"Failed to save recorded object trajectory: {exc}", "red"))
+
+        logger.info(
+            colored(
+                "Using recorded world-frame object trajectory for BPS motion commands "
+                f"({raw_pos.shape[0]} raw frames -> {pos.shape[0]} resampled frames).",
+                "cyan",
+                attrs=["bold"],
+            )
+        )
+
+    def _toggle_record_traj(self) -> None:
+        if not self.record_traj:
+            return
+        if self._record_traj_active:
+            self._stop_record_traj()
+        else:
+            self._start_record_traj()
+
+    def _record_traj_step(self) -> None:
+        if not self._record_traj_active:
+            return
+        if not hasattr(self.interface, "get_object_pose_world_with_timestamp"):
+            pos_w = self._get_object_pos_w()
+            quat_wxyz = self._get_object_quat_w()
+            pose_timestamp = None
+        else:
+            pose, pose_timestamp = self.interface.get_object_pose_world_with_timestamp()
+            if pose is None or pose_timestamp is None:
+                return
+            pose = np.asarray(pose, dtype=np.float32).reshape(-1)
+            if pose.size < 7:
+                return
+            pos_w = pose[:3].reshape(1, 3)
+            quat_wxyz = xyzw_to_wxyz(pose[3:7].reshape(1, 4))
+
+        if pos_w is None or quat_wxyz is None:
+            return
+        if pose_timestamp is None:
+            pose_timestamp = len(self._recorded_traj_time_buffer) / max(float(self.config.task.rl_rate), 1e-6)
+        if self._recorded_traj_time_buffer and pose_timestamp <= self._recorded_traj_time_buffer[-1]:
+            return
+        self._recorded_traj_time_buffer.append(float(pose_timestamp))
+        self._recorded_traj_pos_buffer.append(pos_w[0].astype(np.float32, copy=True))
+        self._recorded_traj_rot_buffer.append(self._normalize_quat_wxyz(quat_wxyz)[0].astype(np.float32, copy=True))
+
+    @staticmethod
+    def _estimate_sample_rate(sample_times: np.ndarray) -> float | None:
+        if sample_times.size < 2:
+            return None
+        dt = np.diff(sample_times)
+        dt = dt[dt > 1e-6]
+        if dt.size == 0:
+            return None
+        return float(1.0 / np.median(dt))
+
+    def _quat_slerp_wxyz(self, q0: np.ndarray, q1: np.ndarray, alpha: float) -> np.ndarray:
+        q0_n = self._normalize_quat_wxyz(np.asarray(q0, dtype=np.float32).reshape(1, 4))[0]
+        q1_n = self._normalize_quat_wxyz(np.asarray(q1, dtype=np.float32).reshape(1, 4))[0]
+        dot = float(np.dot(q0_n, q1_n))
+        if dot < 0.0:
+            q1_n = -q1_n
+            dot = -dot
+        dot = float(np.clip(dot, -1.0, 1.0))
+
+        if dot > 0.9995:
+            q = q0_n + float(alpha) * (q1_n - q0_n)
+            return self._normalize_quat_wxyz(q.reshape(1, 4))[0]
+
+        theta_0 = float(np.arccos(dot))
+        sin_theta_0 = float(np.sin(theta_0))
+        if sin_theta_0 < 1e-6:
+            return q0_n
+
+        theta = theta_0 * float(alpha)
+        s0 = np.sin(theta_0 - theta) / sin_theta_0
+        s1 = np.sin(theta) / sin_theta_0
+        q = s0 * q0_n + s1 * q1_n
+        return self._normalize_quat_wxyz(q.reshape(1, 4))[0]
+
+    def _resample_recorded_traj(
+        self,
+        sample_times: np.ndarray,
+        pos_seq: np.ndarray,
+        rot_wxyz_seq: np.ndarray,
+        target_fps: float,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        sample_times = np.asarray(sample_times, dtype=np.float64).reshape(-1)
+        pos_seq = np.asarray(pos_seq, dtype=np.float32)
+        rot_wxyz_seq = self._normalize_quat_wxyz(np.asarray(rot_wxyz_seq, dtype=np.float32))
+
+        if sample_times.size == 0 or pos_seq.shape[0] == 0 or rot_wxyz_seq.shape[0] == 0:
+            return (
+                np.zeros((0,), dtype=np.float32),
+                np.zeros((0, 3), dtype=np.float32),
+                np.zeros((0, 4), dtype=np.float32),
+            )
+
+        if sample_times.size == 1 or target_fps <= 0.0:
+            return (
+                np.array([0.0], dtype=np.float32),
+                pos_seq[:1].astype(np.float32, copy=False),
+                rot_wxyz_seq[:1].astype(np.float32, copy=False),
+            )
+
+        target_dt = 1.0 / target_fps
+        duration = float(sample_times[-1])
+        target_times = np.arange(0.0, duration + 0.5 * target_dt, target_dt, dtype=np.float64)
+        if target_times.size == 0:
+            target_times = np.array([0.0], dtype=np.float64)
+
+        pos_resampled = np.stack(
+            [np.interp(target_times, sample_times, pos_seq[:, axis]) for axis in range(3)],
+            axis=1,
+        ).astype(np.float32, copy=False)
+
+        quat_resampled = np.zeros((target_times.shape[0], 4), dtype=np.float32)
+        for idx, t in enumerate(target_times):
+            right = int(np.searchsorted(sample_times, t, side="right"))
+            if right <= 0:
+                quat_resampled[idx] = rot_wxyz_seq[0]
+            elif right >= sample_times.shape[0]:
+                quat_resampled[idx] = rot_wxyz_seq[-1]
+            else:
+                left = right - 1
+                t0 = sample_times[left]
+                t1 = sample_times[right]
+                alpha = 0.0 if t1 <= t0 else float((t - t0) / (t1 - t0))
+                quat_resampled[idx] = self._quat_slerp_wxyz(
+                    rot_wxyz_seq[left], rot_wxyz_seq[right], alpha
+                )
+
+        return target_times.astype(np.float32, copy=False), pos_resampled, quat_resampled
+
+    def _policy_step_hook(self, robot_state_data):
+        super()._policy_step_hook(robot_state_data)
+        self._record_traj_step()
+
+    def _collect_motion_log_step(
+        self,
+        robot_state_data: np.ndarray,
+        current_obs_dict: dict[str, dict[str, np.ndarray]],
+    ) -> None:
+        """Append one timestep of per-term observations and key poses to the motion log."""
         if self._motion_log_data is None:
             return
-        obj_pos = self._get_object_pos_w()
-        obj_quat = self._get_object_quat_w()
+
+        obj_pos_torso, obj_quat_torso_wxyz = self._get_object_pose_torso()
+        obj_pos_world = self._get_object_pos_w()
+        obj_quat_world_wxyz = self._get_object_quat_w()
+        pelvis_pose_world = np.asarray(robot_state_data[0, :7], dtype=np.float32).copy()
+
         entry = {
             "motion_timestep": int(self.motion_timestep),
             "global_timestep": int(self.global_timestep),
-            # per-group observations (flattened, with history)
-            "obs_groups": {k: v.copy() for k, v in group_outputs.items()},
-            # robot root pose
-            "robot_pos_w": robot_state_data[0, :3].copy().astype(np.float32),
-            "robot_quat_wxyz": robot_state_data[0, 3:7].copy().astype(np.float32),
-            # object pose
-            "obj_pos_w": obj_pos[0].copy() if obj_pos is not None else None,
-            "obj_quat_wxyz": obj_quat[0].copy() if obj_quat is not None else None,
+            "observation_terms": {
+                group: {
+                    term: np.asarray(value, dtype=np.float32).reshape(-1).copy()
+                    for term, value in term_dict.items()
+                }
+                for group, term_dict in current_obs_dict.items()
+            },
+            "object_pose_torso": self._pose_to_log_array(obj_pos_torso, obj_quat_torso_wxyz),
+            "object_pose_world": self._pose_to_log_array(obj_pos_world, obj_quat_world_wxyz),
+            "pelvis_pose_world": pelvis_pose_world,
         }
         self._motion_log_data.append(entry)
 
@@ -2450,7 +2566,14 @@ class WholeBodyTrackingPolicy(BasePolicy):
             pos_long   : (1, 15)   5×3 positions
             ori_long   : (1, 30)   5×6 6D orientations
         """
-        if self.motion_obj_pos is None or self.motion_obj_rot is None:
+        use_recorded_world_traj = (
+            self._recorded_obj_pos_w is not None
+            and self._recorded_obj_rot_wxyz is not None
+            and self._recorded_obj_pos_w.shape[0] > 0
+            and self._recorded_obj_rot_wxyz.shape[0] > 0
+        )
+
+        if not use_recorded_world_traj and (self.motion_obj_pos is None or self.motion_obj_rot is None):
             return (
                 np.zeros((1, 30), dtype=np.float32),
                 np.zeros((1, 60), dtype=np.float32),
@@ -2465,32 +2588,58 @@ class WholeBodyTrackingPolicy(BasePolicy):
         else:
             torso_pos_w, _ = self._get_ref_body_pose_in_world(robot_state_data)
 
-        torso_pos = torso_pos_w.reshape(1, 3)
+        if use_recorded_world_traj:
+            traj_len = min(self._recorded_obj_pos_w.shape[0], self._recorded_obj_rot_wxyz.shape[0])
+            short_idx = np.clip(timestep + np.arange(1, 11), 0, traj_len - 1)
+            long_idx = np.clip(timestep + np.array([20, 40, 60, 80, 100]), 0, traj_len - 1)
 
-        short_idx = np.clip(timestep + np.arange(1, 11), 0, self.motion_length - 1)
-        long_idx  = np.clip(timestep + np.array([20, 40, 60, 80, 100]), 0, self.motion_length - 1)
+            torso_pos = torso_pos_w.reshape(1, 3)
 
-        # Positions: (N, 3) world → heading frame relative to torso
-        def _pos_to_heading(pos_w_batch: np.ndarray) -> np.ndarray:
-            delta = pos_w_batch - torso_pos  # (N, 3)
-            q = np.repeat(yaw_quat, delta.shape[0], axis=0)
-            return quat_rotate_inverse(q, delta).astype(np.float32)
+            def _pos_to_heading(pos_w_batch: np.ndarray) -> np.ndarray:
+                delta = pos_w_batch - torso_pos
+                q_yaw = np.repeat(yaw_quat, delta.shape[0], axis=0)
+                return quat_rotate_inverse(q_yaw, delta).astype(np.float32)
 
-        pos_short = _pos_to_heading(self.motion_obj_pos[short_idx]).reshape(1, -1)
-        pos_long  = _pos_to_heading(self.motion_obj_pos[long_idx]).reshape(1, -1)
+            pos_short = _pos_to_heading(self._recorded_obj_pos_w[short_idx]).reshape(1, -1)
+            pos_long = _pos_to_heading(self._recorded_obj_pos_w[long_idx]).reshape(1, -1)
 
-        # Orientations: (N, 4) world wxyz → heading frame → 6D
-        q_w2h = quat_inverse(yaw_quat)
+            q_w2h = quat_inverse(yaw_quat)
 
-        def _ori_to_6d(rot_wxyz_batch: np.ndarray) -> np.ndarray:
-            n = rot_wxyz_batch.shape[0]
-            q_rep = np.repeat(q_w2h, n, axis=0)
-            q_h = self._normalize_quat_wxyz(quat_mul(q_rep, self._normalize_quat_wxyz(rot_wxyz_batch)))
-            R = matrix_from_quat(q_h)  # (N, 3, 3)
-            return R[..., :2].reshape(1, -1).astype(np.float32)  # (1, N*6)
+            def _ori_to_6d(rot_wxyz_batch: np.ndarray) -> np.ndarray:
+                n = rot_wxyz_batch.shape[0]
+                q_rep = np.repeat(q_w2h, n, axis=0)
+                q_h = self._normalize_quat_wxyz(quat_mul(q_rep, self._normalize_quat_wxyz(rot_wxyz_batch)))
+                R = matrix_from_quat(q_h)
+                return R[..., :2].reshape(1, -1).astype(np.float32)
 
-        ori_short = _ori_to_6d(self.motion_obj_rot[short_idx])
-        ori_long  = _ori_to_6d(self.motion_obj_rot[long_idx])
+            ori_short = _ori_to_6d(self._recorded_obj_rot_wxyz[short_idx])
+            ori_long = _ori_to_6d(self._recorded_obj_rot_wxyz[long_idx])
+        else:
+            torso_pos = torso_pos_w.reshape(1, 3)
+            short_idx = np.clip(timestep + np.arange(1, 11), 0, self.motion_length - 1)
+            long_idx  = np.clip(timestep + np.array([20, 40, 60, 80, 100]), 0, self.motion_length - 1)
+
+            # Positions: (N, 3) world → heading frame relative to torso
+            def _pos_to_heading(pos_w_batch: np.ndarray) -> np.ndarray:
+                delta = pos_w_batch - torso_pos  # (N, 3)
+                q = np.repeat(yaw_quat, delta.shape[0], axis=0)
+                return quat_rotate_inverse(q, delta).astype(np.float32)
+
+            pos_short = _pos_to_heading(self.motion_obj_pos[short_idx]).reshape(1, -1)
+            pos_long  = _pos_to_heading(self.motion_obj_pos[long_idx]).reshape(1, -1)
+
+            # Orientations: (N, 4) world wxyz → heading frame → 6D
+            q_w2h = quat_inverse(yaw_quat)
+
+            def _ori_to_6d(rot_wxyz_batch: np.ndarray) -> np.ndarray:
+                n = rot_wxyz_batch.shape[0]
+                q_rep = np.repeat(q_w2h, n, axis=0)
+                q_h = self._normalize_quat_wxyz(quat_mul(q_rep, self._normalize_quat_wxyz(rot_wxyz_batch)))
+                R = matrix_from_quat(q_h)  # (N, 3, 3)
+                return R[..., :2].reshape(1, -1).astype(np.float32)  # (1, N*6)
+
+            ori_short = _ori_to_6d(self.motion_obj_rot[short_idx])
+            ori_long  = _ori_to_6d(self.motion_obj_rot[long_idx])
 
         return pos_short, ori_short, pos_long, ori_long
 
@@ -2599,6 +2748,57 @@ class WholeBodyTrackingPolicy(BasePolicy):
         )
         try:
             self._debug_traj_viz_sock.sendto(packet.tobytes(), self._debug_traj_viz_addr)
+        except OSError:
+            return
+
+    def _get_sampled_motion_obj_traj_for_rviz(self) -> np.ndarray | None:
+        pos_seq = self.motion_obj_pos_aligned if self.motion_obj_pos_aligned is not None else self.motion_obj_pos
+        rot_seq = (
+            self.motion_obj_rot_aligned_wxyz
+            if self.motion_obj_rot_aligned_wxyz is not None
+            else self.motion_obj_rot
+        )
+        if pos_seq is None or rot_seq is None or self.motion_fps is None:
+            return None
+
+        pos_arr = np.asarray(pos_seq, dtype=np.float32)
+        rot_arr = np.asarray(rot_seq, dtype=np.float32)
+        if pos_arr.ndim != 2 or pos_arr.shape[1] != 3:
+            return None
+        if rot_arr.ndim != 2 or rot_arr.shape[1] != 4:
+            return None
+
+        traj_len = min(pos_arr.shape[0], rot_arr.shape[0])
+        if traj_len == 0:
+            return None
+
+        sample_step = max(1, int(round(self._debug_rviz_obj_traj_viz_dt * float(self.motion_fps))))
+        sample_idx = np.arange(0, traj_len, sample_step, dtype=np.int64)
+        if sample_idx.size == 0 or sample_idx[-1] != traj_len - 1:
+            sample_idx = np.concatenate([sample_idx, np.array([traj_len - 1], dtype=np.int64)], axis=0)
+
+        packet = np.concatenate(
+            [
+                pos_arr[sample_idx],
+                self._normalize_quat_wxyz(rot_arr[sample_idx]),
+            ],
+            axis=1,
+        )
+        return packet.astype(np.float32, copy=False)
+
+    def _send_debug_rviz_obj_traj_viz(self) -> None:
+        if not self._debug_rviz_obj_traj_viz_enabled or self._debug_rviz_obj_traj_viz_sock is None:
+            return
+
+        packet = self._get_sampled_motion_obj_traj_for_rviz()
+        if packet is None:
+            return
+
+        try:
+            self._debug_rviz_obj_traj_viz_sock.sendto(
+                packet.reshape(-1).astype(np.float32, copy=False).tobytes(),
+                self._debug_rviz_obj_traj_viz_addr,
+            )
         except OSError:
             return
 
@@ -2779,7 +2979,6 @@ class WholeBodyTrackingPolicy(BasePolicy):
 
         # Do not touch main policy action history
         self.scaled_policy_action = full_action_config
-        self.current_observation = None
         return self.scaled_policy_action
 
     def rl_inference(self, robot_state_data):
@@ -2875,26 +3074,25 @@ class WholeBodyTrackingPolicy(BasePolicy):
                 
                 return self.scaled_policy_action
 
-        group_outputs = self._prepare_group_observations(robot_state_data)
+        current_obs_buffer_dict = self.get_current_obs_buffer_dict(robot_state_data)
+        current_obs_dict = self.parse_current_obs_dict(current_obs_buffer_dict)
+        group_outputs = self._update_obs_history(current_obs_dict)
 
-        # Collect motion log entry (obs + poses) once motion clip starts
-        if self.motion_clip_progressing:
-            self._collect_motion_log_step(robot_state_data, group_outputs)
+        # Collect motion log entry only during active motion playback (not stabilization).
+        if self.motion_clip_progressing and not self.stabilization_mode:
+            self._collect_motion_log_step(robot_state_data, current_obs_dict)
 
         if "obs" in self.onnx_input_names:
             if "actor_obs" in group_outputs:
                 input_feed = {"obs": group_outputs["actor_obs"]}
-                self.current_observation = group_outputs["actor_obs"].copy()
             else:
                 concat_obs = np.concatenate(
                     [group_outputs[group] for group in self.obs_dict.keys() if group in group_outputs],
                     axis=1,
                 )
                 input_feed = {"obs": concat_obs}
-                self.current_observation = concat_obs.copy()
         else:
             input_feed = {name: group_outputs[name] for name in self.onnx_input_names}
-            self.current_observation = None
 
         raw_action_order = self.policy(input_feed)  # Raw action in action order
 
@@ -2986,16 +3184,6 @@ class WholeBodyTrackingPolicy(BasePolicy):
         self.global_timestep += 1
         # update motion timestep (only when motion is actually progressing, not stabilization)
         if self.motion_clip_progressing and not self.stabilization_mode:
-            # Log inference data (proprio_body, proprio_hand, policy_action)
-            self._log_inference_data(input_feed)
-            # Sim2real log: observation + scaled_policy_action
-            obs_arr = (
-                self.current_observation[0]
-                if self.current_observation is not None
-                else np.concatenate([v for v in input_feed.values()], axis=1)[0]
-            )
-            self._append_sim2real_log_step(obs_arr)
-            
             # Check if we've hit the safety limit
             if self.max_motion_length is not None and self.motion_timestep >= self.max_motion_length:
                 # Freeze at last action - don't increment timestep
@@ -3131,6 +3319,12 @@ class WholeBodyTrackingPolicy(BasePolicy):
 
     def _handle_stop_policy(self):
         """Handle stop policy action with two-stage stop (soft stop -> stiff stop)."""
+        if self._record_traj_active:
+            self.logger.warning("Stopping active world-frame trajectory recording without saving.")
+            self._record_traj_active = False
+            self._recorded_traj_time_buffer = []
+            self._recorded_traj_pos_buffer = []
+            self._recorded_traj_rot_buffer = []
         
         # First stop press: soft stop (hold current position with stabilization policy)
         if not self._soft_stop_active:
@@ -3179,15 +3373,6 @@ class WholeBodyTrackingPolicy(BasePolicy):
             if hasattr(self.interface, "no_action"):
                 self.interface.no_action = 0
             
-            # Save logs only on stiff mode (second stop)
-            if self.npz_log_data is not None and len(self.npz_log_data.get("global_timestep", [])) > 0:
-                self._save_npz_log()
-                logger.info(colored("✓ NPZ file saved on policy stop", "green", attrs=["bold"]))
-            
-            if self.inference_log_data is not None and len(self.inference_log_data.get("proprio_body", [])) > 0:
-                self._save_inference_log()
-                logger.info(colored("✓ Inference log saved on policy stop", "cyan", attrs=["bold"]))
-            
             if self.debug_log_data is not None and len(self.debug_log_data.get("dof_pos", [])) > 0:
                 self._save_debug_log()
                 logger.info(colored("✓ Debug log saved on policy stop", "magenta", attrs=["bold"]))
@@ -3214,6 +3399,9 @@ class WholeBodyTrackingPolicy(BasePolicy):
     def _handle_start_motion_clip(self):
         """Handle start motion clip action."""
         self._stiff_startup_active = False
+        if self._record_traj_active:
+            self.logger.warning("Finish trajectory recording first before starting the motion clip.")
+            return
         # Snapshot world poses at motion-start trigger ('s' first press).
         self._log_robot_object_pose_snapshot("s:start_motion")
         # Initialize pkl log for this motion clip
@@ -3245,12 +3433,15 @@ class WholeBodyTrackingPolicy(BasePolicy):
                 logger.info(
                     colored(
                         f"Gen traj enabled: length={self.motion_length} frames "
-                        f"({self.motion_length/self.motion_fps:.2f}s), height=0.2m",
+                        f"({self.motion_length/self.motion_fps:.2f}s), mode={self._traj_gen.mode}",
                         "cyan",
                     )
                 )
             else:
                 logger.warning("Gen traj requested but object pose not available; keeping original motion object traj.")
+        elif self.record_traj and self._recorded_obj_pos_w is None:
+            logger.warning("record_traj is enabled but no recorded world-frame trajectory is available; using clip object trajectory.")
+        self._send_debug_rviz_obj_traj_viz()
         self.clock_sub.reset_origin()
         self.motion_clip_progressing = True
         # Capture motion-specific start timestep for policy-level timing control
@@ -3343,6 +3534,8 @@ class WholeBodyTrackingPolicy(BasePolicy):
         elif keycode == "d":
             # Start stabilization mode - policy runs with first motion frame
             self._handle_start_stabilization()
+        elif keycode == "t":
+            self._toggle_record_traj()
         elif keycode == "s":
             # 's' behavior:
             # - If motion not started yet: start motion clip
@@ -3384,7 +3577,9 @@ class WholeBodyTrackingPolicy(BasePolicy):
 
     def handle_joystick_button(self, cur_key):
         """Handle joystick button presses for WBT-specific controls."""
-        if cur_key == "X":
+        if cur_key == "Y" and self.record_traj:
+            self._toggle_record_traj()
+        elif cur_key == "X":
             # Start stabilization mode
             self._handle_start_stabilization()
         elif cur_key == "start":
