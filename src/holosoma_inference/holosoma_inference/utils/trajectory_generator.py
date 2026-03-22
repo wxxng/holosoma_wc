@@ -6,9 +6,9 @@ class TrajectoryGenerator:
     def __init__(
         self,
         rl_rate: float,
-        hold_time_s: float = 10.0,
+        hold_time_s: float = 6.0,
         lift_height_m: float = 0.5,
-        lift_speed_mps: float = 0.8,
+        lift_speed_mps: float = 0.4,
         mode: str = "lift"
     ):
         self.rl_rate = float(rl_rate)
@@ -45,10 +45,10 @@ class TrajectoryGenerator:
         # up: 0 -> +H (constant speed in continuous time; discretized linear ramp)
         z_up = np.linspace(0.0, self.lift_height_m, n_lift + 1, dtype=np.float32)[1:]
 
-        # down: +H -> 0
-        z_down = np.linspace(self.lift_height_m, 0.0, n_lift + 1, dtype=np.float32)[1:]
+        # keep the final pose instead of returning to the start point
+        z_final_hold = np.full((n_lift,), self.lift_height_m, dtype=np.float32)
 
-        z = np.concatenate([z_hold, z_up, z_down], axis=0)  # [T]
+        z = np.concatenate([z_hold, z_up, z_final_hold], axis=0)  # [T]
 
         pos = np.repeat(start_pos.reshape(1, 3), z.shape[0], axis=0)
         pos[:, 2] = start_pos[2] + z
