@@ -8,6 +8,9 @@ python scripts/generate_g1_object_xmls.py
 ## locomotion
 python test_loco_mw.py --offscreen --record --sim-hz 2000 --onnx src/holosoma_inference/holosoma_inference/models/loco/g1_43dof/walk_prior_dr_0315.onnx --infer
 
+## object trajectory tracking
+python test_ott_mw.py --offscreen --record --sim-hz 2000 --policy ~/Desktop/codebase/unitreeG1/holosoma_wc/src/holosoma_inference/holosoma_inference/models/wbt/object/bps_policy_mlp_large.onnx --pkl src/holosoma/holosoma/data/motions/motion_tracking/grab_omomo_selected_111_filtered.pkl --clip-key GRAB_s1_cubemedium_pass_1 --lift --plot_joint_action
+--stay  --gantry --init-timestep 130 --virtual --virtual_table
 
 ## Cabinet stocking
 
@@ -39,6 +42,10 @@ python3 src/holosoma_inference/holosoma_inference/run_policy.py inference:g1-43d
 
 python3 src/holosoma_inference/holosoma_inference/run_policy.py inference:g1-43dof-loco-prior     --task.model-path src/holosoma_inference/holosoma_inference/models/loco/g1_43dof/walk_prior_dr_0315.onnx     --task.no-use-joystick     --task.interface lo --task.change_loco_order
 
+
+python3 src/holosoma_inference/holosoma_inference/run_policy.py inference:g1-43dof-loco-prior     --task.model-path /home/rllab3/Desktop/codebase/unitreeG1/holosoma_wc/src/holosoma_inference/holosoma_inference/models/loco/g1_43dof/walk_mlp_0317.onnx     --task.no-use-joystick     --task.interface lo --task.change_loco_order --task.switch_hands
+
+
 # press ] in the terminal
 # press = to start locomotion
 # WASD to move, QE to rotate
@@ -47,6 +54,7 @@ python3 src/holosoma_inference/holosoma_inference/run_policy.py inference:g1-43d
 ## Object tracking (bps)
 
 ```
+sudo ip link set dev lo multicast on
 source scripts/source_holomujoco_mw_setup.sh
 python src/holosoma/holosoma/run_sim.py \
   robot:g1_43dof_cubemedium \
@@ -73,6 +81,17 @@ python3 src/holosoma_inference/holosoma_inference/run_policy.py inference:g1-43d
   --task.no-use-joystick \
   --task.interface lo \
   --task.motion-start-timestep 0
+
+python3 src/holosoma_inference/holosoma_inference/run_policy.py inference:g1-43dof-object-bps \
+  --task.model-path src/holosoma_inference/holosoma_inference/models/wbt/object/bps_policy_mlp_large_better.onnx \
+  --task.motion-pkl-path /home/rllab3/Desktop/codebase/unitreeG1_mw/holosoma_wc/src/holosoma/holosoma/data/motions/motion_tracking/grab_omomo_selected_111_filtered.pkl \
+  --task.motion-clip-key GRAB_s1_cubemedium_pass_1 \
+  --task.no-use-joystick \
+  --task.interface lo \
+  --task.motion-start-timestep 20 \
+  --task.use_gen_traj \
+  --task.gen_traj_mode lift \
+  --task.cache_world
 
 # pcd based
 source scripts/source_holoinference_mw.sh
@@ -114,15 +133,66 @@ python3 src/holosoma_inference/holosoma_inference/run_policy.py inference:g1-43d
 python3 src/holosoma_inference/holosoma_inference/run_policy.py inference:g1-43dof-loco-prior \
     --task.model-path src/holosoma_inference/holosoma_inference/models/loco/g1_43dof/walk_prior_0315.onnx \
     --task.use-joystick \
-    
     --task.rl-rate 50 \
     --task.interface enp132s0 \
     --task.change_loco_order \
     --task.log \
     --task.debug_hand \
-    --task.debug_hand_action test_log/hand_joint_targets_latest.npz
+    --task.debug_hand_action test_log/hand_joint_targets_latest.npz \
+    --task.debug_hand_demo
 ```
 
+# object tracking setup (FastLIO + apriltag + rviz)
+```
+./scripts/start_localization_session.sh
+```
+
+## debugging
+```
+python sim_replay.py --pkl logs/sim2real/wbt/wbt_log_enp132s0_20260320_232616.pkl --offscreen  --record --time 5
+```
+
+## Object trajectory following
+```
+# launch mujoco twin
+python3 mujoco_twin.py --xml src/holosoma/holosoma/data/robots/g1/g1_object/g1_43dof_cubemedium.xml
+```
+
+
+```
+holoin_wc
+python3 src/holosoma_inference/holosoma_inference/run_policy.py inference:g1-43dof-object-bps   --task.model-path src/holosoma_inference/holosoma_inference/models/wbt/object/bps_policy_mlp_large_better_local.onnx   --task.motion-pkl-path /home/rllab3/Desktop/codebase/unitreeG1_mw/holosoma_wc/src/holosoma/holosoma/data/motions/motion_tracking/grab_omomo_selected_111_filtered.pkl   --task.motion-clip-key GRAB_s1_cubemedium_pass_1   --task.use-joystick   --task.interface enp132s0   --task.motion-start-timestep 0 --task.use_gen_traj --task.gen_traj_mode lift --task.switch_hands --task.log --task.mujoco_twin 
+
+python3 src/holosoma_inference/holosoma_inference/run_policy.py inference:g1-43dof-object-bps   --task.model-path src/holosoma_inference/holosoma_inference/models/wbt/object/bps_policy_mlp_large_better.onnx   --task.motion-pkl-path /home/rllab3/Desktop/codebase/unitreeG1_mw/holosoma_wc/src/holosoma/holosoma/data/motions/motion_tracking/grab_omomo_selected_111_filtered.pkl   --task.motion-clip-key GRAB_s1_cubemedium_pass_1   --task.use-joystick   --task.interface enp132s0   --task.motion-start-timestep 0 --task.use_gen_traj --task.gen_traj_mode lift --task.switch_hands --task.log --task.mujoco_twin --task.cache_world
+
+```
+## Use Fastlio 
+```
+ros_loc # env 
+ros2 launch fast_lio mapping.launch.py fake_object:=true # terminal 1
+ros2 launch livox_ros_driver2 msg_MID360_launch.py # terminal 2
+ros2 run fast_lio holosoma_pose_bridge.py # terminal 3
+```
+### Robot dof pos 
+```
+holoin_wc
+python read_dof_pos_real.py --ros
+
+holoin_wc
+source /opt/ros/jazzy/setup.bash
+/usr/bin/python3 ros2_joint_state_bridge.py
+
+rviz2 -d ~/ws_loc/src/FAST_LIO_LOCALIZATION_HUMANOID/FAST_LIO/rviz/fastlio.rviz # rviz 
+```
+
+## Use Apriltag 
+```
+source ~/ros2_env.sh
+ros2 launch realsense2_camera rs_launch.py
+ros2 launch apriltag_ros realsense_apriltag.launch.py
+
+python3 ~/ros2_ws/src/apriltag_ros/scripts/bundle_pose_node.py --ros-args -p bundle_config_file:=$HOME/ros2_ws/src/apriltag_ros/cfg/bundle.yaml -p camera_frame:=camera_link
+```
 
 ## To use vscode debugger:
 ```
