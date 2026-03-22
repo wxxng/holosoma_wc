@@ -405,8 +405,9 @@ class SimpleVideoRecorder:
         self._camera.azimuth = azimuth
         self._camera.elevation = -elevation
 
-    def capture_frame(self, data: mujoco.MjData, scene_fn=None) -> None:
-        self._camera.lookat[:] = data.qpos[:3]  # follow robot base
+    def capture_frame(self, data: mujoco.MjData, scene_fn=None, follow_robot: bool = True) -> None:
+        if follow_robot:
+            self._camera.lookat[:] = data.qpos[:3]  # follow robot base
         self._renderer.update_scene(data, camera=self._camera)
         if scene_fn is not None:
             scene_fn(self._renderer.scene)

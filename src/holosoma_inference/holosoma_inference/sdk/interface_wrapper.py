@@ -1,6 +1,7 @@
 import json
 import os
 import socket
+import time
 import numpy as np
 from loguru import logger
 from termcolor import colored
@@ -95,6 +96,8 @@ class InterfaceWrapper:
         self._world_robot_pose_cache = None  # [x,y,z,qx,qy,qz,qw] in FLU, typically pelvis/root pose in world
         self._world_object_pose_cache = None  # [x,y,z,qx,qy,qz,qw] in FLU, object pose in world
         self._torso_object_pose_cache = None  # [x,y,z,qx,qy,qz,qw] in FLU, object pose in torso_link
+        self._world_object_pose_timestamp = None  # receive timestamp in seconds
+        self._torso_object_pose_timestamp = None  # receive timestamp in seconds
         self._world_robot_twist_cache = None  # [vx,vy,vz,wx,wy,wz] in FLU
         self._world_robot_quat_warned = False
 
@@ -238,6 +241,11 @@ class InterfaceWrapper:
             f"Unsupported HOLOSOMA_WORLD_TOPIC_FRAME='{WORLD_TOPICS_INPUT_FRAME}'. Expected 'FLU' or 'RDF'."
         )
 
+    @staticmethod
+    def _packet_receive_time() -> float:
+        """Timestamp packets using local monotonic time for consistent relative timing."""
+        return time.monotonic()
+
     def _poll_world_topics(self) -> None:
         """Drain pending world-topic packets and update caches (best-effort, non-blocking)."""
         if self._world_topics_sock is None:
@@ -245,6 +253,7 @@ class InterfaceWrapper:
         while True:
             try:
                 data, _addr = self._world_topics_sock.recvfrom(8192)
+                packet_time = self._packet_receive_time()
             except BlockingIOError:
                 break
             if not data:
@@ -284,10 +293,12 @@ class InterfaceWrapper:
                     pose = _pose_with_quat(identity_ok=False)
                     if pose is not None:
                         self._torso_object_pose_cache = pose
+                        self._torso_object_pose_timestamp = packet_time
                 elif topic.endswith("/object_pose_world") or topic == "object_pose_world":
                     pose = _pose_with_quat(identity_ok=False)
                     if pose is not None:
                         self._world_object_pose_cache = pose
+                        self._world_object_pose_timestamp = packet_time
                 elif topic.endswith("/pelvis_pose_world") or topic == "pelvis_pose_world":
                     pose = _pose_with_quat(identity_ok=True)
                     if pose is None:
@@ -310,6 +321,7 @@ class InterfaceWrapper:
                     pose = _pose_with_quat(identity_ok=False)
                     if pose is not None:
                         self._world_object_pose_cache = pose
+                        self._world_object_pose_timestamp = packet_time
 
             elif msg_type == "TwistStamped":
                 # Only use base linear velocity from UDP; angular velocity comes from robot IMU.
@@ -488,6 +500,24 @@ class InterfaceWrapper:
         if self._torso_object_pose_cache is None:
             return None
         return self._torso_object_pose_cache.copy()
+
+    def get_object_pose_torso_with_timestamp(self):
+        """Get latest object pose in torso_link frame plus receive timestamp."""
+        if self._world_topics_sock is None:
+            return None, None
+        self._poll_world_topics()
+        if self._torso_object_pose_cache is None or self._torso_object_pose_timestamp is None:
+            return None, None
+        return self._torso_object_pose_cache.copy(), float(self._torso_object_pose_timestamp)
+
+    def get_object_pose_world_with_timestamp(self):
+        """Get latest object world pose plus receive timestamp."""
+        if self._world_topics_sock is None:
+            return None, None
+        self._poll_world_topics()
+        if self._world_object_pose_cache is None or self._world_object_pose_timestamp is None:
+            return None, None
+        return self._world_object_pose_cache.copy(), float(self._world_object_pose_timestamp)
 
     def get_scene_object_name(self):
         """Get latest scene object name if available."""

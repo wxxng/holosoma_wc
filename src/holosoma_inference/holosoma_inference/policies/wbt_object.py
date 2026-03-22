@@ -1,4 +1,3 @@
-import atexit
 import csv
 import json
 import pickle
@@ -365,6 +364,8 @@ class WholeBodyTrackingPolicy(BasePolicy):
         self.motion_dof_vel = None  # [num_frames, num_dofs] calculated from pos
         self.motion_obj_pos = None  # [num_frames, 3] world
         self.motion_obj_rot = None  # [num_frames, 4] world (wxyz)
+        self._motion_obj_pos_world = None  # [num_frames, 3] original world frame (preserved before alignment)
+        self._motion_obj_rot_world_wxyz = None  # [num_frames, 4] original world frame wxyz
         self.motion_table_pos = None  # [num_frames, 3] world
         self.motion_table_rot_wxyz = None  # [num_frames, 4] world (wxyz)
         self.motion_obj_name = None
@@ -386,9 +387,12 @@ class WholeBodyTrackingPolicy(BasePolicy):
         self._scene_object_name = None
         self._scene_reset_counter = None
         
-        # Interpolation counter for smooth transition to the configured start frame
+        # Interpolation counter for smooth transition to the configured start frame.
+        # Phase 1 (0..rl_interp_steps-1): all joints except elbows interpolate to target.
+        # Phase 2 (rl_interp_steps..2*rl_interp_steps-1): elbow joints interpolate to target.
         self.rl_interp_count = 0
-        self.rl_interp_steps = 100  # Number of steps for smooth interpolation
+        self.rl_interp_steps = 100  # Steps per phase (total = 2 * rl_interp_steps)
+        self._elbow_interp_start_pos = None  # Elbow positions captured at start of phase 2
         self.interp_complete_dof_pos_logged = False  # Flag to log dof_pos once when interp complete
         
         # Global timestep counter for logging
@@ -405,6 +409,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
         # Object height tracking for table removal
         self._initial_object_height = None
         self._table_removed = False
+        self._table_removal_grace_steps = 0  # Countdown; skip height checks while > 0
 
         # Read use_sim_time from config
         self.use_sim_time = config.task.use_sim_time
@@ -457,6 +462,16 @@ class WholeBodyTrackingPolicy(BasePolicy):
         self._bps_cache: dict[str, np.ndarray] = {}
         self._obj_bps: np.ndarray | None = None  # current object BPS code (512,)
 
+        # Optional recorded object trajectory in world frame for BPS motion commands.
+        self.record_traj = bool(getattr(config.task, "record_traj", False))
+        self._record_traj_active = False
+        self._recorded_obj_pos_w = None  # [num_frames, 3]
+        self._recorded_obj_rot_wxyz = None  # [num_frames, 4]
+        self._recorded_traj_time_buffer: list[float] = []
+        self._recorded_traj_pos_buffer: list[np.ndarray] = []
+        self._recorded_traj_rot_buffer: list[np.ndarray] = []
+        self._recorded_traj_path: Path | None = None
+
         super().__init__(config)
 
         # Load stiff startup parameters from robot config
@@ -493,10 +508,10 @@ class WholeBodyTrackingPolicy(BasePolicy):
         self._traj_gen = None
         self._gen_traj_initialized = False
         if self.use_gen_traj:
-            self._traj_gen = TrajectoryGenerator(rl_rate=config.task.rl_rate)
-        
-        # self.current_object_pos_w = np.array([[0.8, 0.0, 0.9]], dtype=np.float32)
-        # self.current_object_quat_w = np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32)  # wxyz
+            self._traj_gen = TrajectoryGenerator(
+                rl_rate=config.task.rl_rate,
+                mode=config.task.gen_traj_mode,
+            )
         
         # Prompt user before entering stiff mode (only if stdin is available)
         def _show_warning():
@@ -507,6 +522,25 @@ class WholeBodyTrackingPolicy(BasePolicy):
                     attrs=["bold"],
                 )
             )
+
+        # RViz object trajectory UDP sender — init before input() so it sends immediately
+        self._rviz_traj_enabled = bool(config.task.rviz_traj)
+        self._rviz_traj_host = str(config.task.rviz_traj_host).strip()
+        self._rviz_traj_port = int(config.task.rviz_traj_port)
+        self._rviz_traj_dt = max(float(config.task.rviz_traj_dt), 1e-3)
+        self._rviz_traj_sock = None
+        self._rviz_traj_addr = None
+        if self._rviz_traj_enabled:
+            self._rviz_traj_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._rviz_traj_addr = (self._rviz_traj_host, self._rviz_traj_port)
+            logger.info(
+                colored(
+                    f"RViz object trajectory UDP sender enabled on {self._rviz_traj_addr} "
+                    f"(dt={self._rviz_traj_dt:.3f}s)",
+                    "cyan",
+                )
+            )
+            self._send_rviz_traj()
 
         if sys.stdin.isatty():
             logger.info(colored("\n⚠️  Ready to enter stiff hold mode", "yellow", attrs=["bold"]))
@@ -520,17 +554,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
         else:
             _show_warning()
         
-        # Initialize NPZ logging for lo/eth0 interface
-        self.npz_log_data = None  # Dictionary to store logged data
-        self.npz_log_path = None  # Path to save NPZ file
-        self.npz_save_interval = 10  # Save every N timesteps
         self.max_motion_length = None  # Safety limit for motion clip length
-        self.current_observation = None  # Store current observation for logging
-        self.current_torques = None  # Store current torques for logging
-        
-        # Inference logging (proprio_body, proprio_hand, policy_action)
-        self.inference_log_data = None
-        self.inference_log_path = None
         
         # Debug mode flag
         self.debug_mode = getattr(config.task, 'debug', False)
@@ -545,9 +569,6 @@ class WholeBodyTrackingPolicy(BasePolicy):
         logger.info(colored(f"DEBUG: config.task.interface = '{config.task.interface}'", "cyan", attrs=["bold"]))
         
         if config.task.interface in ["lo", "eth0", "enp123s0"]:
-            self._init_inference_logging()  # Initialize inference logging
-            # Safety: Limit motion length to first 3 seconds (adjust based on motion fps)
-            # Set to None to disable limit after verifying safety
             self.max_motion_length = None  # ~3 seconds at 50 fps
             logger.info(colored(f"Safety mode: Motion limited to {self.max_motion_length} frames", "yellow", attrs=["bold"]))
         else:
@@ -557,14 +578,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
         if self.debug_mode:
             self._init_debug_logging()
 
-        # Sim2real inference logging (obs + action, saved to logs/sim2real/wbt)
-        self._sim2real_log_data: dict | None = None
-        self._sim2real_log_path: Path | None = None
-        self._sim2real_shutdown_complete = False
-        self._init_sim2real_log()
-        atexit.register(self._save_sim2real_log)
-
-        # Motion pkl logging (obs + poses, starts on 's' key)
+        # Motion logging (per-term observations + poses, starts on 's' key)
         self._motion_log_data: list[dict] | None = None
         self._motion_log_path: Path | None = None
 
@@ -613,7 +627,25 @@ class WholeBodyTrackingPolicy(BasePolicy):
                     "cyan",
                 )
             )
-        
+
+        # MuJoCo twin: real-time full-state streaming for live visualization
+        self._mujoco_twin_enabled = bool(getattr(config.task, "mujoco_twin", False))
+        self._mujoco_twin_host = str(getattr(config.task, "mujoco_twin_host", "127.0.0.1")).strip()
+        self._mujoco_twin_port = int(getattr(config.task, "mujoco_twin_port", 10008))
+        self._mujoco_twin_sock = None
+        self._mujoco_twin_addr = None
+        self._mujoco_twin_first_packet_logged = False
+        self._mujoco_twin_send_error_logged = False
+        if self._mujoco_twin_enabled:
+            self._mujoco_twin_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._mujoco_twin_addr = (self._mujoco_twin_host, self._mujoco_twin_port)
+            logger.info(
+                colored(
+                    f"MuJoCo twin UDP sender enabled on {self._mujoco_twin_addr}",
+                    "cyan",
+                )
+            )
+
     def _initialize_history_state(self):
         """Override to use listed (not sorted) obs term order to match training."""
         super()._initialize_history_state()
@@ -631,20 +663,13 @@ class WholeBodyTrackingPolicy(BasePolicy):
             self.obs_buf_dict[group] = np.concatenate(flattened_terms, axis=1) if flattened_terms else np.zeros((1, 0))
 
     def __del__(self):
-        """Save NPZ files on cleanup."""
-        if hasattr(self, 'npz_log_data') and self.npz_log_data is not None and len(self.npz_log_data.get("global_timestep", [])) > 0:
-            self._save_npz_log()
-        # Save inference log
-        if hasattr(self, 'inference_log_data') and self.inference_log_data is not None and len(self.inference_log_data.get("proprio_body", [])) > 0:
-            self._save_inference_log()
+        """Save log files on cleanup."""
         # Save debug log
         if hasattr(self, 'debug_log_data') and self.debug_log_data is not None and len(self.debug_log_data.get("dof_pos", [])) > 0:
             self._save_debug_log()
         # Save motion pkl log
         if hasattr(self, '_motion_log_data') and self._motion_log_data:
             self._save_motion_log()
-        # Save sim2real log
-        self._save_sim2real_log()
     
     def _init_debug_logging(self):
         """Initialize debug logging for dof_pos and scaled_policy_action."""
@@ -665,6 +690,12 @@ class WholeBodyTrackingPolicy(BasePolicy):
         }
         
         logger.info(colored(f"✓ Debug logging initialized: {self.debug_log_path.resolve()}", "magenta", attrs=["bold"]))
+
+    def _get_interface_log_tag(self) -> str:
+        interface = str(getattr(self.config.task, "interface", "unknown")).strip()
+        if not interface:
+            interface = "unknown"
+        return "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in interface)
 
     def _save_debug_log(self):
         """Save debug log data to NPZ file."""
@@ -689,91 +720,8 @@ class WholeBodyTrackingPolicy(BasePolicy):
         except Exception as e:
             logger.error(colored(f"Failed to save debug log: {e}", "red"))
 
-    def _init_inference_logging(self):
-        """Initialize inference logging for proprio_body, proprio_hand, and policy_action."""
-        # Create logs directory if it doesn't exist
-        log_dir = Path("logs/action_logs")
-        log_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Create NPZ file path with timestamp
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.inference_log_path = log_dir / f"inference_log_{timestamp}.npz"
-        
-        # Initialize data storage
-        self.inference_log_data = {
-            "proprio_body": [],  # obs[0, 6500:6835]
-            "proprio_hand": [],  # obs[0, 6835:]
-            "policy_action": [],  # self.scaled_policy_action
-            "motion_timestep": [],  # motion timestep for reference
-        }
-        
-        logger.info(colored(f"✓ Inference logging initialized: {self.inference_log_path.resolve()}", "cyan", attrs=["bold"]))
-
-    def _log_inference_data(self, input_feed: dict):
-        """Log proprio_body, proprio_hand, and policy_action during motion clip progression."""
-        if self.inference_log_data is None:
-            return
-        
-        try:
-            obs = input_feed.get("obs")
-            if obs is None:
-                return
-            
-            # Extract proprio_body and proprio_hand from observation
-            proprio_body = obs[0, 6500:6835].copy()  # [335]
-            proprio_hand = obs[0, 6835:].copy()  # remaining dims
-            
-            # Store data
-            self.inference_log_data["proprio_body"].append(proprio_body)
-            self.inference_log_data["proprio_hand"].append(proprio_hand)
-            self.inference_log_data["policy_action"].append(self.scaled_policy_action.copy().flatten())
-            self.inference_log_data["motion_timestep"].append(self.motion_timestep)
-            
-        except Exception as e:
-            logger.warning(colored(f"Failed to log inference data: {e}", "yellow"))
-
-    def _save_inference_log(self):
-        """Save inference log data to NPZ file."""
-        if self.inference_log_path is None or self.inference_log_data is None:
-            return
-        if len(self.inference_log_data.get("proprio_body", [])) == 0:
-            return
-        
-        try:
-            # Convert lists to numpy arrays
-            save_dict = {
-                key: np.array(value) for key, value in self.inference_log_data.items()
-            }
-            
-            # Save to NPZ file
-            np.savez_compressed(self.inference_log_path, **save_dict)
-            logger.info(colored(
-                f"✓ Inference log saved: {self.inference_log_path.resolve()} "
-                f"({len(self.inference_log_data['proprio_body'])} timesteps)",
-                "cyan", attrs=["bold"]
-            ))
-        except Exception as e:
-            logger.error(colored(f"Failed to save inference log: {e}", "red"))
-    
-    def _save_npz_log(self):
-        """Save collected data to NPZ file."""
-        if self.npz_log_path is None or self.npz_log_data is None:
-            return
-        
-        try:
-            # Convert lists to numpy arrays
-            save_dict = {
-                key: np.array(value) for key, value in self.npz_log_data.items()
-            }
-            
-            # Save to NPZ file
-            np.savez_compressed(self.npz_log_path, **save_dict)
-            logger.info(colored(f"✓ NPZ file saved: {self.npz_log_path.resolve()} ({len(self.npz_log_data['global_timestep'])} timesteps)", "green", attrs=["bold"]))
-        except Exception as e:
-            logger.error(colored(f"Failed to save NPZ file: {e}", "red"))
-
     # -------------------------------------------------------------------------
-    # Motion pkl logging (obs + poses, collected after 's' key)
+    # Motion logging (observation terms + poses, collected after 's' key)
     # -------------------------------------------------------------------------
 
     def _on_sigint(self, signum, frame):
@@ -781,17 +729,17 @@ class WholeBodyTrackingPolicy(BasePolicy):
         logger.info(colored("Ctrl+C detected — saving logs...", "yellow", attrs=["bold"]))
         if self._motion_log_data:
             self._save_motion_log()
-        self._save_sim2real_log()
         # Restore previous handler and re-raise so the process exits normally
         signal.signal(signal.SIGINT, self._prev_sigint_handler)
         signal.raise_signal(signal.SIGINT)
 
     def _init_motion_log(self):
         """Initialize per-motion-clip pkl log buffer."""
-        log_dir = Path("logs/motion_logs")
+        log_dir = Path("logs/sim2real/wbt")
         log_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self._motion_log_path = log_dir / f"motion_log_{timestamp}.pkl"
+        interface_tag = self._get_interface_log_tag()
+        self._motion_log_path = log_dir / f"wbt_log_{interface_tag}_{timestamp}.pkl"
         self._motion_log_data = []
         logger.info(colored(f"✓ Motion log initialized: {self._motion_log_path.resolve()}", "green", attrs=["bold"]))
 
@@ -810,73 +758,260 @@ class WholeBodyTrackingPolicy(BasePolicy):
         except Exception as e:
             logger.error(colored(f"Failed to save motion log: {e}", "red"))
 
-    # -------------------------------------------------------------------------
-    # Sim2real inference logging (obs + action → logs/sim2real/wbt)
-    # -------------------------------------------------------------------------
+    @staticmethod
+    def _pose_to_log_array(
+        pos: np.ndarray | None,
+        quat_wxyz: np.ndarray | None,
+    ) -> np.ndarray | None:
+        if pos is None or quat_wxyz is None:
+            return None
+        pos_arr = np.asarray(pos, dtype=np.float32).reshape(-1)
+        quat_arr = np.asarray(quat_wxyz, dtype=np.float32).reshape(-1)
+        if pos_arr.size != 3 or quat_arr.size != 4:
+            return None
+        return np.concatenate([pos_arr, quat_arr], axis=0).astype(np.float32, copy=False)
 
-    def _init_sim2real_log(self) -> None:
-        log_dir = Path("/home/rllab3/Desktop/codebase/unitreeG1/holosoma_wc/logs/sim2real/wbt")
+    def _init_recorded_traj_path(self) -> Path:
+        log_dir = Path("logs/recorded_object_traj")
         log_dir.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        self._sim2real_log_path = log_dir / f"wbt_{timestamp}.pkl"
-        self._sim2real_log_data = {
-            "created_at": datetime.now().isoformat(),
-            "observation": [],
-            "scaled_policy_action": [],
-        }
-        logger.info(colored(f"Sim2real log initialized: {self._sim2real_log_path}", "cyan"))
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return log_dir / f"recorded_object_traj_{timestamp}.pkl"
 
-    def _append_sim2real_log_step(self, obs: np.ndarray) -> None:
-        if self._sim2real_log_data is None:
-            return
-        self._sim2real_log_data["observation"].append(obs.astype(np.float32).copy())
-        self._sim2real_log_data["scaled_policy_action"].append(
-            self.scaled_policy_action[0].astype(np.float32).copy()
+    def _start_record_traj(self) -> None:
+        self._recorded_traj_time_buffer = []
+        self._recorded_traj_pos_buffer = []
+        self._recorded_traj_rot_buffer = []
+        self._recorded_traj_path = self._init_recorded_traj_path()
+        self._record_traj_active = True
+        logger.info(
+            colored(
+                "⏺️  Started recording object trajectory in world frame. Press the same button again to stop.",
+                "yellow",
+                attrs=["bold"],
+            )
         )
 
-    def _save_sim2real_log(self) -> None:
-        if self._sim2real_shutdown_complete:
+    def _stop_record_traj(self) -> None:
+        self._record_traj_active = False
+        if (
+            not self._recorded_traj_time_buffer
+            or not self._recorded_traj_pos_buffer
+            or not self._recorded_traj_rot_buffer
+        ):
+            logger.warning("Recorded trajectory is empty; keeping the existing motion object trajectory.")
             return
-        self._sim2real_shutdown_complete = True
-        if self._sim2real_log_data is None or self._sim2real_log_path is None:
-            return
-        num_samples = len(self._sim2real_log_data["observation"])
-        if num_samples == 0:
-            logger.info(colored("Sim2real log empty, skipping save.", "yellow"))
-            return
-        payload = {
-            "created_at": self._sim2real_log_data["created_at"],
-            "saved_at": datetime.now().isoformat(),
-            "observation": np.stack(self._sim2real_log_data["observation"], axis=0),
-            "scaled_policy_action": np.stack(self._sim2real_log_data["scaled_policy_action"], axis=0),
-        }
-        try:
-            with self._sim2real_log_path.open("wb") as f:
-                pickle.dump(payload, f)
-            logger.info(colored(
-                f"Sim2real log saved: {self._sim2real_log_path} ({num_samples} steps)",
-                "cyan", attrs=["bold"],
-            ))
-        except Exception as e:
-            logger.error(colored(f"Failed to save sim2real log: {e}", "red"))
 
-    def _collect_motion_log_step(self, robot_state_data, group_outputs: dict):
-        """Append one timestep of obs + poses to the motion log."""
+        raw_time = np.asarray(self._recorded_traj_time_buffer, dtype=np.float64)
+        raw_time = raw_time - raw_time[0]
+        raw_pos = np.stack(self._recorded_traj_pos_buffer, axis=0).astype(np.float32, copy=False)
+        raw_quat = self._normalize_quat_wxyz(
+            np.stack(self._recorded_traj_rot_buffer, axis=0).astype(np.float32, copy=False)
+        )
+
+        resampled_time, pos, quat = self._resample_recorded_traj(
+            raw_time,
+            raw_pos,
+            raw_quat,
+            float(self.config.task.rl_rate),
+        )
+        source_fps = self._estimate_sample_rate(raw_time)
+        self._recorded_obj_pos_w = pos
+        self._recorded_obj_rot_wxyz = quat
+
+        payload = {
+            "created_at": datetime.now().isoformat(),
+            "fps": float(self.config.task.rl_rate),
+            "source_fps_estimate": None if source_fps is None else float(source_fps),
+            "source_time_from_start_sec": raw_time.astype(np.float32, copy=False),
+            "source_obj_pos_w": raw_pos,
+            "source_obj_rot_wxyz": raw_quat,
+            "resampled_time_from_start_sec": resampled_time,
+            "obj_pos_w": pos,
+            "obj_rot_wxyz": quat,
+            "motion_clip_key": self.motion_clip_key,
+            "motion_obj_name": self.motion_obj_name,
+        }
+        if self._recorded_traj_path is not None:
+            try:
+                with self._recorded_traj_path.open("wb") as f:
+                    pickle.dump(payload, f)
+                logger.info(
+                    colored(
+                        f"✓ Recorded object trajectory saved: {self._recorded_traj_path.resolve()} "
+                        f"({raw_pos.shape[0]} raw frames -> {pos.shape[0]} frames @ {self.config.task.rl_rate:.1f}Hz)",
+                        "green",
+                        attrs=["bold"],
+                    )
+                )
+            except Exception as exc:
+                logger.error(colored(f"Failed to save recorded object trajectory: {exc}", "red"))
+
+        logger.info(
+            colored(
+                "Using recorded world-frame object trajectory for BPS motion commands "
+                f"({raw_pos.shape[0]} raw frames -> {pos.shape[0]} resampled frames).",
+                "cyan",
+                attrs=["bold"],
+            )
+        )
+
+    def _toggle_record_traj(self) -> None:
+        if not self.record_traj:
+            return
+        if self._record_traj_active:
+            self._stop_record_traj()
+        else:
+            self._start_record_traj()
+
+    def _record_traj_step(self) -> None:
+        if not self._record_traj_active:
+            return
+        if not hasattr(self.interface, "get_object_pose_world_with_timestamp"):
+            pos_w = self._get_object_pos_w()
+            quat_wxyz = self._get_object_quat_w()
+            pose_timestamp = None
+        else:
+            pose, pose_timestamp = self.interface.get_object_pose_world_with_timestamp()
+            if pose is None or pose_timestamp is None:
+                return
+            pose = np.asarray(pose, dtype=np.float32).reshape(-1)
+            if pose.size < 7:
+                return
+            pos_w = pose[:3].reshape(1, 3)
+            quat_wxyz = xyzw_to_wxyz(pose[3:7].reshape(1, 4))
+
+        if pos_w is None or quat_wxyz is None:
+            return
+        if pose_timestamp is None:
+            pose_timestamp = len(self._recorded_traj_time_buffer) / max(float(self.config.task.rl_rate), 1e-6)
+        if self._recorded_traj_time_buffer and pose_timestamp <= self._recorded_traj_time_buffer[-1]:
+            return
+        self._recorded_traj_time_buffer.append(float(pose_timestamp))
+        self._recorded_traj_pos_buffer.append(pos_w[0].astype(np.float32, copy=True))
+        self._recorded_traj_rot_buffer.append(self._normalize_quat_wxyz(quat_wxyz)[0].astype(np.float32, copy=True))
+
+    @staticmethod
+    def _estimate_sample_rate(sample_times: np.ndarray) -> float | None:
+        if sample_times.size < 2:
+            return None
+        dt = np.diff(sample_times)
+        dt = dt[dt > 1e-6]
+        if dt.size == 0:
+            return None
+        return float(1.0 / np.median(dt))
+
+    def _quat_slerp_wxyz(self, q0: np.ndarray, q1: np.ndarray, alpha: float) -> np.ndarray:
+        q0_n = self._normalize_quat_wxyz(np.asarray(q0, dtype=np.float32).reshape(1, 4))[0]
+        q1_n = self._normalize_quat_wxyz(np.asarray(q1, dtype=np.float32).reshape(1, 4))[0]
+        dot = float(np.dot(q0_n, q1_n))
+        if dot < 0.0:
+            q1_n = -q1_n
+            dot = -dot
+        dot = float(np.clip(dot, -1.0, 1.0))
+
+        if dot > 0.9995:
+            q = q0_n + float(alpha) * (q1_n - q0_n)
+            return self._normalize_quat_wxyz(q.reshape(1, 4))[0]
+
+        theta_0 = float(np.arccos(dot))
+        sin_theta_0 = float(np.sin(theta_0))
+        if sin_theta_0 < 1e-6:
+            return q0_n
+
+        theta = theta_0 * float(alpha)
+        s0 = np.sin(theta_0 - theta) / sin_theta_0
+        s1 = np.sin(theta) / sin_theta_0
+        q = s0 * q0_n + s1 * q1_n
+        return self._normalize_quat_wxyz(q.reshape(1, 4))[0]
+
+    def _resample_recorded_traj(
+        self,
+        sample_times: np.ndarray,
+        pos_seq: np.ndarray,
+        rot_wxyz_seq: np.ndarray,
+        target_fps: float,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        sample_times = np.asarray(sample_times, dtype=np.float64).reshape(-1)
+        pos_seq = np.asarray(pos_seq, dtype=np.float32)
+        rot_wxyz_seq = self._normalize_quat_wxyz(np.asarray(rot_wxyz_seq, dtype=np.float32))
+
+        if sample_times.size == 0 or pos_seq.shape[0] == 0 or rot_wxyz_seq.shape[0] == 0:
+            return (
+                np.zeros((0,), dtype=np.float32),
+                np.zeros((0, 3), dtype=np.float32),
+                np.zeros((0, 4), dtype=np.float32),
+            )
+
+        if sample_times.size == 1 or target_fps <= 0.0:
+            return (
+                np.array([0.0], dtype=np.float32),
+                pos_seq[:1].astype(np.float32, copy=False),
+                rot_wxyz_seq[:1].astype(np.float32, copy=False),
+            )
+
+        target_dt = 1.0 / target_fps
+        duration = float(sample_times[-1])
+        target_times = np.arange(0.0, duration + 0.5 * target_dt, target_dt, dtype=np.float64)
+        if target_times.size == 0:
+            target_times = np.array([0.0], dtype=np.float64)
+
+        pos_resampled = np.stack(
+            [np.interp(target_times, sample_times, pos_seq[:, axis]) for axis in range(3)],
+            axis=1,
+        ).astype(np.float32, copy=False)
+
+        quat_resampled = np.zeros((target_times.shape[0], 4), dtype=np.float32)
+        for idx, t in enumerate(target_times):
+            right = int(np.searchsorted(sample_times, t, side="right"))
+            if right <= 0:
+                quat_resampled[idx] = rot_wxyz_seq[0]
+            elif right >= sample_times.shape[0]:
+                quat_resampled[idx] = rot_wxyz_seq[-1]
+            else:
+                left = right - 1
+                t0 = sample_times[left]
+                t1 = sample_times[right]
+                alpha = 0.0 if t1 <= t0 else float((t - t0) / (t1 - t0))
+                quat_resampled[idx] = self._quat_slerp_wxyz(
+                    rot_wxyz_seq[left], rot_wxyz_seq[right], alpha
+                )
+
+        return target_times.astype(np.float32, copy=False), pos_resampled, quat_resampled
+
+    def _policy_step_hook(self, robot_state_data):
+        super()._policy_step_hook(robot_state_data)
+        self._record_traj_step()
+
+    def _collect_motion_log_step(
+        self,
+        robot_state_data: np.ndarray,
+        current_obs_dict: dict[str, dict[str, np.ndarray]],
+    ) -> None:
+        """Append one timestep of per-term observations and key poses to the motion log."""
         if self._motion_log_data is None:
             return
-        obj_pos = self._get_object_pos_w()
-        obj_quat = self._get_object_quat_w()
+
+        obj_pos_torso, obj_quat_torso_wxyz = self._get_object_pose_torso()
+        obj_pos_world = self._get_object_pos_w()
+        obj_quat_world_wxyz = self._get_object_quat_w()
+        pelvis_pose_world = np.asarray(robot_state_data[0, :7], dtype=np.float32).copy()
+
         entry = {
             "motion_timestep": int(self.motion_timestep),
             "global_timestep": int(self.global_timestep),
-            # per-group observations (flattened, with history)
-            "obs_groups": {k: v.copy() for k, v in group_outputs.items()},
-            # robot root pose
-            "robot_pos_w": robot_state_data[0, :3].copy().astype(np.float32),
-            "robot_quat_wxyz": robot_state_data[0, 3:7].copy().astype(np.float32),
-            # object pose
-            "obj_pos_w": obj_pos[0].copy() if obj_pos is not None else None,
-            "obj_quat_wxyz": obj_quat[0].copy() if obj_quat is not None else None,
+            "observation_terms": {
+                group: {
+                    term: np.asarray(value, dtype=np.float32).reshape(-1).copy()
+                    for term, value in term_dict.items()
+                }
+                for group, term_dict in current_obs_dict.items()
+            },
+            "scaled_policy_action": None
+            if getattr(self, "scaled_policy_action", None) is None
+            else np.asarray(self.scaled_policy_action, dtype=np.float32).reshape(-1).copy(),
+            "object_pose_torso": self._pose_to_log_array(obj_pos_torso, obj_quat_torso_wxyz),
+            "object_pose_world": self._pose_to_log_array(obj_pos_world, obj_quat_world_wxyz),
+            "pelvis_pose_world": pelvis_pose_world,
         }
         self._motion_log_data.append(entry)
 
@@ -1068,6 +1203,50 @@ class WholeBodyTrackingPolicy(BasePolicy):
                 f"length {self.motion_length}"
             )
 
+    def _resample_motion_arrays(self, speed: float) -> None:
+        """Resample all loaded motion arrays to play at ``speed`` × the original rate.
+
+        speed > 1 → fewer frames (faster);  speed < 1 → more frames (slower).
+        Quaternion arrays are renormalized after interpolation.
+        """
+        old_len = self.motion_length
+        new_len = max(1, int(round(old_len / speed)))
+        old_t = np.linspace(0.0, 1.0, old_len)
+        new_t = np.linspace(0.0, 1.0, new_len)
+
+        def _interp(arr: np.ndarray) -> np.ndarray:
+            return np.stack(
+                [np.interp(new_t, old_t, arr[:, d]) for d in range(arr.shape[1])],
+                axis=1,
+            ).astype(np.float32)
+
+        def _interp_quat(arr: np.ndarray) -> np.ndarray:
+            out = _interp(arr)
+            norms = np.linalg.norm(out, axis=1, keepdims=True)
+            return (out / np.maximum(norms, 1e-8)).astype(np.float32)
+
+        self.motion_dof_pos = _interp(self.motion_dof_pos)
+        if self.motion_obj_pos is not None:
+            self.motion_obj_pos = _interp(self.motion_obj_pos)
+        if self.motion_obj_rot is not None:
+            self.motion_obj_rot = _interp_quat(self.motion_obj_rot)
+        if self.motion_table_pos is not None:
+            self.motion_table_pos = _interp(self.motion_table_pos)
+        if self.motion_table_rot_wxyz is not None:
+            self.motion_table_rot_wxyz = _interp_quat(self.motion_table_rot_wxyz)
+        if self.motion_root_pos_w is not None:
+            self.motion_root_pos_w = _interp(self.motion_root_pos_w)
+        if self.motion_root_quat_w is not None:
+            self.motion_root_quat_w = _interp_quat(self.motion_root_quat_w)
+        self.motion_length = new_len
+        logger.info(
+            colored(
+                f"Reference speed {speed:.3g}×: {old_len} → {new_len} frames "
+                f"({new_len / self.motion_fps:.2f}s)",
+                "yellow",
+            )
+        )
+
     def _get_target_pos_config_first_frame(self) -> np.ndarray | None:
         if self.motion_data is None or self.motion_dof_pos is None or self.motion_length == 0:
             return None
@@ -1242,9 +1421,8 @@ class WholeBodyTrackingPolicy(BasePolicy):
         # Extract data
         self.motion_fps = clip_data['fps']
         self.motion_clip_key = clip_key
-        self.motion_dof_pos = clip_data['dof_pos']  
+        self.motion_dof_pos = clip_data['dof_pos']
         self.motion_length = self.motion_dof_pos.shape[0]
-        self._validate_motion_timestep_config()
         obj_pos_raw = clip_data.get("obj_pos")
         if obj_pos_raw is None:
             self.motion_obj_pos = None
@@ -1327,6 +1505,18 @@ class WholeBodyTrackingPolicy(BasePolicy):
                     self.motion_root_quat_w = root_quat
             else:
                 logger.warning(f"Invalid root_quat shape {root_quat.shape}; ignoring motion root orientation.")
+
+        # Apply reference speed resampling before alignment and velocity calculations
+        reference_speed = getattr(self.config.task, "reference_speed", 1.0)
+        if reference_speed != 1.0:
+            self._resample_motion_arrays(reference_speed)
+        self._validate_motion_timestep_config()
+
+        # Preserve original world-frame object poses before alignment (used by RViz traj sender)
+        if self.motion_obj_pos is not None:
+            self._motion_obj_pos_world = self.motion_obj_pos.copy()
+        if self.motion_obj_rot is not None:
+            self._motion_obj_rot_world_wxyz = self.motion_obj_rot.copy()
 
         # Align motion object poses to the same root transform applied to the robot (xy translation + yaw)
         self._align_motion_objects_to_root(
@@ -1505,7 +1695,10 @@ class WholeBodyTrackingPolicy(BasePolicy):
         future_steps = np.clip(future_steps, 0, self.motion_length - 1)
         
         # Fetch positions and velocities for 10 frames in motion clip order
-        pos_seq = self.motion_dof_pos[future_steps]
+        try:
+            pos_seq = self.motion_dof_pos[future_steps]
+        except:
+            breakpoint()
         vel_seq = self.motion_dof_vel[future_steps]
 
         # Always use body-only 29-DOF for motion commands (drop hands if present)
@@ -1905,6 +2098,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
                 self._table_removed = False
                 self._initial_object_height = None
                 self._last_sent_table_frame = None
+                self._table_removal_grace_steps = 0
 
         scene_object_name = self._normalize_object_name(self.interface.get_scene_object_name())
         if scene_object_name is None:
@@ -2009,7 +2203,6 @@ class WholeBodyTrackingPolicy(BasePolicy):
         self._sync_scene_object_name()
         command_timestep = self._get_motion_start_frame_index() if self.stabilization_mode else self.motion_timestep
         self._send_debug_traj_viz(command_timestep)
-        self._update_table_pose_from_motion(command_timestep)
 
         # Extract joint data from robot_state_data (in config order)
         dof_pos_config = robot_state_data[:, 7 : 7 + self.num_dofs]  # [1, num_dofs]
@@ -2154,8 +2347,8 @@ class WholeBodyTrackingPolicy(BasePolicy):
             # In stabilization mode, keep using the configured start frame for motion command.
             if self.stabilization_mode:
                 current_obs_buffer_dict["motion_command_sequence"] = self._get_motion_command_sequence_first_frame()
-            else:
-                current_obs_buffer_dict["motion_command_sequence"] = self._get_motion_command_sequence(command_timestep)
+            # else:
+            #     current_obs_buffer_dict["motion_command_sequence"] = self._get_motion_command_sequence(command_timestep)
         else:
             # Fallback: use zeros if motion not loaded
             seq_dim = 10 * self.motion_command_dofs * 2  # 580 for 29-DOF (body-only)
@@ -2216,32 +2409,8 @@ class WholeBodyTrackingPolicy(BasePolicy):
         return out.reshape(1, -1).astype(np.float32, copy=False)
 
     def _update_table_pose_from_motion(self, timestep: int) -> None:
-        if self.motion_table_pos is None or self.motion_table_pos.shape[0] == 0:
-            return
-        if self._table_removed:
-            return
-        if not (self.motion_clip_progressing or self.stabilization_mode):
-            return
-        if not hasattr(self.interface, "set_table_pose"):
-            return
-
-        frame_idx = int(np.clip(timestep, 0, self.motion_table_pos.shape[0] - 1))
-        if self._last_sent_table_frame == frame_idx:
-            return
-
-        table_pos_w = self.motion_table_pos[frame_idx].astype(np.float32, copy=False)
-        table_quat_wxyz = None
-        if self.motion_table_rot_wxyz is not None and frame_idx < self.motion_table_rot_wxyz.shape[0]:
-            table_quat_wxyz = self.motion_table_rot_wxyz[frame_idx].astype(np.float32, copy=False)
-
-        ok = self.interface.set_table_pose(table_pos_w, table_quat_wxyz)
-        if ok:
-            self._last_sent_table_frame = frame_idx
-            return
-
-        if not self._table_pose_send_warned:
-            self.logger.warning("Failed to send table pose command to interface.")
-            self._table_pose_send_warned = True
+        """Policy inference must not modify simulator table pose outside reset."""
+        return
 
     def _compute_motion_obj_ori_rel_all(self, robot_state_data, timestep: int) -> np.ndarray:
         if self.motion_obj_rot is None or self.motion_length == 0:
@@ -2358,38 +2527,8 @@ class WholeBodyTrackingPolicy(BasePolicy):
         return pos_torso, quat_torso_wxyz
 
     def _check_and_request_table_removal(self):
-        """Monitor object height and request table removal when object rises 0.1m."""
-        obj_pos_w = self._get_object_pos_w()
-        if obj_pos_w is None:
-            self.logger.debug("Object position not available for table removal check")
-            return
-
-        current_height = float(obj_pos_w[0, 2])
-
-        if self._table_removed:
-            return
-        
-        # Store initial height on first call
-        if self._initial_object_height is None:
-            self._initial_object_height = current_height
-            self.logger.info(f"📏 Initial object height: {self._initial_object_height:.4f}m")
-            return
-        
-        # Check if object has risen 0.1m
-        height_delta = current_height - self._initial_object_height
-        
-        # Log height changes periodically
-        if not hasattr(self, '_last_height_log_step'):
-            self._last_height_log_step = 0
-        if self.global_timestep - self._last_height_log_step >= 50:  # Log every 50 steps
-            self.logger.debug(f"Object height delta: {height_delta:.4f}m (current: {current_height:.4f}m)")
-            self._last_height_log_step = self.global_timestep
-        
-        if height_delta >= 0.03:
-            self.logger.info(f"🚀 Object risen by {height_delta:.4f}m, requesting table removal...")
-            if self.interface.request_remove_table():
-                self._table_removed = True
-                self.logger.info("✓ Table removal flag set")
+        """Policy inference must not request simulator scene changes."""
+        return
     
     def _compute_bps_obj_state(
         self, robot_state_data
@@ -2450,7 +2589,14 @@ class WholeBodyTrackingPolicy(BasePolicy):
             pos_long   : (1, 15)   5×3 positions
             ori_long   : (1, 30)   5×6 6D orientations
         """
-        if self.motion_obj_pos is None or self.motion_obj_rot is None:
+        use_recorded_world_traj = (
+            self._recorded_obj_pos_w is not None
+            and self._recorded_obj_rot_wxyz is not None
+            and self._recorded_obj_pos_w.shape[0] > 0
+            and self._recorded_obj_rot_wxyz.shape[0] > 0
+        )
+
+        if not use_recorded_world_traj and (self.motion_obj_pos is None or self.motion_obj_rot is None):
             return (
                 np.zeros((1, 30), dtype=np.float32),
                 np.zeros((1, 60), dtype=np.float32),
@@ -2465,40 +2611,63 @@ class WholeBodyTrackingPolicy(BasePolicy):
         else:
             torso_pos_w, _ = self._get_ref_body_pose_in_world(robot_state_data)
 
-        torso_pos = torso_pos_w.reshape(1, 3)
+        if use_recorded_world_traj:
+            traj_len = min(self._recorded_obj_pos_w.shape[0], self._recorded_obj_rot_wxyz.shape[0])
+            short_idx = np.clip(timestep + np.arange(1, 11), 0, traj_len - 1)
+            long_idx = np.clip(timestep + np.array([20, 40, 60, 80, 100]), 0, traj_len - 1)
 
-        short_idx = np.clip(timestep + np.arange(1, 11), 0, self.motion_length - 1)
-        long_idx  = np.clip(timestep + np.array([20, 40, 60, 80, 100]), 0, self.motion_length - 1)
+            torso_pos = torso_pos_w.reshape(1, 3)
 
-        # Positions: (N, 3) world → heading frame relative to torso
-        def _pos_to_heading(pos_w_batch: np.ndarray) -> np.ndarray:
-            delta = pos_w_batch - torso_pos  # (N, 3)
-            q = np.repeat(yaw_quat, delta.shape[0], axis=0)
-            return quat_rotate_inverse(q, delta).astype(np.float32)
+            def _pos_to_heading(pos_w_batch: np.ndarray) -> np.ndarray:
+                delta = pos_w_batch - torso_pos
+                q_yaw = np.repeat(yaw_quat, delta.shape[0], axis=0)
+                return quat_rotate_inverse(q_yaw, delta).astype(np.float32)
 
-        pos_short = _pos_to_heading(self.motion_obj_pos[short_idx]).reshape(1, -1)
-        pos_long  = _pos_to_heading(self.motion_obj_pos[long_idx]).reshape(1, -1)
+            pos_short = _pos_to_heading(self._recorded_obj_pos_w[short_idx]).reshape(1, -1)
+            pos_long = _pos_to_heading(self._recorded_obj_pos_w[long_idx]).reshape(1, -1)
 
-        # Orientations: (N, 4) world wxyz → heading frame → 6D
-        q_w2h = quat_inverse(yaw_quat)
+            q_w2h = quat_inverse(yaw_quat)
 
-        def _ori_to_6d(rot_wxyz_batch: np.ndarray) -> np.ndarray:
-            n = rot_wxyz_batch.shape[0]
-            q_rep = np.repeat(q_w2h, n, axis=0)
-            q_h = self._normalize_quat_wxyz(quat_mul(q_rep, self._normalize_quat_wxyz(rot_wxyz_batch)))
-            R = matrix_from_quat(q_h)  # (N, 3, 3)
-            return R[..., :2].reshape(1, -1).astype(np.float32)  # (1, N*6)
+            def _ori_to_6d(rot_wxyz_batch: np.ndarray) -> np.ndarray:
+                n = rot_wxyz_batch.shape[0]
+                q_rep = np.repeat(q_w2h, n, axis=0)
+                q_h = self._normalize_quat_wxyz(quat_mul(q_rep, self._normalize_quat_wxyz(rot_wxyz_batch)))
+                R = matrix_from_quat(q_h)
+                return R[..., :2].reshape(1, -1).astype(np.float32)
 
-        ori_short = _ori_to_6d(self.motion_obj_rot[short_idx])
-        ori_long  = _ori_to_6d(self.motion_obj_rot[long_idx])
+            ori_short = _ori_to_6d(self._recorded_obj_rot_wxyz[short_idx])
+            ori_long = _ori_to_6d(self._recorded_obj_rot_wxyz[long_idx])
+        else:
+            torso_pos = torso_pos_w.reshape(1, 3)
+            short_idx = np.clip(timestep + np.arange(1, 11), 0, self.motion_length - 1)
+            long_idx  = np.clip(timestep + np.array([20, 40, 60, 80, 100]), 0, self.motion_length - 1)
+
+            # Positions: (N, 3) world → heading frame relative to torso
+            def _pos_to_heading(pos_w_batch: np.ndarray) -> np.ndarray:
+                delta = pos_w_batch - torso_pos  # (N, 3)
+                q = np.repeat(yaw_quat, delta.shape[0], axis=0)
+                return quat_rotate_inverse(q, delta).astype(np.float32)
+
+            pos_short = _pos_to_heading(self.motion_obj_pos[short_idx]).reshape(1, -1)
+            pos_long  = _pos_to_heading(self.motion_obj_pos[long_idx]).reshape(1, -1)
+
+            # Orientations: (N, 4) world wxyz → heading frame → 6D
+            q_w2h = quat_inverse(yaw_quat)
+
+            def _ori_to_6d(rot_wxyz_batch: np.ndarray) -> np.ndarray:
+                n = rot_wxyz_batch.shape[0]
+                q_rep = np.repeat(q_w2h, n, axis=0)
+                q_h = self._normalize_quat_wxyz(quat_mul(q_rep, self._normalize_quat_wxyz(rot_wxyz_batch)))
+                R = matrix_from_quat(q_h)  # (N, 3, 3)
+                return R[..., :2].reshape(1, -1).astype(np.float32)  # (1, N*6)
+
+            ori_short = _ori_to_6d(self.motion_obj_rot[short_idx])
+            ori_long  = _ori_to_6d(self.motion_obj_rot[long_idx])
 
         return pos_short, ori_short, pos_long, ori_long
 
     def _compute_obj_pos_diff_b(self, robot_state_data):
         """Compute object position delta in the previous robot frame."""
-        # Check object height for table removal
-        self._check_and_request_table_removal()
-        
         obj_pos_w = self._get_object_pos_w()
         if obj_pos_w is None:
             return np.zeros((1, 3), dtype=np.float32)
@@ -2599,6 +2768,153 @@ class WholeBodyTrackingPolicy(BasePolicy):
         )
         try:
             self._debug_traj_viz_sock.sendto(packet.tobytes(), self._debug_traj_viz_addr)
+        except OSError:
+            return
+
+    def _send_mujoco_twin_state(
+        self,
+        robot_state_data: np.ndarray,
+        current_obs_dict: dict,
+    ) -> None:
+        """Stream full robot+object state to the mujoco_twin.py live viewer via UDP.
+
+        Packet layout (all float32, 149 floats = 596 bytes):
+            [0]        num_dofs  (43.0)
+            [1]        motion_timestep
+            [2:9]      pelvis_pose_world  (pos_xyz + quat_wxyz)
+            [9:52]     dof_pos_config     (43, config order, absolute)
+            [52:95]    dof_vel_config     (43, config order)
+            [95:98]    obj_pos_rel        (heading frame, relative to torso)
+            [98:104]   obj_rot_6d         (heading frame)
+            [104:134]  short_pos          (10×3, heading frame)
+            [134:149]  long_pos           (5×3, heading frame)
+        """
+        if not self._mujoco_twin_enabled or self._mujoco_twin_sock is None:
+            return
+        if self.num_dofs != 43:
+            return
+        try:
+            dof_pos_config = np.asarray(
+                robot_state_data[0, 7 : 7 + self.num_dofs], dtype=np.float32
+            )
+            dof_vel_config = np.asarray(
+                robot_state_data[0, 7 + self.num_dofs + 6 : 7 + self.num_dofs + 6 + self.num_dofs],
+                dtype=np.float32,
+            )
+            pelvis_pose_world = np.asarray(robot_state_data[0, :7], dtype=np.float32)
+
+            task_terms = current_obs_dict.get("task", {})
+            obj_pos_rel = np.asarray(
+                task_terms.get("obj_pos_rel", np.zeros(3)), dtype=np.float32
+            ).reshape(3)
+            obj_rot_6d = np.asarray(
+                task_terms.get("obj_rot_6d", np.zeros(6)), dtype=np.float32
+            ).reshape(6)
+
+            cmd_terms = current_obs_dict.get("command", {})
+            short_pos = np.asarray(
+                cmd_terms.get("motion_obj_pos_short", np.zeros(30)), dtype=np.float32
+            ).reshape(30)
+            long_pos = np.asarray(
+                cmd_terms.get("motion_obj_pos_long", np.zeros(15)), dtype=np.float32
+            ).reshape(15)
+
+            packet = np.concatenate([
+                np.array([float(self.num_dofs), float(self.motion_timestep)], dtype=np.float32),
+                pelvis_pose_world,
+                dof_pos_config,
+                dof_vel_config,
+                obj_pos_rel,
+                obj_rot_6d,
+                short_pos,
+                long_pos,
+            ])
+            self._mujoco_twin_sock.sendto(packet.tobytes(), self._mujoco_twin_addr)
+            if not self._mujoco_twin_first_packet_logged:
+                logger.info(
+                    colored(
+                        f"MuJoCo twin first packet sent to {self._mujoco_twin_addr} "
+                        f"({packet.size} float32 / {packet.nbytes} bytes)",
+                        "cyan",
+                    )
+                )
+                self._mujoco_twin_first_packet_logged = True
+        except OSError as exc:
+            if not self._mujoco_twin_send_error_logged:
+                logger.warning(
+                    colored(
+                        f"MuJoCo twin UDP send failed to {self._mujoco_twin_addr}: "
+                        f"{exc.__class__.__name__}: {exc}",
+                        "yellow",
+                    )
+                )
+                self._mujoco_twin_send_error_logged = True
+            return
+
+    def _get_sampled_motion_obj_traj_for_rviz(self) -> np.ndarray | None:
+        # Use original world-frame object poses (preserved before alignment).
+        # For gen_traj the trajectory is already in world frame and stored directly
+        # in motion_obj_pos / motion_obj_rot, so fall back to those.
+        pos_seq = self._motion_obj_pos_world if self._motion_obj_pos_world is not None else self.motion_obj_pos
+        rot_seq = (
+            self._motion_obj_rot_world_wxyz
+            if self._motion_obj_rot_world_wxyz is not None
+            else self.motion_obj_rot
+        )
+        if pos_seq is None or rot_seq is None or self.motion_fps is None:
+            return None
+
+        pos_arr = np.asarray(pos_seq, dtype=np.float32)
+        rot_arr = np.asarray(rot_seq, dtype=np.float32)
+        if pos_arr.ndim != 2 or pos_arr.shape[1] != 3:
+            return None
+        if rot_arr.ndim != 2 or rot_arr.shape[1] != 4:
+            return None
+
+        traj_len = min(pos_arr.shape[0], rot_arr.shape[0])
+        if traj_len == 0:
+            return None
+
+        # Express trajectory relative to the object's initial (first-frame) pose
+        init_pos = pos_arr[0:1]  # (1, 3)
+        init_rot = rot_arr[0:1]  # (1, 4) wxyz
+        init_rot_inv = quat_inverse(init_rot)  # (1, 4)
+
+        rel_pos = quat_apply(
+            np.repeat(init_rot_inv, traj_len, axis=0),
+            pos_arr - init_pos,
+        )
+        rel_rot = self._normalize_quat_wxyz(
+            quat_mul(np.repeat(init_rot_inv, traj_len, axis=0), rot_arr)
+        )
+
+        sample_step = max(1, int(round(self._rviz_traj_dt * float(self.motion_fps))))
+        sample_idx = np.arange(0, traj_len, sample_step, dtype=np.int64)
+        if sample_idx.size == 0 or sample_idx[-1] != traj_len - 1:
+            sample_idx = np.concatenate([sample_idx, np.array([traj_len - 1], dtype=np.int64)], axis=0)
+
+        packet = np.concatenate(
+            [
+                rel_pos[sample_idx],
+                rel_rot[sample_idx],
+            ],
+            axis=1,
+        )
+        return packet.astype(np.float32, copy=False)
+
+    def _send_rviz_traj(self) -> None:
+        if not self._rviz_traj_enabled or self._rviz_traj_sock is None:
+            return
+
+        packet = self._get_sampled_motion_obj_traj_for_rviz()
+        if packet is None:
+            return
+
+        try:
+            self._rviz_traj_sock.sendto(
+                packet.reshape(-1).astype(np.float32, copy=False).tobytes(),
+                self._rviz_traj_addr,
+            )
         except OSError:
             return
 
@@ -2779,7 +3095,6 @@ class WholeBodyTrackingPolicy(BasePolicy):
 
         # Do not touch main policy action history
         self.scaled_policy_action = full_action_config
-        self.current_observation = None
         return self.scaled_policy_action
 
     def rl_inference(self, robot_state_data):
@@ -2787,6 +3102,9 @@ class WholeBodyTrackingPolicy(BasePolicy):
         # prepare obs, run policy inference
         if self.stabilization_mode:
             scaled_action = self._stabilization_inference(robot_state_data)
+            current_obs_buffer_dict = self.get_current_obs_buffer_dict(robot_state_data)
+            current_obs_dict = self.parse_current_obs_dict(current_obs_buffer_dict)
+            self._send_mujoco_twin_state(robot_state_data, current_obs_dict)
             self.global_timestep += 1
             return scaled_action
         if not self.motion_clip_progressing and not self.stabilization_mode:
@@ -2852,13 +3170,49 @@ class WholeBodyTrackingPolicy(BasePolicy):
                         target_pos_config = target_pos_asset[reorder_map]  # [29] in config order
                 
                 target_pos_config = target_pos_config.reshape(1, -1)  # [1, num_dofs]
-                # Smooth interpolation to the configured start frame.
-                interp_ratio = min(self.rl_interp_count / self.rl_interp_steps, 1.0)
-                interpolated_pos = dof_pos + (target_pos_config - dof_pos) * interp_ratio
+
+                # Two-phase interpolation to avoid elbow collision:
+                # Phase 1: all joints except elbows move to target.
+                # Phase 2: elbows move to target after phase 1 is complete.
+                left_elbow_idx = self.dof_names.index("left_elbow_joint")
+                right_elbow_idx = self.dof_names.index("right_elbow_joint")
+                elbow_indices = [left_elbow_idx, right_elbow_idx]
+
+                # Capture elbow start position once at the very beginning (step 0).
+                # Use the last commanded position if available so the delta clamp in
+                # base.py doesn't fight a sensor-vs-command mismatch.
+                if self._elbow_interp_start_pos is None:
+                    if self._prev_cmd_q is not None:
+                        self._elbow_interp_start_pos = self._prev_cmd_q[elbow_indices].copy()
+                    else:
+                        self._elbow_interp_start_pos = dof_pos[0, elbow_indices].copy()
+
+                non_elbow_mask = np.ones(self.num_dofs, dtype=bool)
+                non_elbow_mask[elbow_indices] = False
+
+                interpolated_pos = dof_pos.copy()
+                if self.rl_interp_count < self.rl_interp_steps:
+                    # Phase 1: only non-elbow joints move; elbows stay at their captured start position
+                    ratio = (self.rl_interp_count + 1) / self.rl_interp_steps
+                    interpolated_pos[0, non_elbow_mask] = (
+                        dof_pos[0, non_elbow_mask]
+                        + (target_pos_config[0, non_elbow_mask] - dof_pos[0, non_elbow_mask]) * ratio
+                    )
+                    interpolated_pos[0, elbow_indices] = self._elbow_interp_start_pos
+                else:
+                    # Phase 2: non-elbow joints hold at target; elbows interpolate from their captured start
+                    ratio = (self.rl_interp_count - self.rl_interp_steps + 1) / self.rl_interp_steps
+                    ratio = min(ratio, 1.0)
+                    interpolated_pos[0, non_elbow_mask] = target_pos_config[0, non_elbow_mask]
+                    interpolated_pos[0, elbow_indices] = (
+                        self._elbow_interp_start_pos
+                        + (target_pos_config[0, elbow_indices] - self._elbow_interp_start_pos) * ratio
+                    )
+
                 self.rl_interp_count += 1
-                
-                # Log dof_pos when interpolation is complete (once)
-                if self.rl_interp_count >= self.rl_interp_steps and not self.interp_complete_dof_pos_logged:
+
+                # Log dof_pos when both phases are complete (once)
+                if self.rl_interp_count >= self.rl_interp_steps * 2 and not self.interp_complete_dof_pos_logged:
                     logger.info(colored("\n" + "="*80, "green", attrs=["bold"]))
                     logger.info(colored("🎯 Interpolation Complete! Current dof_pos (config order):", "green", attrs=["bold"]))
                     dof_pos_str = "[" + ", ".join(f"{v:.2f}" for v in dof_pos[0]) + "]"
@@ -2875,26 +3229,28 @@ class WholeBodyTrackingPolicy(BasePolicy):
                 
                 return self.scaled_policy_action
 
-        group_outputs = self._prepare_group_observations(robot_state_data)
+        current_obs_buffer_dict = self.get_current_obs_buffer_dict(robot_state_data)
+        current_obs_dict = self.parse_current_obs_dict(current_obs_buffer_dict)
+        group_outputs = self._update_obs_history(current_obs_dict)
 
-        # Collect motion log entry (obs + poses) once motion clip starts
-        if self.motion_clip_progressing:
-            self._collect_motion_log_step(robot_state_data, group_outputs)
+        # Collect motion log entry only during active motion playback (not stabilization).
+        if self.motion_clip_progressing and not self.stabilization_mode:
+            self._collect_motion_log_step(robot_state_data, current_obs_dict)
+
+        # Stream full state to live MuJoCo twin viewer (always, not just during playback).
+        self._send_mujoco_twin_state(robot_state_data, current_obs_dict)
 
         if "obs" in self.onnx_input_names:
             if "actor_obs" in group_outputs:
                 input_feed = {"obs": group_outputs["actor_obs"]}
-                self.current_observation = group_outputs["actor_obs"].copy()
             else:
                 concat_obs = np.concatenate(
                     [group_outputs[group] for group in self.obs_dict.keys() if group in group_outputs],
                     axis=1,
                 )
                 input_feed = {"obs": concat_obs}
-                self.current_observation = concat_obs.copy()
         else:
             input_feed = {name: group_outputs[name] for name in self.onnx_input_names}
-            self.current_observation = None
 
         raw_action_order = self.policy(input_feed)  # Raw action in action order
 
@@ -2986,16 +3342,6 @@ class WholeBodyTrackingPolicy(BasePolicy):
         self.global_timestep += 1
         # update motion timestep (only when motion is actually progressing, not stabilization)
         if self.motion_clip_progressing and not self.stabilization_mode:
-            # Log inference data (proprio_body, proprio_hand, policy_action)
-            self._log_inference_data(input_feed)
-            # Sim2real log: observation + scaled_policy_action
-            obs_arr = (
-                self.current_observation[0]
-                if self.current_observation is not None
-                else np.concatenate([v for v in input_feed.values()], axis=1)[0]
-            )
-            self._append_sim2real_log_step(obs_arr)
-            
             # Check if we've hit the safety limit
             if self.max_motion_length is not None and self.motion_timestep >= self.max_motion_length:
                 # Freeze at last action - don't increment timestep
@@ -3089,6 +3435,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
         # Don't start motion clip automatically - wait for 's' key
         self.motion_clip_progressing = False
         self.rl_interp_count = 0  # Reset interpolation counter
+        self._elbow_interp_start_pos = None
         self.interp_complete_dof_pos_logged = False  # Reset logging flag
         self._capture_robot_yaw_offset()
 
@@ -3131,6 +3478,12 @@ class WholeBodyTrackingPolicy(BasePolicy):
 
     def _handle_stop_policy(self):
         """Handle stop policy action with two-stage stop (soft stop -> stiff stop)."""
+        if self._record_traj_active:
+            self.logger.warning("Stopping active world-frame trajectory recording without saving.")
+            self._record_traj_active = False
+            self._recorded_traj_time_buffer = []
+            self._recorded_traj_pos_buffer = []
+            self._recorded_traj_rot_buffer = []
         
         # First stop press: soft stop (hold current position with stabilization policy)
         if not self._soft_stop_active:
@@ -3153,7 +3506,12 @@ class WholeBodyTrackingPolicy(BasePolicy):
             self.motion_clip_progressing = False
             self._reset_motion_timing()
             self.robot_yaw_offset = 0.0
-            
+            # Reset table tracking so the next motion run starts fresh
+            self._table_removed = False
+            self._initial_object_height = None
+            self._last_sent_table_frame = None
+            self._table_removal_grace_steps = 0
+
             self.logger.info(colored("🟡 Soft stop activated - holding current position with stabilization policy", "yellow", attrs=["bold"]))
             self.logger.info(colored("   Press 'o' again to enter stiff mode", "yellow"))
             
@@ -3173,20 +3531,16 @@ class WholeBodyTrackingPolicy(BasePolicy):
             self.motion_clip_progressing = False
             self._reset_motion_timing()
             self.robot_yaw_offset = 0.0
-            
+            # Reset table tracking so the next run starts fresh
+            self._table_removed = False
+            self._initial_object_height = None
+            self._last_sent_table_frame = None
+            self._table_removal_grace_steps = 0
+
             self.logger.info(colored("🔴 Stiff mode activated", "red", attrs=["bold"]))
             
             if hasattr(self.interface, "no_action"):
                 self.interface.no_action = 0
-            
-            # Save logs only on stiff mode (second stop)
-            if self.npz_log_data is not None and len(self.npz_log_data.get("global_timestep", [])) > 0:
-                self._save_npz_log()
-                logger.info(colored("✓ NPZ file saved on policy stop", "green", attrs=["bold"]))
-            
-            if self.inference_log_data is not None and len(self.inference_log_data.get("proprio_body", [])) > 0:
-                self._save_inference_log()
-                logger.info(colored("✓ Inference log saved on policy stop", "cyan", attrs=["bold"]))
             
             if self.debug_log_data is not None and len(self.debug_log_data.get("dof_pos", [])) > 0:
                 self._save_debug_log()
@@ -3211,9 +3565,46 @@ class WholeBodyTrackingPolicy(BasePolicy):
         )
         self.logger.info(colored("    Robot will stabilize and touch ground. Press 's' when ready to start motion.", "yellow"))
 
+    def _initialize_robot_to_motion_frame(self) -> None:
+        """Initialize robot joint angles and velocities to the configured motion start frame.
+        
+        This ensures the robot starts at the exact pose from the motion clip at motion_start_timestep,
+        allowing smooth motion playback without interpolation artifacts.
+        """
+        if self.motion_data is None or self.motion_dof_pos is None:
+            self.logger.debug("Cannot initialize robot to motion frame: no motion data")
+            return
+        
+        start_frame_idx = self._get_motion_start_frame_index()
+        if start_frame_idx < 0 or start_frame_idx >= self.motion_length:
+            self.logger.warning(f"Start frame index {start_frame_idx} out of range [0, {self.motion_length})")
+            return
+        
+        # Get target pose from motion
+        target_pos_config = self._get_target_pos_config_first_frame()
+        if target_pos_config is None:
+            self.logger.warning("Cannot get target position from motion frame")
+            return
+        
+        # Initialize interpolation counter to trigger smooth interpolation to start frame
+        self.rl_interp_count = 0
+        self.interp_complete_dof_pos_logged = False
+        
+        self.logger.info(
+            colored(
+                f"🎯 Initializing robot to motion frame {start_frame_idx}: "
+                f"target_pos={target_pos_config[0, :5].tolist()}... (first 5 joints)",
+                "green",
+                attrs=["bold"],
+            )
+        )
+
     def _handle_start_motion_clip(self):
         """Handle start motion clip action."""
         self._stiff_startup_active = False
+        if self._record_traj_active:
+            self.logger.warning("Finish trajectory recording first before starting the motion clip.")
+            return
         # Snapshot world poses at motion-start trigger ('s' first press).
         self._log_robot_object_pose_snapshot("s:start_motion")
         # Initialize pkl log for this motion clip
@@ -3237,6 +3628,9 @@ class WholeBodyTrackingPolicy(BasePolicy):
                 self.motion_obj_rot = quat_seq_wxyz.astype(np.float32, copy=False)
                 self.motion_obj_pos_aligned = self.motion_obj_pos.copy()
                 self.motion_obj_rot_aligned_wxyz = self.motion_obj_rot.copy()
+                # gen_traj is already in world frame
+                self._motion_obj_pos_world = self.motion_obj_pos.copy()
+                self._motion_obj_rot_world_wxyz = self.motion_obj_rot.copy()
 
                 self.motion_fps = self.config.task.rl_rate
                 self.motion_length = int(self.motion_obj_pos.shape[0])
@@ -3245,17 +3639,34 @@ class WholeBodyTrackingPolicy(BasePolicy):
                 logger.info(
                     colored(
                         f"Gen traj enabled: length={self.motion_length} frames "
-                        f"({self.motion_length/self.motion_fps:.2f}s), height=0.2m",
+                        f"({self.motion_length/self.motion_fps:.2f}s), mode={self._traj_gen.mode}",
                         "cyan",
                     )
                 )
             else:
                 logger.warning("Gen traj requested but object pose not available; keeping original motion object traj.")
+        elif self.record_traj and self._recorded_obj_pos_w is None:
+            logger.warning("record_traj is enabled but no recorded world-frame trajectory is available; using clip object trajectory.")
+        self._send_rviz_traj()
         self.clock_sub.reset_origin()
         self.motion_clip_progressing = True
+        # Initialize robot to the motion start frame pose
+        self._initialize_robot_to_motion_frame()
         # Capture motion-specific start timestep for policy-level timing control
         self._reset_motion_timing()
+        # Reset table tracking so each motion run starts with a fresh baseline.
+        # Without this, a previous run's _table_removed=True would prevent
+        # _update_table_pose_from_motion from ever sending table commands, and a
+        # stale _initial_object_height would cause incorrect height-delta checks.
+        self._table_removed = False
+        self._initial_object_height = None
         self._last_sent_table_frame = None
+        # Grace period: let the table settle at its motion-clip position before
+        # monitoring object height.  Without this, _update_table_pose_from_motion
+        # repositions the table on the first few ticks, causing the object to
+        # bounce, which exceeds the 0.03 m threshold and triggers premature
+        # table removal.
+        self._table_removal_grace_steps = int(self.rl_rate * 2)  # 2 seconds
         # Seed main policy history buffers with the current observation for smooth transition
         robot_state_data = (
             self.interface.get_full_state_43dof() if self.num_dofs == 43 else self.interface.get_low_state()
@@ -3343,6 +3754,8 @@ class WholeBodyTrackingPolicy(BasePolicy):
         elif keycode == "d":
             # Start stabilization mode - policy runs with first motion frame
             self._handle_start_stabilization()
+        elif keycode == "t":
+            self._toggle_record_traj()
         elif keycode == "s":
             # 's' behavior:
             # - If motion not started yet: start motion clip
@@ -3384,7 +3797,9 @@ class WholeBodyTrackingPolicy(BasePolicy):
 
     def handle_joystick_button(self, cur_key):
         """Handle joystick button presses for WBT-specific controls."""
-        if cur_key == "X":
+        if cur_key == "Y" and self.record_traj:
+            self._toggle_record_traj()
+        elif cur_key == "X":
             # Start stabilization mode
             self._handle_start_stabilization()
         elif cur_key == "start":

@@ -19,7 +19,9 @@ Usage:
 """
 
 import argparse
+from datetime import datetime
 from pathlib import Path
+import xml.etree.ElementTree as ET
 
 import joblib
 import mujoco
@@ -33,6 +35,11 @@ from g1_robot_common import (
     BODY_JOINT_NAMES, HAND_JOINT_NAMES,
     name_indices, mj_hinge_addrs, mj_actuator_ids, apply_pd_control,
     quat_rotate_inverse, SimpleVideoRecorder, run_mujoco_loop,
+)
+from virtual_gantry_notebook import (
+    DEFAULT_NOTEBOOK_GANTRY_CFG,
+    create_mujoco_virtual_gantry,
+    reset_robot_state_on_gantry,
 )
 
 # Precomputed index maps (config order → body/hand subsets)
@@ -214,6 +221,228 @@ def load_motion_clip(pkl_path: str, clip_key: str | None = None) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Lift trajectory + reference-speed resampling helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _build_lift_traj(
+    start_pos: np.ndarray,
+    start_quat_wxyz: np.ndarray,
+    policy_hz: float,
+    hold_time_s: float = 4.0,
+    lift_height_m: float = 0.5,
+    lift_speed_mps: float = 0.4,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Hold at start pose for hold_time_s, then lift up by lift_height_m, then back down.
+
+    Trajectory is sampled at policy_hz so that one frame = one policy step.
+    Returns (pos [T,3], quat_wxyz [T,4]).
+    """
+    start_pos       = np.asarray(start_pos,       dtype=np.float32).reshape(3)
+    start_quat_wxyz = np.asarray(start_quat_wxyz, dtype=np.float32).reshape(4)
+
+    n_hold = max(1, int(round(hold_time_s * policy_hz)))
+    n_lift = max(1, int(round((lift_height_m / lift_speed_mps) * policy_hz)))
+
+    z_hold = np.zeros(n_hold, dtype=np.float32)
+    z_up   = np.linspace(0.0, lift_height_m, n_lift + 1, dtype=np.float32)[1:]
+    z_down = np.linspace(lift_height_m, 0.0, n_lift + 1, dtype=np.float32)[1:]
+    z      = np.concatenate([z_hold, z_up, z_down])   # [T]
+
+    pos  = np.tile(start_pos,       (z.shape[0], 1))  # [T, 3]
+    quat = np.tile(start_quat_wxyz, (z.shape[0], 1))  # [T, 4]
+    pos[:, 2] = start_pos[2] + z
+    return pos, quat
+
+
+def _build_stay_traj(
+    start_pos: np.ndarray,
+    start_quat_wxyz: np.ndarray,
+    policy_hz: float,
+    stay_time_s: float = 10.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Stay at start pose for stay_time_s (object command is fixed at initial position).
+
+    Trajectory is sampled at policy_hz so that one frame = one policy step.
+    Returns (pos [T,3], quat_wxyz [T,4]).
+    """
+    start_pos       = np.asarray(start_pos,       dtype=np.float32).reshape(3)
+    start_quat_wxyz = np.asarray(start_quat_wxyz, dtype=np.float32).reshape(4)
+
+    n_stay = max(1, int(round(stay_time_s * policy_hz)))
+    pos  = np.tile(start_pos,       (n_stay, 1))  # [T, 3]
+    quat = np.tile(start_quat_wxyz, (n_stay, 1))  # [T, 4]
+    return pos, quat
+
+
+def _make_virtual_xml(
+    xml_path: str,
+    virtual_object: bool = True,
+    virtual_table: bool = False,
+) -> str:
+    """Read XML and return a modified string with virtual (kinematic) bodies.
+
+    virtual_object: remove object freejoint and disable object geom collision.
+    virtual_table:  disable table geom collision (table has no freejoint).
+
+    The meshdir compiler attribute is converted to an absolute path so that
+    from_xml_string() can resolve mesh files correctly.
+    """
+    xml_path = str(xml_path)
+    xml_dir  = str(Path(xml_path).parent)
+
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+
+    # Make meshdir absolute so mesh files resolve when loading from string
+    for compiler in root.iter("compiler"):
+        meshdir = compiler.get("meshdir")
+        if meshdir is not None and not Path(meshdir).is_absolute():
+            compiler.set("meshdir", str((Path(xml_dir) / meshdir).resolve()))
+
+    for body in root.iter("body"):
+        name = body.get("name")
+        if virtual_object and name == "object":
+            # Remove freejoint so object is welded to worldbody
+            for fj in body.findall("freejoint"):
+                body.remove(fj)
+            # Disable collision on all geoms
+            for geom in body.findall("geom"):
+                geom.set("contype", "0")
+                geom.set("conaffinity", "0")
+        elif virtual_table and name == "table":
+            # Disable collision on all geoms (table has no freejoint)
+            for geom in body.findall("geom"):
+                geom.set("contype", "0")
+                geom.set("conaffinity", "0")
+
+    return ET.tostring(root, encoding="unicode")
+
+
+def _resample_motion(motion: dict, speed: float) -> dict:
+    """Resample motion arrays to play at `speed` × the original rate (linear interp).
+
+    speed > 1 → fewer frames (faster);  speed < 1 → more frames (slower).
+    Quaternion arrays are renormalized after interpolation.
+    """
+    old_len = motion["motion_length"]
+    new_len = max(1, int(round(old_len / speed)))
+    old_t   = np.linspace(0.0, 1.0, old_len)
+    new_t   = np.linspace(0.0, 1.0, new_len)
+
+    def _interp(arr: np.ndarray) -> np.ndarray:   # [T, D] → [T', D]
+        return np.stack(
+            [np.interp(new_t, old_t, arr[:, d]) for d in range(arr.shape[1])],
+            axis=1,
+        ).astype(np.float32)
+
+    def _interp_quat(arr: np.ndarray) -> np.ndarray:
+        out   = _interp(arr)
+        norms = np.linalg.norm(out, axis=1, keepdims=True)
+        return (out / np.maximum(norms, 1e-8)).astype(np.float32)
+
+    m = dict(motion)
+    m["dof_pos"]       = _interp(motion["dof_pos"])
+    m["obj_pos"]       = _interp(motion["obj_pos"])
+    m["obj_rot"]       = _interp_quat(motion["obj_rot"])
+    m["root_pos_all"]  = _interp(motion["root_pos_all"])
+    m["root_quat_all"] = _interp_quat(motion["root_quat_all"])
+    m["motion_length"] = new_len
+    return m
+
+
+def _record_joint_action_sample(
+    joint_action_plot_data: dict | None,
+    raw_action: np.ndarray,
+    processed_action: np.ndarray,
+) -> None:
+    """Append one OTT policy action sample for later plotting/logging."""
+    if joint_action_plot_data is None:
+        return
+    joint_action_plot_data["raw"].append(np.asarray(raw_action, dtype=np.float32).copy())
+    joint_action_plot_data["processed"].append(np.asarray(processed_action, dtype=np.float32).copy())
+
+
+def _save_joint_action_artifacts(
+    root: Path,
+    joint_action_plot_data: dict | None,
+    policy_hz: float,
+    clip_key: str | None = None,
+) -> None:
+    """Save per-joint OTT action plots and logs under test_log/."""
+    if joint_action_plot_data is None:
+        return
+    if not joint_action_plot_data["raw"]:
+        print("\n  [Joint Action] No OTT policy action samples were collected. Skipping save.")
+        return
+
+    raw = np.asarray(joint_action_plot_data["raw"], dtype=np.float32)
+    processed = np.asarray(joint_action_plot_data["processed"], dtype=np.float32)
+
+    log_dir = root / "test_log"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    npz_path = log_dir / f"ott_joint_actions_{timestamp}.npz"
+    latest_npz_path = log_dir / "ott_joint_actions_latest.npz"
+
+    payload = {
+        "raw": raw,
+        "processed": processed,
+        "joint_names": np.asarray(ACTION_ORDER_43DOF),
+        "policy_hz": np.asarray(policy_hz, dtype=np.float32),
+        "clip_key": np.asarray("" if clip_key is None else clip_key),
+        "created_at": np.asarray(datetime.now().isoformat()),
+    }
+    np.savez_compressed(npz_path, **payload)
+    np.savez_compressed(latest_npz_path, **payload)
+    print(f"\n  [Joint Action] Saved joint action log to {npz_path}")
+    print(f"  [Joint Action] Updated latest joint action log at {latest_npz_path}")
+
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        print(f"  [Joint Action] Failed to import matplotlib: {exc}")
+        return
+
+    time_axis = np.arange(raw.shape[0], dtype=np.float32) / float(policy_hz)
+    num_cols = 4
+    num_rows = int(np.ceil(len(ACTION_ORDER_43DOF) / num_cols))
+    fig, axes = plt.subplots(num_rows, num_cols, figsize=(20, 2.8 * num_rows), sharex=True)
+    axes = np.atleast_1d(axes).reshape(-1)
+
+    for joint_idx, joint_name in enumerate(ACTION_ORDER_43DOF):
+        ax = axes[joint_idx]
+        ax.plot(time_axis, raw[:, joint_idx], label="raw", linewidth=1.1, alpha=0.85)
+        ax.plot(time_axis, processed[:, joint_idx], label="processed", linewidth=1.3)
+        ax.set_title(joint_name, fontsize=9)
+        ax.grid(True, alpha=0.3)
+        if joint_idx % num_cols == 0:
+            ax.set_ylabel("rad")
+
+    for ax in axes[len(ACTION_ORDER_43DOF):]:
+        ax.axis("off")
+
+    for ax in axes[-num_cols:]:
+        if ax.has_data():
+            ax.set_xlabel("time [s]")
+
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper right")
+    fig.suptitle("OTT joint actions: raw vs processed")
+    fig.tight_layout(rect=(0, 0, 0.97, 0.98))
+
+    plot_path = log_dir / f"ott_joint_actions_{timestamp}.png"
+    latest_plot_path = log_dir / "ott_joint_actions_latest.png"
+    fig.savefig(plot_path, dpi=180)
+    fig.savefig(latest_plot_path, dpi=180)
+    plt.close(fig)
+    print(f"  [Joint Action] Saved joint action plot to {plot_path}")
+    print(f"  [Joint Action] Updated latest joint action plot at {latest_plot_path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Scene helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -257,6 +486,63 @@ def set_freejoint_pose(
     """Set freejoint pose (pos + wxyz quaternion) in data.qpos."""
     data.qpos[qpos_addr:qpos_addr + 3] = pos
     data.qpos[qpos_addr + 3:qpos_addr + 7] = quat_wxyz   # MuJoCo: wxyz
+
+
+def _finite_diff_at(arr: np.ndarray, t: int, dt: float) -> np.ndarray:
+    """Finite-difference sample at index t using forward/backward/central diff."""
+    arr = np.asarray(arr, dtype=np.float32)
+    if arr.shape[0] <= 1:
+        return np.zeros(arr.shape[1:], dtype=np.float32)
+    if t <= 0:
+        return ((arr[1] - arr[0]) / dt).astype(np.float32)
+    if t >= arr.shape[0] - 1:
+        return ((arr[-1] - arr[-2]) / dt).astype(np.float32)
+    return ((arr[t + 1] - arr[t - 1]) / (2.0 * dt)).astype(np.float32)
+
+
+def _quat_conjugate(q_wxyz: np.ndarray) -> np.ndarray:
+    q = np.asarray(q_wxyz, dtype=np.float32).copy()
+    q[1:] *= -1.0
+    return q
+
+
+def _quat_multiply(q1_wxyz: np.ndarray, q2_wxyz: np.ndarray) -> np.ndarray:
+    w1, x1, y1, z1 = np.asarray(q1_wxyz, dtype=np.float32)
+    w2, x2, y2, z2 = np.asarray(q2_wxyz, dtype=np.float32)
+    return np.array([
+        w1*w2 - x1*x2 - y1*y2 - z1*z2,
+        w1*x2 + x1*w2 + y1*z2 - z1*y2,
+        w1*y2 - x1*z2 + y1*w2 + z1*x2,
+        w1*z2 + x1*y2 - y1*x2 + z1*w2,
+    ], dtype=np.float32)
+
+
+def _quat_to_angvel(prev_q_wxyz: np.ndarray, next_q_wxyz: np.ndarray, dt: float) -> np.ndarray:
+    """Approximate angular velocity from two quaternions in world frame."""
+    prev_q = np.asarray(prev_q_wxyz, dtype=np.float32)
+    next_q = np.asarray(next_q_wxyz, dtype=np.float32)
+    dq = _quat_multiply(next_q, _quat_conjugate(prev_q))
+    dq /= max(float(np.linalg.norm(dq)), 1e-8)
+    if dq[0] < 0.0:
+        dq = -dq
+    vec = dq[1:]
+    sin_half = float(np.linalg.norm(vec))
+    if sin_half < 1e-8:
+        return np.zeros(3, dtype=np.float32)
+    axis = vec / sin_half
+    angle = 2.0 * np.arctan2(sin_half, float(np.clip(dq[0], -1.0, 1.0)))
+    return (axis * (angle / dt)).astype(np.float32)
+
+
+def _quat_angvel_at(quat_seq_wxyz: np.ndarray, t: int, dt: float) -> np.ndarray:
+    quat_seq_wxyz = np.asarray(quat_seq_wxyz, dtype=np.float32)
+    if quat_seq_wxyz.shape[0] <= 1:
+        return np.zeros(3, dtype=np.float32)
+    if t <= 0:
+        return _quat_to_angvel(quat_seq_wxyz[0], quat_seq_wxyz[1], dt)
+    if t >= quat_seq_wxyz.shape[0] - 1:
+        return _quat_to_angvel(quat_seq_wxyz[-2], quat_seq_wxyz[-1], dt)
+    return _quat_to_angvel(quat_seq_wxyz[t - 1], quat_seq_wxyz[t + 1], 2.0 * dt)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -545,10 +831,12 @@ def build_ott_obs(
     motion_timestep: int,
     obs_buf: OTTObsBuffer,
     obj_bps: np.ndarray,
-    obj_pos_seq: np.ndarray | None = None,       # (10, 3) world-frame short-horizon, overrides motion["obj_pos"]
-    obj_rot_seq: np.ndarray | None = None,       # (10, 4) wxyz short-horizon
-    obj_pos_seq_long: np.ndarray | None = None,  # (5, 3) world-frame long-horizon
-    obj_rot_seq_long: np.ndarray | None = None,  # (5, 4) wxyz long-horizon
+    obj_pos_seq: np.ndarray | None = None,              # (10, 3) world-frame short-horizon, overrides motion["obj_pos"]
+    obj_rot_seq: np.ndarray | None = None,              # (10, 4) wxyz short-horizon
+    obj_pos_seq_long: np.ndarray | None = None,         # (5, 3) world-frame long-horizon
+    obj_rot_seq_long: np.ndarray | None = None,         # (5, 4) wxyz long-horizon
+    obj_world_pos_override: np.ndarray | None = None,   # (3,) override object world pos (virtual mode)
+    obj_world_quat_override: np.ndarray | None = None,  # (4,) override object world quat wxyz (virtual mode)
 ) -> np.ndarray:
     """Build the OTT policy observation vector.
 
@@ -585,8 +873,12 @@ def build_ott_obs(
     proj_grav = quat_rotate_inverse(base_quat, np.array([0.0, 0.0, -1.0], dtype=np.float32))
 
     # ── Object state ───────────────────────────────────────────────────────
-    obj_pos_world  = data.qpos[obj_qpos_addr:obj_qpos_addr + 3].astype(np.float32)
-    obj_quat_world = data.qpos[obj_qpos_addr + 3:obj_qpos_addr + 7].astype(np.float32)  # wxyz
+    if obj_world_pos_override is not None and obj_world_quat_override is not None:
+        obj_pos_world  = np.asarray(obj_world_pos_override,  dtype=np.float32).reshape(3)
+        obj_quat_world = np.asarray(obj_world_quat_override, dtype=np.float32).reshape(4)
+    else:
+        obj_pos_world  = data.qpos[obj_qpos_addr:obj_qpos_addr + 3].astype(np.float32)
+        obj_quat_world = data.qpos[obj_qpos_addr + 3:obj_qpos_addr + 7].astype(np.float32)  # wxyz
 
     cur_obj_pos    = obj_pos_rel_heading(obj_pos_world, torso_pos, hquat)
     cur_obj_rot_6d = obj_rot_rel_heading(obj_quat_world, hquat)
@@ -761,10 +1053,101 @@ def run(args):
     root = Path(__file__).parent
     pkl_path = args.pkl
 
+    if args.lift and args.stay:
+        raise ValueError("--lift and --stay are mutually exclusive.")
+
     # ── Load motion clip ───────────────────────────────────────────────────
     motion        = load_motion_clip(pkl_path, args.clip_key)
     motion_fps    = motion["motion_fps"]
     motion_length = motion["motion_length"]
+
+    # ── Reference-speed resampling ─────────────────────────────────────────
+    if args.reference_speed != 1.0:
+        old_len = motion_length
+        motion  = _resample_motion(motion, args.reference_speed)
+        motion_fps    = motion["motion_fps"]
+        motion_length = motion["motion_length"]
+        print(
+            f"Reference speed {args.reference_speed:.3g}×: "
+            f"{old_len} → {motion_length} frames "
+            f"({motion_length / motion_fps:.2f}s)"
+        )
+
+    # ── Lift trajectory (replaces obj_pos/obj_rot with generated lift cmd) ─
+    if args.lift:
+        _lift_t    = min(int(getattr(args, "init_timestep", 0)), motion["obj_pos"].shape[0] - 1)
+        lift_pos, lift_quat = _build_lift_traj(
+            motion["obj_pos"][_lift_t],
+            motion["obj_rot"][_lift_t],
+            policy_hz=float(args.policy_hz),
+        )
+        new_len = lift_pos.shape[0]
+        motion  = dict(motion)
+        motion["obj_pos"]       = lift_pos
+        motion["obj_rot"]       = lift_quat
+        # Pad dof_pos / root arrays if shorter than new trajectory
+        # (needed so stabilization index arithmetic stays in-bounds)
+        for key in ("dof_pos",):
+            arr = motion[key]
+            if arr.shape[0] < new_len:
+                pad = new_len - arr.shape[0]
+                motion[key] = np.concatenate(
+                    [arr, np.tile(arr[-1:], (pad, 1))], axis=0
+                )
+        for key in ("root_pos_all", "root_quat_all"):
+            arr = motion[key]
+            if arr.shape[0] < new_len:
+                pad = new_len - arr.shape[0]
+                motion[key] = np.concatenate(
+                    [arr, np.tile(arr[-1:], (pad, 1))], axis=0
+                )
+        motion["motion_length"] = new_len
+        # Sample at policy_hz so one frame = one policy step
+        motion["motion_fps"]    = float(args.policy_hz)
+        motion_fps    = float(args.policy_hz)
+        motion_length = new_len
+        hold_s = 4.0
+        print(
+            f"Lift trajectory: {new_len} frames "
+            f"({new_len / motion_fps:.2f}s @ {motion_fps:.0f}Hz, "
+            f"hold={hold_s:.1f}s then lift 0.5m)"
+        )
+
+    # ── Stay trajectory (replaces obj_pos/obj_rot with fixed-position cmd) ─
+    if args.stay:
+        _stay_t = min(int(getattr(args, "init_timestep", 0)), motion["obj_pos"].shape[0] - 1)
+        stay_pos, stay_quat = _build_stay_traj(
+            motion["obj_pos"][_stay_t],
+            motion["obj_rot"][_stay_t],
+            policy_hz=float(args.policy_hz),
+        )
+        new_len = stay_pos.shape[0]
+        motion  = dict(motion)
+        motion["obj_pos"]       = stay_pos
+        motion["obj_rot"]       = stay_quat
+        for key in ("dof_pos",):
+            arr = motion[key]
+            if arr.shape[0] < new_len:
+                pad = new_len - arr.shape[0]
+                motion[key] = np.concatenate(
+                    [arr, np.tile(arr[-1:], (pad, 1))], axis=0
+                )
+        for key in ("root_pos_all", "root_quat_all"):
+            arr = motion[key]
+            if arr.shape[0] < new_len:
+                pad = new_len - arr.shape[0]
+                motion[key] = np.concatenate(
+                    [arr, np.tile(arr[-1:], (pad, 1))], axis=0
+                )
+        motion["motion_length"] = new_len
+        motion["motion_fps"]    = float(args.policy_hz)
+        motion_fps    = float(args.policy_hz)
+        motion_length = new_len
+        print(
+            f"Stay trajectory: {new_len} frames "
+            f"({new_len / motion_fps:.2f}s @ {motion_fps:.0f}Hz, "
+            f"object fixed at init pose)"
+        )
 
     # ── Resolve XML from obj_name ──────────────────────────────────────────
     xml_dir  = root / "src/holosoma/holosoma/data/robots/g1/g1_object"
@@ -792,7 +1175,21 @@ def run(args):
     obs_dim = int(inp.shape[-1]) if inp.shape and inp.shape[-1] is not None else 1
 
     # ── Load MuJoCo model ──────────────────────────────────────────────────
-    model = mujoco.MjModel.from_xml_path(xml_path)
+    if args.virtual or args.virtual_table:
+        virtual_xml_str = _make_virtual_xml(
+            xml_path,
+            virtual_object=args.virtual,
+            virtual_table=args.virtual_table,
+        )
+        model = mujoco.MjModel.from_xml_string(virtual_xml_str, assets=None)
+        parts = []
+        if args.virtual:
+            parts.append("object freejoint removed + collision disabled")
+        if args.virtual_table:
+            parts.append("table collision disabled")
+        print(f"Virtual mode: {', '.join(parts)}.")
+    else:
+        model = mujoco.MjModel.from_xml_path(xml_path)
     data  = mujoco.MjData(model)
     model.opt.timestep = 1.0 / args.sim_hz
     sim_dt           = float(model.opt.timestep)
@@ -803,22 +1200,50 @@ def run(args):
 
     dof_qpos_addrs, dof_qvel_addrs = mj_hinge_addrs(model, DOF_NAMES)
     actuator_ids    = mj_actuator_ids(model, DOF_NAMES)
-    obj_qpos_addr   = get_freejoint_qpos_addr(model, "object")
     robot_qpos_addr = get_freejoint_qpos_addr(model, "pelvis")   # robot root body
-    obj_qvel_addr   = get_freejoint_qvel_addr(model, "object")
     robot_qvel_addr = get_freejoint_qvel_addr(model, "pelvis")
     torso_body_id   = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
     if torso_body_id < 0:
         raise KeyError("Body 'torso_link' not found in model.")
     obj_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "object")
     obj_mass = model.body_mass[obj_body_id] if obj_body_id >= 0 else float("nan")
+
+    # In virtual mode the freejoint is removed; object pose is controlled via model.body_pos/quat.
+    if args.virtual:
+        obj_qpos_addr = -1
+        obj_qvel_addr = -1
+    else:
+        obj_qpos_addr = get_freejoint_qpos_addr(model, "object")
+        obj_qvel_addr = get_freejoint_qvel_addr(model, "object")
+
     print(f"  Robot freejoint qpos addr : {robot_qpos_addr}")
-    print(f"  Object freejoint qpos addr: {obj_qpos_addr}")
+    print(f"  Object freejoint qpos addr: {obj_qpos_addr} {'(virtual — welded)' if args.virtual else ''}")
     print(f"  Torso body id             : {torso_body_id}")
     print(f"  Object mass               : {obj_mass:.4f} kg")
 
     # Action index map: ACTION_ORDER_43DOF → DOF_NAMES (config order)
     act_idx = name_indices(ACTION_ORDER_43DOF, DOF_NAMES)
+
+    # ── Virtual gantry ────────────────────────────────────────────────────
+    # Force is applied at torso_link origin + z+0.28 (local frame), which corresponds
+    # to roughly the harness attachment point used in real-world gantry experiments.
+    _GANTRY_BODY_NAME    = "torso_link"
+    _GANTRY_LOCAL_OFFSET = np.array([0.0, 0.0, 0.28], dtype=np.float64)
+    gantry = None
+    if args.gantry:
+        import dataclasses as _dc
+        _gantry_cfg = _dc.replace(DEFAULT_NOTEBOOK_GANTRY_CFG, length=float(args.gantry_length))
+        _, gantry = create_mujoco_virtual_gantry(
+            model, data,
+            cfg=_gantry_cfg,
+            attachment_body_name=_GANTRY_BODY_NAME,
+            force_local_offset=_GANTRY_LOCAL_OFFSET,
+        )
+        print(
+            f"Virtual gantry enabled: body='{_GANTRY_BODY_NAME}' "
+            f"offset={_GANTRY_LOCAL_OFFSET.tolist()} (local) "
+            f"length={_gantry_cfg.length:.2f}m  height={_gantry_cfg.height:.2f}m."
+        )
 
     # ── Optional stabilization resources (same policy+obs as wbt_mw) ─────
     stabilize_duration = float(getattr(args, "stabilize_sec", 0.0))
@@ -1100,6 +1525,69 @@ def run(args):
         q[motion["config_idx"]] = motion["dof_pos"][t]
         return q
 
+    motion_dt = 1.0 / float(motion_fps)
+
+    def _motion_state_at(t: int) -> dict:
+        root_pos = motion["root_pos_all"][t].astype(np.float32).copy()
+        root_quat = motion["root_quat_all"][t].astype(np.float32).copy()
+        joint_pos = _init_q_at(t).astype(np.float32).copy()
+        joint_vel = np.zeros(len(DOF_NAMES), dtype=np.float32)
+        joint_vel[motion["config_idx"]] = _finite_diff_at(motion["dof_pos"], t, motion_dt)
+        state = {
+            "root_pos": root_pos,
+            "root_quat": root_quat,
+            "root_lin_vel": _finite_diff_at(motion["root_pos_all"], t, motion_dt),
+            "root_ang_vel": _quat_angvel_at(motion["root_quat_all"], t, motion_dt),
+            "joint_pos": joint_pos,
+            "joint_vel": joint_vel,
+        }
+        if not args.virtual:
+            state["obj_pos"] = motion["obj_pos"][t].astype(np.float32).copy()
+            state["obj_quat"] = motion["obj_rot"][t].astype(np.float32).copy()
+            state["obj_lin_vel"] = _finite_diff_at(motion["obj_pos"], t, motion_dt)
+            state["obj_ang_vel"] = _quat_angvel_at(motion["obj_rot"], t, motion_dt)
+        return state
+
+    def _apply_motion_state_to_scene(t: int) -> None:
+        state = _motion_state_at(t)
+        set_table_pose(model, motion["table_pos"], motion["table_rot"])
+
+        if args.virtual:
+            model.body_pos[obj_body_id] = motion["obj_pos"][t].astype(np.float64)
+            model.body_quat[obj_body_id] = motion["obj_rot"][t].astype(np.float64)
+        else:
+            set_freejoint_pose(data, obj_qpos_addr, state["obj_pos"], state["obj_quat"])
+            data.qvel[obj_qvel_addr:obj_qvel_addr + 3] = state["obj_lin_vel"]
+            data.qvel[obj_qvel_addr + 3:obj_qvel_addr + 6] = state["obj_ang_vel"]
+
+        if gantry is not None:
+            reset_robot_state_on_gantry(
+                model, data, dof_qpos_addrs, dof_qvel_addrs,
+                root_qpos_addr=robot_qpos_addr,
+                root_qvel_addr=robot_qvel_addr,
+                joint_pos=state["joint_pos"],
+                joint_vel=state["joint_vel"],
+                root_quat_wxyz=state["root_quat"],
+                root_height=float(state["root_pos"][2]),
+                root_xy=(float(state["root_pos"][0]), float(state["root_pos"][1])),
+                root_lin_vel=state["root_lin_vel"],
+                root_ang_vel=state["root_ang_vel"],
+                gantry=gantry,
+            )
+            if not args.virtual:
+                data.qvel[obj_qvel_addr:obj_qvel_addr + 3] = state["obj_lin_vel"]
+                data.qvel[obj_qvel_addr + 3:obj_qvel_addr + 6] = state["obj_ang_vel"]
+                mujoco.mj_forward(model, data)
+            gantry.point[2] = float(state["root_pos"][2]) + 1.5
+        else:
+            data.qpos[robot_qpos_addr:robot_qpos_addr + 3] = state["root_pos"]
+            data.qpos[robot_qpos_addr + 3:robot_qpos_addr + 7] = state["root_quat"]
+            data.qpos[dof_qpos_addrs] = state["joint_pos"]
+            data.qvel[robot_qvel_addr:robot_qvel_addr + 3] = state["root_lin_vel"]
+            data.qvel[robot_qvel_addr + 3:robot_qvel_addr + 6] = state["root_ang_vel"]
+            data.qvel[dof_qvel_addrs] = state["joint_vel"]
+            mujoco.mj_forward(model, data)
+
     # ── Initialize scene ───────────────────────────────────────────────────
     use_debug_init = debug_entries is not None and len(debug_entries) > 0
     if use_debug_init:
@@ -1120,14 +1608,8 @@ def run(args):
         )
         print(f"Scene initialized from --debug-file entry {_init_entry_idx}.")
     else:
-        # Initialize from motion clip at frame init_t
-        set_table_pose(model, motion["table_pos"], motion["table_rot"])
-        data.qpos[robot_qpos_addr:robot_qpos_addr + 3] = motion["root_pos_all"][init_t]
-        data.qpos[robot_qpos_addr + 3:robot_qpos_addr + 7] = motion["root_quat_all"][init_t]
-        data.qpos[dof_qpos_addrs] = _init_q_at(init_t)
         data.qvel[:] = 0.0
-        set_freejoint_pose(data, obj_qpos_addr, motion["obj_pos"][init_t], motion["obj_rot"][init_t])
-        mujoco.mj_forward(model, data)
+        _apply_motion_state_to_scene(init_t)
         print(f"Scene initialized from motion clip frame {init_t}.")
 
     if args.save_debug_stabilie_file:
@@ -1155,6 +1637,9 @@ def run(args):
             mt_dbg = _extract_debug_motion_timestep(entry0, entry0["robot_state"])
             if mt_dbg is not None:
                 mt_for_boot = mt_dbg
+        _boot_vt = min(mt_for_boot, motion_length - 1)
+        _boot_obj_pos  = motion["obj_pos"][_boot_vt].astype(np.float32) if args.virtual else None
+        _boot_obj_quat = motion["obj_rot"][_boot_vt].astype(np.float32) if args.virtual else None
         _ = build_ott_obs(
             data, dof_qpos_addrs, dof_qvel_addrs,
             robot_qpos_addr, obj_qpos_addr, torso_body_id,
@@ -1164,6 +1649,8 @@ def run(args):
             obj_rot_seq=seq_rot,
             obj_pos_seq_long=seq_pos_long,
             obj_rot_seq_long=seq_rot_long,
+            obj_world_pos_override=_boot_obj_pos,
+            obj_world_quat_override=_boot_obj_quat,
         )
         for buf in (
             obs_buf.obj_pos, obs_buf.obj_rot_6d,
@@ -1182,6 +1669,8 @@ def run(args):
             obj_rot_seq=seq_rot,
             obj_pos_seq_long=seq_pos_long,
             obj_rot_seq_long=seq_rot_long,
+            obj_world_pos_override=_boot_obj_pos,
+            obj_world_quat_override=_boot_obj_quat,
         )[0]
 
         # ── Verify bootstrapped obs against saved reference ────────────────
@@ -1218,6 +1707,7 @@ def run(args):
     stabilize_last_action_29 = np.zeros(29, dtype=np.float32)
     stabilize_active = stabilize_enabled
     stabilize_start_sim_time = float(data.time)
+    joint_action_plot_data = {"raw": [], "processed": []} if args.plot_joint_action else None
     if stabilize_enabled:
         print(
             f"Stabilization stage enabled: running wbt_mw master_policy/obs for {stabilize_duration:.1f}s "
@@ -1229,7 +1719,10 @@ def run(args):
     _viz_long_pos:  list = []   # (5,  3) world-frame long-horizon points
 
     # ── Object initial height for table-hide logic ─────────────────────────
-    obj_init_z   = float(data.qpos[obj_qpos_addr + 2])
+    if args.virtual:
+        obj_init_z = float(motion["obj_pos"][init_t][2])
+    else:
+        obj_init_z = float(data.qpos[obj_qpos_addr + 2])
     table_hidden = False
     _TABLE_HIDDEN_POS  = np.array([0.0, 0.0, -10.0], dtype=np.float64)
     _table_orig_pos    = motion["table_pos"].copy()
@@ -1313,6 +1806,16 @@ def run(args):
             long_idx = np.clip(motion_t_for_obs + np.array([20, 40, 60, 80, 100]), 0, motion_length - 1)
             _viz_long_pos[:] = list(motion["obj_pos"][long_idx])
 
+        # ── Virtual object: update model body pose to follow motion trajectory ──
+        virtual_obj_pos = virtual_obj_quat = None
+        if args.virtual:
+            _vt = min(motion_t_for_obs, motion_length - 1)
+            virtual_obj_pos  = motion["obj_pos"][_vt].astype(np.float32)
+            virtual_obj_quat = motion["obj_rot"][_vt].astype(np.float32)
+            model.body_pos[obj_body_id]  = virtual_obj_pos.astype(np.float64)
+            model.body_quat[obj_body_id] = virtual_obj_quat.astype(np.float64)
+            mujoco.mj_forward(model, data)
+
         obs = build_ott_obs(
             data, dof_qpos_addrs, dof_qvel_addrs,
             robot_qpos_addr, obj_qpos_addr, torso_body_id,
@@ -1322,6 +1825,8 @@ def run(args):
             obj_rot_seq=seq_rot,
             obj_pos_seq_long=seq_pos_long,
             obj_rot_seq_long=seq_rot_long,
+            obj_world_pos_override=virtual_obj_pos,
+            obj_world_quat_override=virtual_obj_quat,
         )
 
         # ── Policy inference ───────────────────────────────────────────────
@@ -1332,7 +1837,8 @@ def run(args):
         scaled = np.clip(
             raw_action * ACTION_SCALE + ACTION_OFFSET,
             ACTION_CLIP_MIN, ACTION_CLIP_MAX,
-        ) 
+        )
+        _record_joint_action_sample(joint_action_plot_data, raw_action, scaled)
         target_q = data.qpos[dof_qpos_addrs].astype(np.float32).copy()
         target_q[act_idx] = scaled
 
@@ -1342,7 +1848,10 @@ def run(args):
         policy_step     += 1
 
         # ── Table hide/show based on object height ─────────────────────────
-        obj_z = float(data.qpos[obj_qpos_addr + 2])
+        if args.virtual:
+            obj_z = float(virtual_obj_pos[2]) if virtual_obj_pos is not None else obj_init_z
+        else:
+            obj_z = float(data.qpos[obj_qpos_addr + 2])
         if not table_hidden and obj_z > obj_init_z + 0.1:
             set_table_pose(model, _TABLE_HIDDEN_POS, _table_orig_quat)
             table_hidden = True
@@ -1359,6 +1868,8 @@ def run(args):
 
     def _apply_ctrl(d):
         apply_pd_control(d, target_q, dof_qpos_addrs, dof_qvel_addrs, actuator_ids)
+        if gantry is not None:
+            gantry.step()
 
     def _on_reset():
         nonlocal last_raw_action, target_q, motion_timestep, motion_time_acc, policy_step, table_hidden
@@ -1387,12 +1898,8 @@ def run(args):
                 obj_qvel_addr=obj_qvel_addr,
             )
         else:
-            data.qpos[robot_qpos_addr:robot_qpos_addr + 3] = motion["root_pos_all"][init_t]
-            data.qpos[robot_qpos_addr + 3:robot_qpos_addr + 7] = motion["root_quat_all"][init_t]
-            data.qpos[dof_qpos_addrs] = _init_q_at(init_t)
             data.qvel[:] = 0.0
-            set_freejoint_pose(data, obj_qpos_addr, motion["obj_pos"][init_t], motion["obj_rot"][init_t])
-            mujoco.mj_forward(model, data)
+            _apply_motion_state_to_scene(init_t)
 
         target_q = data.qpos[dof_qpos_addrs].astype(np.float32).copy()
         stabilize_last_action_29[:] = 0.0
@@ -1400,6 +1907,9 @@ def run(args):
         stabilize_cmd_time_acc = init_t / motion_fps
         stabilize_active = stabilize_enabled
         stabilize_start_sim_time = float(data.time)
+        if joint_action_plot_data is not None:
+            joint_action_plot_data["raw"].clear()
+            joint_action_plot_data["processed"].clear()
         if args.bootstrap_hist:
             seq_pos = seq_rot = seq_pos_long = seq_rot_long = None
             mt_for_boot = init_t
@@ -1412,6 +1922,9 @@ def run(args):
                 mt_dbg = _extract_debug_motion_timestep(entry0, rs0)
                 if mt_dbg is not None:
                     mt_for_boot = mt_dbg
+            _reset_boot_vt = min(mt_for_boot, motion_length - 1)
+            _reset_obj_pos  = motion["obj_pos"][_reset_boot_vt].astype(np.float32) if args.virtual else None
+            _reset_obj_quat = motion["obj_rot"][_reset_boot_vt].astype(np.float32) if args.virtual else None
             _ = build_ott_obs(
                 data, dof_qpos_addrs, dof_qvel_addrs,
                 robot_qpos_addr, obj_qpos_addr, torso_body_id,
@@ -1421,6 +1934,8 @@ def run(args):
                 obj_rot_seq=seq_rot,
                 obj_pos_seq_long=seq_pos_long,
                 obj_rot_seq_long=seq_rot_long,
+                obj_world_pos_override=_reset_obj_pos,
+                obj_world_quat_override=_reset_obj_quat,
             )
             for buf in (
                 obs_buf.obj_pos, obs_buf.obj_rot_6d,
@@ -1439,6 +1954,8 @@ def run(args):
                 obj_rot_seq=seq_rot,
                 obj_pos_seq_long=seq_pos_long,
                 obj_rot_seq_long=seq_rot_long,
+                obj_world_pos_override=_reset_obj_pos,
+                obj_world_quat_override=_reset_obj_quat,
             )[0]
 
             # ── Verify bootstrapped obs against saved reference ────────────
@@ -1470,6 +1987,65 @@ def run(args):
     _LONG_RGBA    = np.array([0.9, 0.2, 0.2, 0.8], dtype=np.float32)   # red
     _SHORT_SIZE   = np.array([0.015, 0.0, 0.0], dtype=np.float64)
     _LONG_SIZE    = np.array([0.015, 0.0, 0.0], dtype=np.float64)
+    # Gantry visualization constants
+    _GANTRY_ANCHOR_RGBA = np.array([1.0, 0.5, 0.0, 0.9], dtype=np.float32)  # orange sphere
+    _GANTRY_ROPE_RGBA   = np.array([1.0, 0.8, 0.0, 0.7], dtype=np.float32)  # yellow capsule
+    _GANTRY_ANCHOR_SIZE = np.array([0.04, 0.0, 0.0], dtype=np.float64)
+    _GANTRY_ROPE_RADIUS = 0.008
+
+    def _add_gantry_markers(scn) -> None:
+        """Draw gantry anchor (sphere) and rope (capsule) in the scene."""
+        if gantry is None or not gantry.enabled:
+            return
+        max_g = scn.maxgeom
+
+        # Anchor point in world frame
+        anchor = gantry.point.astype(np.float64)
+
+        # Apply-point on the robot body (torso_link origin + local offset, world frame)
+        body_id_g = gantry.body_link_id
+        body_xpos = data.xpos[body_id_g].copy()
+        body_xmat = data.xmat[body_id_g].reshape(3, 3)
+        ipos_local = model.body_ipos[body_id_g]
+        body_origin_world = body_xpos - body_xmat @ ipos_local
+        attach_pt = body_origin_world + body_xmat @ _GANTRY_LOCAL_OFFSET
+
+        # ── Anchor sphere ──────────────────────────────────────────────────
+        if scn.ngeom < max_g:
+            mujoco.mjv_initGeom(
+                scn.geoms[scn.ngeom],
+                mujoco.mjtGeom.mjGEOM_SPHERE,
+                _GANTRY_ANCHOR_SIZE,
+                anchor,
+                _IDENTITY_MAT,
+                _GANTRY_ANCHOR_RGBA,
+            )
+            scn.ngeom += 1
+
+        # ── Rope capsule from anchor to attach_pt ──────────────────────────
+        if scn.ngeom < max_g:
+            vec = attach_pt - anchor
+            length = float(np.linalg.norm(vec))
+            if length > 1e-4:
+                midpoint = (anchor + attach_pt) * 0.5
+                # Build rotation matrix: local z-axis aligned with vec
+                z_axis = vec / length
+                # pick a perpendicular axis
+                perp = np.array([1.0, 0.0, 0.0]) if abs(z_axis[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+                x_axis = np.cross(perp, z_axis)
+                x_axis /= np.linalg.norm(x_axis)
+                y_axis = np.cross(z_axis, x_axis)
+                rot_mat = np.stack([x_axis, y_axis, z_axis], axis=1).flatten()
+                size = np.array([_GANTRY_ROPE_RADIUS, length * 0.5, 0.0], dtype=np.float64)
+                mujoco.mjv_initGeom(
+                    scn.geoms[scn.ngeom],
+                    mujoco.mjtGeom.mjGEOM_CAPSULE,
+                    size,
+                    midpoint,
+                    rot_mat,
+                    _GANTRY_ROPE_RGBA,
+                )
+                scn.ngeom += 1
 
     def _add_traj_markers(scn) -> None:
         max_g = scn.maxgeom
@@ -1489,6 +2065,7 @@ def run(args):
                     rgba,
                 )
                 scn.ngeom += 1
+        _add_gantry_markers(scn)
 
     try:
         run_mujoco_loop(
@@ -1507,6 +2084,12 @@ def run(args):
         if video_recorder is not None:
             video_recorder.save(fps=1.0 / policy_dt)
             video_recorder.cleanup()
+        _save_joint_action_artifacts(
+            root,
+            joint_action_plot_data,
+            policy_hz=float(args.policy_hz),
+            clip_key=motion.get("clip_key"),
+        )
 
     print("\nDone.")
 
@@ -1585,6 +2168,72 @@ def main():
         "--debug-break",
         action="store_true",
         help="Enter breakpoint() on each debug compare step (default: disabled).",
+    )
+    parser.add_argument(
+        "--lift",
+        action="store_true",
+        help=(
+            "Replace the PKL object trajectory with a generated lift command: "
+            "hold at the init-frame object pose for 4 s, then lift 0.5 m up and back down."
+        ),
+    )
+    parser.add_argument(
+        "--stay",
+        action="store_true",
+        help=(
+            "Replace the PKL object trajectory with a fixed-position command: "
+            "object stays at the init-frame pose for 10 s (no movement)."
+        ),
+    )
+    parser.add_argument(
+        "--virtual",
+        action="store_true",
+        help=(
+            "Load object as a virtual (kinematic) body: freejoint is removed and collision is "
+            "disabled at runtime via XML patching. Object position follows the command trajectory "
+            "each policy step (use with --stay or --lift)."
+        ),
+    )
+    parser.add_argument(
+        "--virtual-table", "--virtual_table",
+        dest="virtual_table",
+        action="store_true",
+        help=(
+            "Disable table collision at runtime via XML patching. "
+            "Table remains visible but does not participate in physics."
+        ),
+    )
+    parser.add_argument(
+        "--gantry",
+        action="store_true",
+        help=(
+            "Enable virtual gantry simulation: applies an upward support force on the robot "
+            "torso_link (at local z+0.28) each physics substep so it cannot fall over."
+        ),
+    )
+    parser.add_argument(
+        "--gantry-length", "--gantry_length",
+        dest="gantry_length",
+        type=float,
+        default=0.0,
+        help="Gantry rest length in metres (slack before the elastic band starts pulling). Default: 0.0.",
+    )
+    parser.add_argument(
+        "--reference-speed", "--reference_speed",
+        dest="reference_speed",
+        type=float,
+        default=1.0,
+        help=(
+            "Playback speed multiplier for the reference trajectory "
+            "(e.g. 2.0 = 2× faster, 0.5 = half speed). "
+            "All motion arrays are resampled via linear interpolation."
+        ),
+    )
+    parser.add_argument(
+        "--plot_joint_action", "--plot-joint-action",
+        dest="plot_joint_action",
+        action="store_true",
+        help="Save per-joint OTT action plots/logs (raw + processed) to test_log/ on exit.",
     )
     parser.add_argument("--record",    action="store_true", help="Record video while showing viewer.")
     parser.add_argument("--offscreen", action="store_true", help="Run headless, record video, stop when motion ends.")

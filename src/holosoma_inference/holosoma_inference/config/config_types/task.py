@@ -79,11 +79,26 @@ class TaskConfig:
     use_gen_traj: bool = False
     """Whether to use trajectory generator for object motion."""
 
+    record_traj: bool = False
+    """If True, allow recording an object trajectory in torso frame after stabilization."""
+
     debug_traj_viz: bool = True
     """Enable short/long-horizon trajectory visualization in the MuJoCo viewer."""
 
     debug_traj_viz_port: int = 10006
     """UDP port used to stream trajectory visualization points to the simulator bridge."""
+
+    debug_rviz_obj_traj_viz: bool = False
+    """Enable UDP streaming of sampled object trajectory poses for RViz visualization."""
+
+    debug_rviz_obj_traj_viz_host: str = "127.0.0.1"
+    """Destination host for sampled RViz object trajectory UDP packets."""
+
+    debug_rviz_obj_traj_viz_port: int = 10007
+    """UDP port used to stream sampled object trajectory poses for RViz visualization."""
+
+    debug_rviz_obj_traj_viz_dt: float = 0.2
+    """Sampling interval in seconds for RViz object trajectory UDP packets."""
 
     change_loco_order: bool = False
     """If True, use alternative obs order for loco prior: [last_action, proprio_hand, proprio_body, vel_command]."""
