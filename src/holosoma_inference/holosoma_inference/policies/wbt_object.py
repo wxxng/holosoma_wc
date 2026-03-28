@@ -454,6 +454,12 @@ class WholeBodyTrackingPolicy(BasePolicy):
         self._master_last_action = None  # action order (43) for master policy
         self._stabilization_last_action_43 = None  # raw action (43) in ACTION_ORDER_43DOF
 
+        # Interp-to-first-frame mode: stabilization policy commanded to interpolate to first frame
+        self._interp_to_first_frame_mode = False
+        self._interp_to_first_frame_steps = 200  # number of policy steps to interpolate over
+        self._interp_to_first_frame_count = 0
+        self._interp_to_first_frame_start_q = None  # current dof_pos (motion order) at activation
+
         # Motion command is always body-only 29-DOF
         self.motion_body_indices = None
         self.motion_command_dofs = 29
@@ -533,6 +539,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
             self._traj_gen = TrajectoryGenerator(
                 rl_rate=config.task.rl_rate,
                 mode=config.task.gen_traj_mode,
+                trapezoid=config.task.gen_traj_trapezoid,
             )
         if self.use_gen_traj and self.use_recorded_traj:
             logger.warning("Both use_gen_traj and use_recorded_traj are enabled; use_gen_traj will take precedence.")
@@ -779,9 +786,6 @@ class WholeBodyTrackingPolicy(BasePolicy):
         except Exception:
             cpu_model = platform.processor() or "unknown"
 
-        cpu_usages = self._inference_cpu_usages if hasattr(self, "_inference_cpu_usages") else []
-        avg_cpu = sum(cpu_usages) / len(cpu_usages) if cpu_usages else 0.0
-
         # ONNX provider
         providers = []
         if hasattr(self, "onnx_policy_session"):
@@ -789,18 +793,16 @@ class WholeBodyTrackingPolicy(BasePolicy):
         device = "GPU" if any("CUDA" in p or "Tensorrt" in p for p in providers) else "CPU"
 
         logger.info(colored("\n" + "=" * 80, "green", attrs=["bold"]))
-        logger.info(colored("[Inference Time Summary]", "green", attrs=["bold"]))
+        logger.info(colored("[Inference Time Summary (wall-clock)]", "green", attrs=["bold"]))
         logger.info(colored(f"  Steps:      {len(times)}", "green"))
         logger.info(colored(f"  Avg:        {avg:.2f} ms", "green"))
         logger.info(colored(f"  Std:        {std:.2f} ms", "green"))
         logger.info(colored(f"  Min:        {mn:.2f} ms", "green"))
         logger.info(colored(f"  Max:        {mx:.2f} ms", "green"))
-        logger.info(colored(f"  Avg CPU:    {avg_cpu:.1f}%", "green"))
         logger.info(colored(f"  CPU Model:  {cpu_model}", "green"))
         logger.info(colored(f"  Device:     {device} (providers={providers})", "green"))
         logger.info(colored("=" * 80 + "\n", "green", attrs=["bold"]))
         self._inference_times = []  # avoid printing twice
-        self._inference_cpu_usages = []
 
     def _on_sigint(self, signum, frame):
         """Save logs on Ctrl+C, then propagate signal."""
@@ -1565,6 +1567,8 @@ class WholeBodyTrackingPolicy(BasePolicy):
         # Stabilization uses the first motion frame only
         if self._soft_stop_active:
             current_obs_buffer_dict["motion_command_sequence"] = self._get_motion_command_sequence_soft_stop()
+        elif self._interp_to_first_frame_mode:
+            current_obs_buffer_dict["motion_command_sequence"] = self._get_motion_command_sequence_interp_to_first(robot_state_data)
         else:
             current_obs_buffer_dict["motion_command_sequence"] = self._get_motion_command_sequence_first_frame()
 
@@ -1965,25 +1969,15 @@ class WholeBodyTrackingPolicy(BasePolicy):
         return command_seq.reshape(1, -1)
 
     def _get_motion_command_sequence_first_frame(self) -> np.ndarray:
-        """Get a 10-frame sequence repeating the configured start motion frame (body-only)."""
+        """Get a 10-frame sequence starting from the configured start frame (body-only).
+
+        Uses actual future frames (start_idx to start_idx+9) with real velocities,
+        matching the wbt_motion.py stabilization behaviour.
+        """
         if self.motion_dof_pos is None or self.motion_length == 0:
             return np.zeros((1, 10 * self.motion_command_dofs * 2), dtype=np.float32)
 
-        start_idx = self._get_motion_start_frame_index()
-        pos0 = self.motion_dof_pos[start_idx]
-        vel0 = self.motion_dof_vel[start_idx] if self.motion_dof_vel is not None else np.zeros_like(pos0)
-
-        if pos0.shape[0] != self.motion_command_dofs:
-            if self.motion_body_indices is not None:
-                pos0 = pos0[self.motion_body_indices]
-                vel0 = vel0[self.motion_body_indices]
-            else:
-                pos0 = pos0[: self.motion_command_dofs]
-                vel0 = vel0[: self.motion_command_dofs]
-
-        frame = np.concatenate([pos0, vel0], axis=0).reshape(1, -1)  # [1, 58]
-        seq = np.repeat(frame, 10, axis=0)  # [10, 58]
-        return seq.reshape(1, -1).astype(np.float32, copy=False)
+        return self._get_motion_command_sequence(self._get_motion_start_frame_index())
     
     def _get_motion_command_sequence_first_pos(self) -> np.ndarray:
         """Get a 10-frame sequence repeating the configured start motion position."""
@@ -3634,24 +3628,21 @@ class WholeBodyTrackingPolicy(BasePolicy):
             input_feed = {name: group_outputs[name] for name in self.onnx_input_names}
 
         if self._inference_time_enabled:
-            cpu_before = psutil.cpu_percent(interval=None)
             t0 = time.perf_counter()
             raw_action_order = self.policy(input_feed)
             dt_ms = (time.perf_counter() - t0) * 1000.0
-            cpu_after = psutil.cpu_percent(interval=None)
             self._inference_times.append(dt_ms)
-            self._inference_cpu_usages.append(cpu_after)
             if self._inference_time_count < 10:
                 providers = self.onnx_policy_session.get_providers()
                 device = "GPU" if any("CUDA" in p or "Tensorrt" in p for p in providers) else "CPU"
                 logger.info(colored(
-                    f"[Inference {self._inference_time_count + 1}/10] {dt_ms:.2f} ms, "
-                    f"CPU {cpu_after:.1f}%  ({device})",
+                    f"[Inference {self._inference_time_count + 1}/10] {dt_ms:.2f} ms  ({device})",
                     "green", attrs=["bold"],
                 ))
             self._inference_time_count += 1
             if self._inference_time_count == 300:
                 self._print_inference_time_summary()
+                self._inference_time_enabled = False
         else:
             raw_action_order = self.policy(input_feed)  # Raw action in action order
 
@@ -3807,6 +3798,47 @@ class WholeBodyTrackingPolicy(BasePolicy):
         
         # Concatenate pos and vel
         frame = np.concatenate([target_q_motion, vel0], axis=0).reshape(1, -1)  # [1, 58]
+        seq = np.repeat(frame, 10, axis=0)  # [10, 58]
+        return seq.reshape(1, -1).astype(np.float32, copy=False)
+
+    def _get_motion_command_sequence_interp_to_first(self, robot_state_data) -> np.ndarray:
+        """Get a 10-frame sequence interpolating from current pose toward the first motion frame.
+
+        On each call advances the internal counter so the command smoothly moves toward the target.
+        Once the interpolation is complete, falls back to first-frame sequence.
+        """
+        # Get first frame target in motion order
+        if self.motion_dof_pos is None or self.motion_length == 0:
+            return np.zeros((1, 10 * self.motion_command_dofs * 2), dtype=np.float32)
+
+        start_idx = self._get_motion_start_frame_index()
+        target_q_motion = self.motion_dof_pos[start_idx].copy()
+        if target_q_motion.shape[0] != self.motion_command_dofs:
+            if self.motion_body_indices is not None:
+                target_q_motion = target_q_motion[self.motion_body_indices]
+            else:
+                target_q_motion = target_q_motion[:self.motion_command_dofs]
+
+        # Capture starting pose (in motion order) on first call
+        if self._interp_to_first_frame_start_q is None:
+            dof_pos_config = robot_state_data[0, 7: 7 + self.num_dofs]
+            body_joint_names = list(G1_MOTION_JOINT_NAMES_29)
+            body_indices_config = np.array(
+                get_index_of_a_in_b(body_joint_names, self.dof_names), dtype=np.int64
+            )
+            self._interp_to_first_frame_start_q = dof_pos_config[body_indices_config].copy()
+
+        ratio = min(self._interp_to_first_frame_count / self._interp_to_first_frame_steps, 1.0)
+        interp_q = self._interp_to_first_frame_start_q + ratio * (target_q_motion - self._interp_to_first_frame_start_q)
+        self._interp_to_first_frame_count += 1
+
+        # When done, switch back to normal stabilization
+        if self._interp_to_first_frame_count >= self._interp_to_first_frame_steps:
+            self._interp_to_first_frame_mode = False
+            self.logger.info(colored("✅ Interp to first frame complete — resuming normal stabilization", "cyan"))
+
+        vel0 = np.zeros(self.motion_command_dofs, dtype=np.float32)
+        frame = np.concatenate([interp_q, vel0]).reshape(1, -1)  # [1, 58]
         seq = np.repeat(frame, 10, axis=0)  # [10, 58]
         return seq.reshape(1, -1).astype(np.float32, copy=False)
 
@@ -3990,12 +4022,14 @@ class WholeBodyTrackingPolicy(BasePolicy):
         if not self.use_policy_action:
             self.logger.warning("Press ']' first to enable policy, then 'd' to start stabilization")
             return
-        
+
         self._stiff_startup_active = False
         self.stabilization_mode = True
         self.motion_clip_progressing = False
         self._reset_motion_timing()
         self._reset_master_obs_history()
+        # Reset gen_traj so it re-initializes from the current object pose on the next 's'/start.
+        self._gen_traj_initialized = False
         self.logger.info(
             colored("🛡️  Entering stabilization mode - policy active with configured start-frame command", "yellow", attrs=["bold"])
         )
@@ -4038,6 +4072,8 @@ class WholeBodyTrackingPolicy(BasePolicy):
     def _handle_start_motion_clip(self):
         """Handle start motion clip action."""
         self._inference_time_count = 0  # Reset so timing prints for the next 10 steps
+        self._inference_times.clear()  # Discard stabilization-phase times
+        self._inference_cpu_usages.clear()
         self._stiff_startup_active = False
         if self._record_traj_active:
             self.logger.warning("Finish trajectory recording first before starting the motion clip.")
@@ -4136,9 +4172,25 @@ class WholeBodyTrackingPolicy(BasePolicy):
         else:
             self.logger.info(colored(f"🎬 Starting motion clip playback from timestep {start_idx}", "blue", attrs=["bold"]))
 
+    def _handle_interp_to_first_frame(self):
+        """Use stabilization policy to smoothly command from current pose to first motion frame."""
+        if not self.use_policy_action:
+            self.logger.warning("Press ']' first to enable policy before interpolating to first frame")
+            return
+        self.stabilization_mode = True
+        self.motion_clip_progressing = False
+        self._soft_stop_active = False
+        self._soft_stop_target_q = None
+        self._interp_to_first_frame_mode = True
+        self._interp_to_first_frame_count = 0
+        self._interp_to_first_frame_start_q = None  # will be captured on first inference tick
+        self.logger.info(colored("🔄 Stabilization policy: interpolating command to first motion frame", "cyan", attrs=["bold"]))
+
     def handle_keyboard_button(self, keycode):
         """Add new keyboard button to start and end the motion clips"""
-        if keycode in ["\r", "\n", "", "return", "enter"]:
+        if keycode == "e":
+            self._handle_interp_to_first_frame()
+        elif keycode in ["\r", "\n", "", "return", "enter"]:
             # Print current dof_pos when Enter is pressed
             robot_state_data = self.interface.get_low_state()
             if robot_state_data is not None:
@@ -4251,7 +4303,9 @@ class WholeBodyTrackingPolicy(BasePolicy):
 
     def handle_joystick_button(self, cur_key):
         """Handle joystick button presses for WBT-specific controls."""
-        if cur_key == "X":
+        if cur_key == "F3":
+            self._handle_interp_to_first_frame()
+        elif cur_key == "X":
             # Start stabilization mode
             self._handle_start_stabilization()
         elif cur_key == "Y":

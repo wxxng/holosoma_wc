@@ -327,6 +327,12 @@ class BasePolicy:
             0.0, -1.0, -1.7, 1.57, 1.7, 1.57, 1.7
         ], dtype=np.float32)
 
+        # Finite-difference hand velocity: use (dof_pos - prev_dof_pos) * rl_rate for hand joints
+        self._fd_hand_vel = getattr(self.config.task, "fd_hand_vel", False)
+        self._fd_hand_vel_prev_dof_pos = None  # populated on first observation step
+        if self._fd_hand_vel:
+            logger.info(colored("Finite-difference hand vel enabled (pos diff / dt)", "cyan"))
+
         self._debug_hand_half_cycle_steps = max(1, int(round(4.0 * self.rl_rate)))
         self._debug_hand_demo_cycle_steps = max(1, int(round(2.0 * self.rl_rate)))
         self._debug_hand_hand_idx = np.array(list(range(22, 29)) + list(range(36, 43)), dtype=np.int64)
@@ -785,6 +791,19 @@ class BasePolicy:
 
         return self._default_kp, self._default_kd
 
+    def _apply_fd_hand_vel(self, dof_pos: np.ndarray, dof_vel: np.ndarray, hand_indices: np.ndarray) -> np.ndarray:
+        """Override hand joint velocities with finite-difference: (pos - prev_pos) * rl_rate."""
+        if self._fd_hand_vel_prev_dof_pos is None:
+            self._fd_hand_vel_prev_dof_pos = dof_pos.copy()
+            dof_vel = dof_vel.copy()
+            dof_vel[:, hand_indices] = 0.0
+            return dof_vel
+        fd_vel = (dof_pos[:, hand_indices] - self._fd_hand_vel_prev_dof_pos[:, hand_indices]) * self.rl_rate
+        self._fd_hand_vel_prev_dof_pos = dof_pos.copy()
+        dof_vel = dof_vel.copy()
+        dof_vel[:, hand_indices] = fd_vel
+        return dof_vel
+
     def _reset_debug_hand_cycle(self):
         """Reset the debug hand repeat cycle to re-seed from live hand positions."""
         self._debug_hand_step = 0
@@ -991,9 +1010,6 @@ class BasePolicy:
                     if self._debug_hand_kd is not None:
                         kd_override = self._debug_hand_kd
 
-                # Clip target positions to motor limits (in-place for speed)
-                if self.q_min_arr is not None and self.q_max_arr is not None:
-                    np.clip(q_target[0], self.q_min_arr, self.q_max_arr, out=q_target[0])
                 # Prepare command (reuse pre-allocated arrays)
                 self.cmd_q[:] = q_target[0]
                 # Clip per-step delta to prevent sudden jumps
@@ -1002,9 +1018,7 @@ class BasePolicy:
                     np.clip(delta, -self._cmd_q_max_delta, self._cmd_q_max_delta, out=delta)
                     self.cmd_q[:] = self._prev_cmd_q + delta
                 self._prev_cmd_q = self.cmd_q.copy()
-            elif self.q_min_arr is not None and self.q_max_arr is not None:
-                # Clip target positions to motor limits for manual/init modes
-                np.clip(q_target[0], self.q_min_arr, self.q_max_arr, out=q_target[0])
+            else:
                 # Prepare command (reuse pre-allocated arrays)
                 self.cmd_q[:] = q_target[0]
 
