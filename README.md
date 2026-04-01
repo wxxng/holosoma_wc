@@ -179,8 +179,9 @@ python3 src/holosoma_inference/holosoma_inference/run_policy.py inference:g1-43d
 ### RSS rebuttal sim2real 
 ```
 # use gen_traj : lift_back_left_down
+# 1.2 times gain for hand motors 
 
-python3 src/holosoma_inference/holosoma_inference/run_policy.py inference:g1-43dof-object-bps   --task.model-path src/holosoma_inference/holosoma_inference/models/wbt/object/bps_policy_mlp_large_better.onnx   --task.motion-pkl-path /home/rllab3/Desktop/codebase/unitreeG1_mw/holosoma_wc/src/holosoma/holosoma/data/motions/motion_tracking/grab_omomo_selected_111_filtered.pkl   --task.motion-clip-key GRAB_s1_cubemedium_pass_1   --task.use-joystick   --task.interface enp132s0   --task.motion-start-timestep 0 --task.use_gen_traj --task.gen_traj_mode lift_back_left_down --task.switch_hands --task.log --task.mujoco_twin --task.cache_world --task.fd_hand_vel
+python3 src/holosoma_inference/holosoma_inference/run_policy.py inference:g1-43dof-object-bps   --task.model-path src/holosoma_inference/holosoma_inference/models/wbt/object/bps_policy_mlp_large_better.onnx   --task.motion-pkl-path /home/rllab3/Desktop/codebase/unitreeG1_mw/holosoma_wc/src/holosoma/holosoma/data/motions/motion_tracking/grab_omomo_selected_111_filtered.pkl   --task.motion-clip-key GRAB_s1_cubemedium_pass_1   --task.use-joystick   --task.interface enp132s0   --task.motion-start-timestep 0 --task.use_gen_traj --task.gen_traj_mode lift_back_left_down --task.switch_hands --task.log --task.mujoco_twin --task.cache_world --task.fd_hand_vel --task.hand_gain_scale 1.2 
 
 # joystick commands
 

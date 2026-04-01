@@ -59,7 +59,7 @@ class InterfaceWrapper:
     # Initialization
     # ============================================================================
 
-    def __init__(self, robot_config: RobotConfig, domain_id=0, interface_str=None, use_joystick=True, use_hands=False, switch_hands=False):
+    def __init__(self, robot_config: RobotConfig, domain_id=0, interface_str=None, use_joystick=True, use_hands=False, switch_hands=False, hand_gain_scale=1.0):
         self.logger = logger
         self.use_joystick = use_joystick
         self.use_hands = use_hands
@@ -74,6 +74,7 @@ class InterfaceWrapper:
         # Initialize gain levels for binding backend
         self._kp_level = 1.0
         self._kd_level = 1.0
+        self._hand_gain_scale = float(hand_gain_scale)
 
         # Initialize sdk components
         self._init_sdk_components()
@@ -100,6 +101,8 @@ class InterfaceWrapper:
         self._torso_object_pose_timestamp = None  # receive timestamp in seconds
         self._world_robot_twist_cache = None  # [vx,vy,vz,wx,wy,wz] in FLU
         self._world_robot_quat_warned = False
+        self._object_detected = True  # assume detected until told otherwise
+        self.pending_reset = False  # set True when a reset packet is received
 
         if self.interface_str == "lo":
             self._init_object_state_receiver()
@@ -266,6 +269,18 @@ class InterfaceWrapper:
             topic = str(packet.get("topic", ""))
             msg_type = str(packet.get("type", ""))
 
+            if msg_type == "Reset":
+                self._world_robot_pose_cache = None
+                self._world_object_pose_cache = None
+                self._torso_object_pose_cache = None
+                self._world_object_pose_timestamp = None
+                self._torso_object_pose_timestamp = None
+                self._world_robot_twist_cache = None
+                self._object_detected = True
+                self.pending_reset = True
+                self.logger.info("Received reset packet — cleared pose caches.")
+                continue
+
             if msg_type == "PoseStamped":
                 pos_raw = packet.get("pos", None)
                 if pos_raw is None:
@@ -336,6 +351,10 @@ class InterfaceWrapper:
                 twist = np.concatenate([lin_flu, np.zeros(3, dtype=np.float32)], axis=0).astype(np.float32, copy=False)
                 if "robot_lin_vel" in topic or topic.endswith("/lin_vel"):
                     self._world_robot_twist_cache = twist
+
+            elif msg_type == "Bool":
+                if topic.endswith("object_detected") or topic == "object_detected":
+                    self._object_detected = bool(packet.get("data", True))
 
     def _poll_scene_info(self) -> None:
         """Drain pending scene-info packets and update cached object name."""
@@ -509,6 +528,11 @@ class InterfaceWrapper:
         if self._torso_object_pose_cache is None or self._torso_object_pose_timestamp is None:
             return None, None
         return self._torso_object_pose_cache.copy(), float(self._torso_object_pose_timestamp)
+
+    def is_object_detected(self) -> bool:
+        """Return whether the apriltag bundle is currently detected."""
+        self._poll_world_topics()
+        return self._object_detected
 
     def get_object_pose_world_with_timestamp(self):
         """Get latest object world pose plus receive timestamp."""

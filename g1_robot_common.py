@@ -342,6 +342,14 @@ def apply_pd_control(
 # Math utilities
 # ═══════════════════════════════════════════════════════════════════════════
 
+def quat_rotate(q_wxyz: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """Rotate vector *v* by unit quaternion *q* (wxyz)."""
+    w = q_wxyz[0]
+    xyz = q_wxyz[1:4]
+    t = 2.0 * np.cross(xyz, v)
+    return (v + w * t + np.cross(xyz, t)).astype(np.float32)
+
+
 def quat_rotate_inverse(q_wxyz: np.ndarray, v: np.ndarray) -> np.ndarray:
     """Rotate vector *v* by the inverse of unit quaternion *q* (wxyz).
 

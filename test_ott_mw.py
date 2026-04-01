@@ -34,13 +34,14 @@ from g1_robot_common import (
     ACTION_ORDER_43DOF, ACTION_SCALE, ACTION_OFFSET, ACTION_CLIP_MIN, ACTION_CLIP_MAX,
     BODY_JOINT_NAMES, HAND_JOINT_NAMES,
     name_indices, mj_hinge_addrs, mj_actuator_ids, apply_pd_control,
-    quat_rotate_inverse, SimpleVideoRecorder, run_mujoco_loop,
+    quat_rotate, quat_rotate_inverse, SimpleVideoRecorder, run_mujoco_loop,
 )
 from virtual_gantry_notebook import (
     DEFAULT_NOTEBOOK_GANTRY_CFG,
     create_mujoco_virtual_gantry,
     reset_robot_state_on_gantry,
 )
+from holosoma_inference.utils.trajectory_generator import _trapezoid_ramp
 
 # Precomputed index maps (config order → body/hand subsets)
 BODY_INDICES = name_indices(BODY_JOINT_NAMES, DOF_NAMES)   # (29,)
@@ -231,6 +232,7 @@ def _build_lift_traj(
     hold_time_s: float = 4.0,
     lift_height_m: float = 0.5,
     lift_speed_mps: float = 0.4,
+    trapezoid: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Hold at start pose for hold_time_s, then lift up by lift_height_m, then back down.
 
@@ -244,8 +246,12 @@ def _build_lift_traj(
     n_lift = max(1, int(round((lift_height_m / lift_speed_mps) * policy_hz)))
 
     z_hold = np.zeros(n_hold, dtype=np.float32)
-    z_up   = np.linspace(0.0, lift_height_m, n_lift + 1, dtype=np.float32)[1:]
-    z_down = np.linspace(lift_height_m, 0.0, n_lift + 1, dtype=np.float32)[1:]
+    if trapezoid:
+        z_up   = _trapezoid_ramp(n_lift, 0.0, lift_height_m)
+        z_down = _trapezoid_ramp(n_lift, lift_height_m, 0.0)
+    else:
+        z_up   = np.linspace(0.0, lift_height_m, n_lift + 1, dtype=np.float32)[1:]
+        z_down = np.linspace(lift_height_m, 0.0, n_lift + 1, dtype=np.float32)[1:]
     z      = np.concatenate([z_hold, z_up, z_down])   # [T]
 
     pos  = np.tile(start_pos,       (z.shape[0], 1))  # [T, 3]
@@ -271,6 +277,262 @@ def _build_stay_traj(
     n_stay = max(1, int(round(stay_time_s * policy_hz)))
     pos  = np.tile(start_pos,       (n_stay, 1))  # [T, 3]
     quat = np.tile(start_quat_wxyz, (n_stay, 1))  # [T, 4]
+    return pos, quat
+
+
+def _build_left_down_traj(
+    start_pos: np.ndarray,
+    start_quat_wxyz: np.ndarray,
+    robot_quat_wxyz: np.ndarray,
+    policy_hz: float,
+    hold_time_s: float = 4.0,
+    lift_height_m: float = 0.5,
+    lift_speed_mps: float = 0.4,
+    left_distance_m: float = 0.9,
+    lower_height_m: float = 0.8,
+    trapezoid: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Hold, lift up, move left (relative to robot heading), lower down, hold.
+
+    The lateral direction is computed from the robot's yaw so that "left"
+    is always to the robot's left regardless of which world-frame direction
+    the robot faces at init.
+
+    Trajectory is sampled at policy_hz so that one frame = one policy step.
+    Returns (pos [T,3], quat_wxyz [T,4]).
+    """
+    start_pos       = np.asarray(start_pos,       dtype=np.float32).reshape(3)
+    start_quat_wxyz = np.asarray(start_quat_wxyz, dtype=np.float32).reshape(4)
+    robot_quat_wxyz = np.asarray(robot_quat_wxyz, dtype=np.float32).reshape(4)
+
+    # Robot heading (yaw only) -> "left" unit vector in world XY plane
+    w, x, y, z = robot_quat_wxyz.astype(np.float64)
+    fwd_x = 1.0 - 2.0 * (y * y + z * z)
+    fwd_y = 2.0 * (x * y + w * z)
+    yaw = np.arctan2(fwd_y, fwd_x)
+    # left = 90° CCW from forward
+    left_x = float(-np.sin(yaw))
+    left_y = float( np.cos(yaw))
+
+    # Target position in world frame: start + left_distance along robot-left
+    target_xy = np.array([
+        start_pos[0] + left_distance_m * left_x,
+        start_pos[1] + left_distance_m * left_y,
+    ], dtype=np.float32)
+
+    move_distance_m = np.linalg.norm(target_xy - start_pos[:2])
+
+    n_hold  = max(1, int(round(hold_time_s * policy_hz)))
+    n_lift  = max(1, int(round((lift_height_m / lift_speed_mps) * policy_hz)))
+    n_move  = max(1, int(round((move_distance_m / lift_speed_mps) * policy_hz))) if lift_speed_mps > 0.0 else 1
+    n_lower = max(1, int(round((lower_height_m / lift_speed_mps) * policy_hz)))
+
+    # z profile: hold -> lift up -> move laterally (stay high) -> lower down -> hold
+    z_hold       = np.zeros(n_hold, dtype=np.float32)
+    z_move       = np.full(n_move, lift_height_m, dtype=np.float32)
+    final_z_off  = lift_height_m - lower_height_m
+    z_final_hold = np.full(n_hold, final_z_off, dtype=np.float32)
+    if trapezoid:
+        z_up   = _trapezoid_ramp(n_lift, 0.0, lift_height_m)
+        z_down = _trapezoid_ramp(n_lower, lift_height_m, final_z_off)
+    else:
+        z_up   = np.linspace(0.0, lift_height_m, n_lift + 1, dtype=np.float32)[1:]
+        z_down = np.linspace(lift_height_m, final_z_off, n_lower + 1, dtype=np.float32)[1:]
+    z = np.concatenate([z_hold, z_up, z_move, z_down, z_final_hold])
+
+    # xy profile: hold -> stay during lift -> move laterally -> stay during lower -> hold
+    T = z.shape[0]
+    xy = np.tile(start_pos[:2], (T, 1))  # [T, 2]
+
+    # Indices for each segment
+    i0 = n_hold + n_lift  # move starts here
+    i1 = i0 + n_move      # move ends / lower starts
+    i2 = i1 + n_lower     # lower ends / final hold starts
+
+    # Move segment: interpolate XY from start to target
+    if trapezoid:
+        alphas = _trapezoid_ramp(n_move, 0.0, 1.0)
+        for k in range(n_move):
+            xy[i0 + k] = start_pos[:2] + alphas[k] * (target_xy - start_pos[:2])
+    else:
+        for k in range(n_move):
+            alpha = (k + 1) / n_move
+            xy[i0 + k] = start_pos[:2] + alpha * (target_xy - start_pos[:2])
+    # Lower + final hold: stay at target XY
+    xy[i1:] = target_xy
+
+    pos  = np.tile(start_pos,       (T, 1))
+    quat = np.tile(start_quat_wxyz, (T, 1))
+    pos[:, 0] = xy[:, 0]
+    pos[:, 1] = xy[:, 1]
+    pos[:, 2] = start_pos[2] + z
+    return pos, quat
+
+
+def _build_back_traj(
+    start_pos: np.ndarray,
+    start_quat_wxyz: np.ndarray,
+    robot_quat_wxyz: np.ndarray,
+    policy_hz: float,
+    hold_time_s: float = 4.0,
+    lift_height_m: float = 0.4,
+    lift_speed_mps: float = 0.4,
+    back_distance_m: float = 0.4,
+    trapezoid: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Hold, lift up, then move backward (opposite to robot facing) by back_distance_m while staying lifted, then hold.
+
+    The backward direction is computed from the robot's yaw so it always moves
+    behind the robot regardless of world-frame orientation.
+
+    Trajectory is sampled at policy_hz so that one frame = one policy step.
+    Returns (pos [T,3], quat_wxyz [T,4]).
+    """
+    start_pos       = np.asarray(start_pos,       dtype=np.float32).reshape(3)
+    start_quat_wxyz = np.asarray(start_quat_wxyz, dtype=np.float32).reshape(4)
+    robot_quat_wxyz = np.asarray(robot_quat_wxyz, dtype=np.float32).reshape(4)
+
+    # Robot heading (yaw only) -> backward unit vector in world XY plane
+    w, x, y, z = robot_quat_wxyz.astype(np.float64)
+    fwd_x = 1.0 - 2.0 * (y * y + z * z)
+    fwd_y = 2.0 * (x * y + w * z)
+    # backward = opposite of forward
+    back_x = float(-fwd_x / np.hypot(fwd_x, fwd_y))
+    back_y = float(-fwd_y / np.hypot(fwd_x, fwd_y))
+
+    target_xy = np.array([
+        start_pos[0] + back_distance_m * back_x,
+        start_pos[1] + back_distance_m * back_y,
+    ], dtype=np.float32)
+
+    n_hold = max(1, int(round(hold_time_s * policy_hz)))
+    n_lift = max(1, int(round((lift_height_m / lift_speed_mps) * policy_hz)))
+    n_move = max(1, int(round((back_distance_m / lift_speed_mps) * policy_hz))) if lift_speed_mps > 0.0 else 1
+
+    # z: hold at 0 -> ramp up -> stay at height during move -> hold at height
+    z_hold       = np.zeros(n_hold, dtype=np.float32)
+    z_move       = np.full(n_move, lift_height_m, dtype=np.float32)
+    z_final_hold = np.full(n_lift, lift_height_m, dtype=np.float32)
+    if trapezoid:
+        z_up = _trapezoid_ramp(n_lift, 0.0, lift_height_m)
+    else:
+        z_up = np.linspace(0.0, lift_height_m, n_lift + 1, dtype=np.float32)[1:]
+    z = np.concatenate([z_hold, z_up, z_move, z_final_hold])
+
+    # xy: fixed during hold+lift, ramp toward target, hold at target
+    T = z.shape[0]
+    xy = np.tile(start_pos[:2], (T, 1))
+    i_move_start = n_hold + n_lift
+    if trapezoid:
+        alphas = _trapezoid_ramp(n_move, 0.0, 1.0)
+        for k in range(n_move):
+            xy[i_move_start + k] = start_pos[:2] + alphas[k] * (target_xy - start_pos[:2])
+    else:
+        for k in range(n_move):
+            alpha = (k + 1) / n_move
+            xy[i_move_start + k] = start_pos[:2] + alpha * (target_xy - start_pos[:2])
+    xy[i_move_start + n_move:] = target_xy
+
+    pos  = np.tile(start_pos,       (T, 1))
+    quat = np.tile(start_quat_wxyz, (T, 1))
+    pos[:, 0] = xy[:, 0]
+    pos[:, 1] = xy[:, 1]
+    pos[:, 2] = start_pos[2] + z
+    return pos, quat
+
+
+def _build_lift_back_left_down_traj(
+    start_pos: np.ndarray,
+    start_quat_wxyz: np.ndarray,
+    robot_quat_wxyz: np.ndarray,
+    policy_hz: float,
+    hold_time_s: float = 4.0,
+    lift_height_m: float = 0.4,
+    lift_speed_mps: float = 0.4,
+    back_distance_m: float = 0.4,
+    left_distance_m: float = 0.3,
+    lower_height_m: float = 0.8,
+    trapezoid: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Hold, lift up, move back, move left (all at lift height), lower down, hold.
+
+    Directions are relative to robot heading (yaw).
+    Trajectory is sampled at policy_hz so that one frame = one policy step.
+    Returns (pos [T,3], quat_wxyz [T,4]).
+    """
+    start_pos       = np.asarray(start_pos,       dtype=np.float32).reshape(3)
+    start_quat_wxyz = np.asarray(start_quat_wxyz, dtype=np.float32).reshape(4)
+    robot_quat_wxyz = np.asarray(robot_quat_wxyz, dtype=np.float32).reshape(4)
+
+    # Robot heading -> back and left unit vectors in world XY plane
+    w, x, y, z = robot_quat_wxyz.astype(np.float64)
+    fwd_x = 1.0 - 2.0 * (y * y + z * z)
+    fwd_y = 2.0 * (x * y + w * z)
+    norm  = np.hypot(fwd_x, fwd_y)
+    back_x = float(-fwd_x / norm)
+    back_y = float(-fwd_y / norm)
+    yaw    = np.arctan2(fwd_y, fwd_x)
+    left_x = float(-np.sin(yaw))
+    left_y = float( np.cos(yaw))
+
+    after_back_xy = np.array([
+        start_pos[0] + back_distance_m * back_x,
+        start_pos[1] + back_distance_m * back_y,
+    ], dtype=np.float32)
+    target_xy = np.array([
+        after_back_xy[0] + left_distance_m * left_x,
+        after_back_xy[1] + left_distance_m * left_y,
+    ], dtype=np.float32)
+
+    n_hold   = max(1, int(round(hold_time_s * policy_hz)))
+    n_lift   = max(1, int(round((lift_height_m / lift_speed_mps) * policy_hz)))
+    n_back   = max(1, int(round((back_distance_m / lift_speed_mps) * policy_hz))) if lift_speed_mps > 0.0 else 1
+    n_left   = max(1, int(round((left_distance_m / lift_speed_mps) * policy_hz))) if lift_speed_mps > 0.0 else 1
+    n_lower  = max(1, int(round((lower_height_m  / lift_speed_mps) * policy_hz)))
+
+    # z: hold -> lift -> back (high) -> left (high) -> lower -> hold
+    final_z_off = lift_height_m - lower_height_m
+    z_hold       = np.zeros(n_hold, dtype=np.float32)
+    z_back       = np.full(n_back, lift_height_m, dtype=np.float32)
+    z_left       = np.full(n_left, lift_height_m, dtype=np.float32)
+    z_final_hold = np.full(n_hold, final_z_off,   dtype=np.float32)
+    if trapezoid:
+        z_up   = _trapezoid_ramp(n_lift,  0.0,           lift_height_m)
+        z_down = _trapezoid_ramp(n_lower, lift_height_m, final_z_off)
+    else:
+        z_up   = np.linspace(0.0,           lift_height_m, n_lift  + 1, dtype=np.float32)[1:]
+        z_down = np.linspace(lift_height_m, final_z_off,   n_lower + 1, dtype=np.float32)[1:]
+    z = np.concatenate([z_hold, z_up, z_back, z_left, z_down, z_final_hold])
+
+    # xy: hold+lift fixed -> move back -> move left -> lower+hold at target
+    T  = z.shape[0]
+    xy = np.tile(start_pos[:2], (T, 1))
+
+    i_back  = n_hold + n_lift
+    i_left  = i_back  + n_back
+    i_lower = i_left  + n_left
+
+    if trapezoid:
+        alphas_back = _trapezoid_ramp(n_back, 0.0, 1.0)
+        for k in range(n_back):
+            xy[i_back + k] = start_pos[:2] + alphas_back[k] * (after_back_xy - start_pos[:2])
+        alphas_left = _trapezoid_ramp(n_left, 0.0, 1.0)
+        for k in range(n_left):
+            xy[i_left + k] = after_back_xy + alphas_left[k] * (target_xy - after_back_xy)
+    else:
+        for k in range(n_back):
+            alpha = (k + 1) / n_back
+            xy[i_back + k] = start_pos[:2] + alpha * (after_back_xy - start_pos[:2])
+        for k in range(n_left):
+            alpha = (k + 1) / n_left
+            xy[i_left + k] = after_back_xy + alpha * (target_xy - after_back_xy)
+    xy[i_lower:] = target_xy
+
+    pos  = np.tile(start_pos,       (T, 1))
+    quat = np.tile(start_quat_wxyz, (T, 1))
+    pos[:, 0] = xy[:, 0]
+    pos[:, 1] = xy[:, 1]
+    pos[:, 2] = start_pos[2] + z
     return pos, quat
 
 
@@ -837,6 +1099,8 @@ def build_ott_obs(
     obj_rot_seq_long: np.ndarray | None = None,         # (5, 4) wxyz long-horizon
     obj_world_pos_override: np.ndarray | None = None,   # (3,) override object world pos (virtual mode)
     obj_world_quat_override: np.ndarray | None = None,  # (4,) override object world quat wxyz (virtual mode)
+    obj_heading_pos_override: np.ndarray | None = None,  # (3,) override heading-frame obj pos (cache_world=False dropout)
+    obj_heading_rot_6d_override: np.ndarray | None = None,  # (6,) override heading-frame obj rot 6d
 ) -> np.ndarray:
     """Build the OTT policy observation vector.
 
@@ -873,15 +1137,20 @@ def build_ott_obs(
     proj_grav = quat_rotate_inverse(base_quat, np.array([0.0, 0.0, -1.0], dtype=np.float32))
 
     # ── Object state ───────────────────────────────────────────────────────
-    if obj_world_pos_override is not None and obj_world_quat_override is not None:
-        obj_pos_world  = np.asarray(obj_world_pos_override,  dtype=np.float32).reshape(3)
-        obj_quat_world = np.asarray(obj_world_quat_override, dtype=np.float32).reshape(4)
+    if obj_heading_pos_override is not None and obj_heading_rot_6d_override is not None:
+        # Direct heading-frame override (cache_world=False dropout): skip world→heading transform.
+        cur_obj_pos    = np.asarray(obj_heading_pos_override, dtype=np.float32).reshape(3)
+        cur_obj_rot_6d = np.asarray(obj_heading_rot_6d_override, dtype=np.float32).reshape(6)
     else:
-        obj_pos_world  = data.qpos[obj_qpos_addr:obj_qpos_addr + 3].astype(np.float32)
-        obj_quat_world = data.qpos[obj_qpos_addr + 3:obj_qpos_addr + 7].astype(np.float32)  # wxyz
+        if obj_world_pos_override is not None and obj_world_quat_override is not None:
+            obj_pos_world  = np.asarray(obj_world_pos_override,  dtype=np.float32).reshape(3)
+            obj_quat_world = np.asarray(obj_world_quat_override, dtype=np.float32).reshape(4)
+        else:
+            obj_pos_world  = data.qpos[obj_qpos_addr:obj_qpos_addr + 3].astype(np.float32)
+            obj_quat_world = data.qpos[obj_qpos_addr + 3:obj_qpos_addr + 7].astype(np.float32)  # wxyz
 
-    cur_obj_pos    = obj_pos_rel_heading(obj_pos_world, torso_pos, hquat)
-    cur_obj_rot_6d = obj_rot_rel_heading(obj_quat_world, hquat)
+        cur_obj_pos    = obj_pos_rel_heading(obj_pos_world, torso_pos, hquat)
+        cur_obj_rot_6d = obj_rot_rel_heading(obj_quat_world, hquat)
 
     # ── Proprio features ───────────────────────────────────────────────────
     joint_pos_rel = joint_pos - DEFAULT_DOF_ANGLES
@@ -1053,8 +1322,8 @@ def run(args):
     root = Path(__file__).parent
     pkl_path = args.pkl
 
-    if args.lift and args.stay:
-        raise ValueError("--lift and --stay are mutually exclusive.")
+    if sum([args.lift, args.stay, args.left_down, args.back, args.lift_back_left_down]) > 1:
+        raise ValueError("--lift, --stay, --left-down, --back, and --lift-back-left-down are mutually exclusive.")
 
     # ── Load motion clip ───────────────────────────────────────────────────
     motion        = load_motion_clip(pkl_path, args.clip_key)
@@ -1080,6 +1349,7 @@ def run(args):
             motion["obj_pos"][_lift_t],
             motion["obj_rot"][_lift_t],
             policy_hz=float(args.policy_hz),
+            trapezoid=args.trapezoid,
         )
         new_len = lift_pos.shape[0]
         motion  = dict(motion)
@@ -1149,6 +1419,120 @@ def run(args):
             f"object fixed at init pose)"
         )
 
+    # ── Left-down trajectory (lift, move left, lower) ─────────────────────
+    if args.left_down:
+        _ld_t = min(int(getattr(args, "init_timestep", 0)), motion["obj_pos"].shape[0] - 1)
+        ld_pos, ld_quat = _build_left_down_traj(
+            motion["obj_pos"][_ld_t],
+            motion["obj_rot"][_ld_t],
+            motion["root_quat_all"][_ld_t],
+            policy_hz=float(args.policy_hz),
+            trapezoid=args.trapezoid,
+        )
+        new_len = ld_pos.shape[0]
+        motion  = dict(motion)
+        motion["obj_pos"] = ld_pos
+        motion["obj_rot"] = ld_quat
+        for key in ("dof_pos",):
+            arr = motion[key]
+            if arr.shape[0] < new_len:
+                pad = new_len - arr.shape[0]
+                motion[key] = np.concatenate(
+                    [arr, np.tile(arr[-1:], (pad, 1))], axis=0
+                )
+        for key in ("root_pos_all", "root_quat_all"):
+            arr = motion[key]
+            if arr.shape[0] < new_len:
+                pad = new_len - arr.shape[0]
+                motion[key] = np.concatenate(
+                    [arr, np.tile(arr[-1:], (pad, 1))], axis=0
+                )
+        motion["motion_length"] = new_len
+        motion["motion_fps"]    = float(args.policy_hz)
+        motion_fps    = float(args.policy_hz)
+        motion_length = new_len
+        print(
+            f"Left-down trajectory: {new_len} frames "
+            f"({new_len / motion_fps:.2f}s @ {motion_fps:.0f}Hz, "
+            f"lift→left→lower)"
+        )
+
+    # ── Back trajectory (lift then move back in -x) ────────────────────────
+    if args.back:
+        _back_t = min(int(getattr(args, "init_timestep", 0)), motion["obj_pos"].shape[0] - 1)
+        back_pos, back_quat = _build_back_traj(
+            motion["obj_pos"][_back_t],
+            motion["obj_rot"][_back_t],
+            motion["root_quat_all"][_back_t],
+            policy_hz=float(args.policy_hz),
+            trapezoid=args.trapezoid,
+        )
+        new_len = back_pos.shape[0]
+        motion  = dict(motion)
+        motion["obj_pos"] = back_pos
+        motion["obj_rot"] = back_quat
+        for key in ("dof_pos",):
+            arr = motion[key]
+            if arr.shape[0] < new_len:
+                pad = new_len - arr.shape[0]
+                motion[key] = np.concatenate(
+                    [arr, np.tile(arr[-1:], (pad, 1))], axis=0
+                )
+        for key in ("root_pos_all", "root_quat_all"):
+            arr = motion[key]
+            if arr.shape[0] < new_len:
+                pad = new_len - arr.shape[0]
+                motion[key] = np.concatenate(
+                    [arr, np.tile(arr[-1:], (pad, 1))], axis=0
+                )
+        motion["motion_length"] = new_len
+        motion["motion_fps"]    = float(args.policy_hz)
+        motion_fps    = float(args.policy_hz)
+        motion_length = new_len
+        print(
+            f"Back trajectory: {new_len} frames "
+            f"({new_len / motion_fps:.2f}s @ {motion_fps:.0f}Hz, "
+            f"hold→lift 0.5m→move back 0.3m)"
+        )
+
+    # ── Lift-back-left-down trajectory ─────────────────────────────────────
+    if args.lift_back_left_down:
+        _t = min(int(getattr(args, "init_timestep", 0)), motion["obj_pos"].shape[0] - 1)
+        lbld_pos, lbld_quat = _build_lift_back_left_down_traj(
+            motion["obj_pos"][_t],
+            motion["obj_rot"][_t],
+            motion["root_quat_all"][_t],
+            policy_hz=float(args.policy_hz),
+            trapezoid=args.trapezoid,
+        )
+        new_len = lbld_pos.shape[0]
+        motion  = dict(motion)
+        motion["obj_pos"] = lbld_pos
+        motion["obj_rot"] = lbld_quat
+        for key in ("dof_pos",):
+            arr = motion[key]
+            if arr.shape[0] < new_len:
+                pad = new_len - arr.shape[0]
+                motion[key] = np.concatenate(
+                    [arr, np.tile(arr[-1:], (pad, 1))], axis=0
+                )
+        for key in ("root_pos_all", "root_quat_all"):
+            arr = motion[key]
+            if arr.shape[0] < new_len:
+                pad = new_len - arr.shape[0]
+                motion[key] = np.concatenate(
+                    [arr, np.tile(arr[-1:], (pad, 1))], axis=0
+                )
+        motion["motion_length"] = new_len
+        motion["motion_fps"]    = float(args.policy_hz)
+        motion_fps    = float(args.policy_hz)
+        motion_length = new_len
+        print(
+            f"Lift-back-left-down trajectory: {new_len} frames "
+            f"({new_len / motion_fps:.2f}s @ {motion_fps:.0f}Hz, "
+            f"hold→lift 0.5m→back 0.3m→left 0.9m→lower 0.8m→hold)"
+        )
+
     # ── Resolve XML from obj_name ──────────────────────────────────────────
     xml_dir  = root / "src/holosoma/holosoma/data/robots/g1/g1_object"
     if args.debug_file is not None:
@@ -1163,6 +1547,7 @@ def run(args):
 
     policy_path = args.policy or str(
         root / "src/holosoma_inference/holosoma_inference/models/wbt/object/bps_policy.onnx"
+        # root / "src/holosoma_inference/holosoma_inference/models/wbt/object/cube_local_0323.onnx"
     )
 
     # ── Load ONNX policy ───────────────────────────────────────────────────
@@ -1192,6 +1577,18 @@ def run(args):
         model = mujoco.MjModel.from_xml_path(xml_path)
     data  = mujoco.MjData(model)
     model.opt.timestep = 1.0 / args.sim_hz
+    # ── Override floor friction if requested ──────────────────────────────
+    if args.floor_friction is not None:
+        fric = args.floor_friction
+        floor_geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
+        if floor_geom_id >= 0:
+            model.geom_friction[floor_geom_id] = [fric, 0.005, 0.0001]
+        # Also update foot-floor contact pairs
+        for i in range(model.npair):
+            pair_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_PAIR, i)
+            if pair_name and "floor" in pair_name:
+                model.pair_friction[i] = [fric, fric, 0.005, 0.0001, 0.0001]
+        print(f"  Floor friction overridden to {fric}")
     sim_dt           = float(model.opt.timestep)
     steps_per_policy = args.sim_hz // args.policy_hz
     policy_dt        = sim_dt * steps_per_policy
@@ -1714,6 +2111,20 @@ def run(args):
             f"(--stabilize-sec) before OTT inference."
         )
 
+    # ── Object dropout state ──────────────────────────────────────────────
+    dropout_remaining_steps = 0  # steps left in current dropout block
+    dropout_cached_obj_pos: np.ndarray | None = None   # (3,) cached world pos (cache_world=True)
+    dropout_cached_obj_quat: np.ndarray | None = None  # (4,) cached world quat wxyz (cache_world=True)
+    dropout_cached_heading_pos: np.ndarray | None = None    # (3,) cached heading-frame pos (cache_world=False)
+    dropout_cached_heading_rot_6d: np.ndarray | None = None # (6,) cached heading-frame rot 6d (cache_world=False)
+    if args.object_dropout:
+        mode_str = "cache_world (re-project)" if args.cache_world else "freeze heading-frame"
+        print(
+            f"Object dropout enabled (prob={args.object_dropout_prob:.2f}, "
+            f"duration=[{args.object_dropout_sec_min:.2f}, {args.object_dropout_sec_max:.2f}]s, "
+            f"mode={mode_str})"
+        )
+
     # ── Trajectory visualization state (world-frame positions) ────────────
     _viz_short_pos: list = []   # (10, 3) world-frame short-horizon points
     _viz_long_pos:  list = []   # (5,  3) world-frame long-horizon points
@@ -1723,6 +2134,13 @@ def run(args):
         obj_init_z = float(motion["obj_pos"][init_t][2])
     else:
         obj_init_z = float(data.qpos[obj_qpos_addr + 2])
+    # ── Fixed object observation (--fix-object) ───────────────────────────
+    _fix_obj_pos  = None
+    _fix_obj_quat = None
+    if args.fix_object:
+        _fix_obj_pos  = data.qpos[obj_qpos_addr:obj_qpos_addr + 3].astype(np.float32).copy()
+        _fix_obj_quat = data.qpos[obj_qpos_addr + 3:obj_qpos_addr + 7].astype(np.float32).copy()
+        print(f"  --fix-object: observation frozen at pos={_fix_obj_pos.tolist()}, quat={_fix_obj_quat.tolist()}")
     table_hidden = False
     _TABLE_HIDDEN_POS  = np.array([0.0, 0.0, -10.0], dtype=np.float64)
     _table_orig_pos    = motion["table_pos"].copy()
@@ -1735,6 +2153,9 @@ def run(args):
 
     def _on_policy_step():
         nonlocal last_raw_action, target_q, motion_time_acc, motion_timestep, policy_step, table_hidden
+        nonlocal dropout_remaining_steps, dropout_cached_obj_pos, dropout_cached_obj_quat
+        nonlocal dropout_cached_heading_pos, dropout_cached_heading_rot_6d
+        nonlocal _dropout_viz_active, _dropout_viz_pos
         nonlocal stabilize_active, stabilize_last_action_29, stabilize_cmd_timestep, stabilize_cmd_time_acc
 
         # Optional stabilization stage: run same master-policy path as wbt_mw for 1s.
@@ -1816,6 +2237,75 @@ def run(args):
             model.body_quat[obj_body_id] = virtual_obj_quat.astype(np.float64)
             mujoco.mj_forward(model, data)
 
+        # ── Object dropout: simulate apriltag undetection ──────────────────
+        _dropout_heading_pos = None
+        _dropout_heading_rot_6d = None
+        if args.object_dropout:
+            # Read the current (true) object world pose.
+            if virtual_obj_pos is not None:
+                _live_obj_pos  = virtual_obj_pos
+                _live_obj_quat = virtual_obj_quat
+            else:
+                _live_obj_pos  = data.qpos[obj_qpos_addr:obj_qpos_addr + 3].astype(np.float32)
+                _live_obj_quat = data.qpos[obj_qpos_addr + 3:obj_qpos_addr + 7].astype(np.float32)
+
+            # Compute heading-frame observation for caching (cache_world=False).
+            torso_pos_now  = data.xpos[torso_body_id].astype(np.float32)
+            torso_quat_now = data.xquat[torso_body_id].astype(np.float32)
+            hquat_now = heading_quat(torso_quat_now)
+            _live_heading_pos    = obj_pos_rel_heading(_live_obj_pos, torso_pos_now, hquat_now)
+            _live_heading_rot_6d = obj_rot_rel_heading(_live_obj_quat, hquat_now)
+
+            _in_dropout = False
+            if dropout_remaining_steps > 0:
+                # Still inside a dropout block.
+                dropout_remaining_steps -= 1
+                _in_dropout = True
+                if args.cache_world:
+                    # Re-project cached world pose into current heading frame.
+                    virtual_obj_pos  = dropout_cached_obj_pos
+                    virtual_obj_quat = dropout_cached_obj_quat
+                else:
+                    # Freeze the heading-frame observation as-is.
+                    _dropout_heading_pos    = dropout_cached_heading_pos
+                    _dropout_heading_rot_6d = dropout_cached_heading_rot_6d
+            elif np.random.random() < args.object_dropout_prob:
+                # Start a new dropout block with random duration.
+                dur = np.random.uniform(args.object_dropout_sec_min, args.object_dropout_sec_max)
+                dropout_remaining_steps = max(1, int(round(dur * args.policy_hz)))
+                _in_dropout = True
+                # Cache both world-frame and heading-frame for the chosen mode.
+                dropout_cached_obj_pos      = _live_obj_pos.copy()
+                dropout_cached_obj_quat     = _live_obj_quat.copy()
+                dropout_cached_heading_pos    = _live_heading_pos.copy()
+                dropout_cached_heading_rot_6d = _live_heading_rot_6d.copy()
+                if args.cache_world:
+                    virtual_obj_pos  = dropout_cached_obj_pos
+                    virtual_obj_quat = dropout_cached_obj_quat
+                else:
+                    _dropout_heading_pos    = dropout_cached_heading_pos
+                    _dropout_heading_rot_6d = dropout_cached_heading_rot_6d
+            else:
+                # Not in dropout — update caches with live values.
+                dropout_cached_obj_pos      = _live_obj_pos.copy()
+                dropout_cached_obj_quat     = _live_obj_quat.copy()
+                dropout_cached_heading_pos    = _live_heading_pos.copy()
+                dropout_cached_heading_rot_6d = _live_heading_rot_6d.copy()
+
+            # Update dropout visualization state.
+            _dropout_viz_active = _in_dropout
+            if _in_dropout:
+                if args.cache_world:
+                    # Perceived position IS the cached world-frame pos.
+                    _dropout_viz_pos = dropout_cached_obj_pos.astype(np.float64)
+                else:
+                    # Convert frozen heading-frame pos back to world frame for rendering.
+                    _dropout_viz_pos = (
+                        torso_pos_now + quat_rotate(hquat_now, dropout_cached_heading_pos)
+                    ).astype(np.float64)
+            else:
+                _dropout_viz_pos = None
+
         obs = build_ott_obs(
             data, dof_qpos_addrs, dof_qvel_addrs,
             robot_qpos_addr, obj_qpos_addr, torso_body_id,
@@ -1825,8 +2315,10 @@ def run(args):
             obj_rot_seq=seq_rot,
             obj_pos_seq_long=seq_pos_long,
             obj_rot_seq_long=seq_rot_long,
-            obj_world_pos_override=virtual_obj_pos,
-            obj_world_quat_override=virtual_obj_quat,
+            obj_world_pos_override=_fix_obj_pos if _fix_obj_pos is not None else virtual_obj_pos,
+            obj_world_quat_override=_fix_obj_quat if _fix_obj_quat is not None else virtual_obj_quat,
+            obj_heading_pos_override=_dropout_heading_pos,
+            obj_heading_rot_6d_override=_dropout_heading_rot_6d,
         )
 
         # ── Policy inference ───────────────────────────────────────────────
@@ -1875,11 +2367,21 @@ def run(args):
         nonlocal last_raw_action, target_q, motion_timestep, motion_time_acc, policy_step, table_hidden
         nonlocal stabilize_last_action_29, stabilize_active, stabilize_start_sim_time
         nonlocal stabilize_cmd_timestep, stabilize_cmd_time_acc
+        nonlocal dropout_remaining_steps, dropout_cached_obj_pos, dropout_cached_obj_quat
+        nonlocal dropout_cached_heading_pos, dropout_cached_heading_rot_6d
+        nonlocal _dropout_viz_active, _dropout_viz_pos
         last_raw_action = np.zeros(len(ACTION_ORDER_43DOF), dtype=np.float32)
         motion_timestep = init_t
         motion_time_acc = init_t / motion_fps
         policy_step     = 0
         table_hidden    = False
+        dropout_remaining_steps     = 0
+        dropout_cached_obj_pos      = None
+        dropout_cached_obj_quat     = None
+        dropout_cached_heading_pos    = None
+        dropout_cached_heading_rot_6d = None
+        _dropout_viz_active = False
+        _dropout_viz_pos = None
         obs_buf.reset()
         set_table_pose(model, _table_orig_pos, _table_orig_quat)
 
@@ -1934,8 +2436,8 @@ def run(args):
                 obj_rot_seq=seq_rot,
                 obj_pos_seq_long=seq_pos_long,
                 obj_rot_seq_long=seq_rot_long,
-                obj_world_pos_override=_reset_obj_pos,
-                obj_world_quat_override=_reset_obj_quat,
+                obj_world_pos_override=_fix_obj_pos if _fix_obj_pos is not None else _reset_obj_pos,
+                obj_world_quat_override=_fix_obj_quat if _fix_obj_quat is not None else _reset_obj_quat,
             )
             for buf in (
                 obs_buf.obj_pos, obs_buf.obj_rot_6d,
@@ -1954,8 +2456,8 @@ def run(args):
                 obj_rot_seq=seq_rot,
                 obj_pos_seq_long=seq_pos_long,
                 obj_rot_seq_long=seq_rot_long,
-                obj_world_pos_override=_reset_obj_pos,
-                obj_world_quat_override=_reset_obj_quat,
+                obj_world_pos_override=_fix_obj_pos if _fix_obj_pos is not None else _reset_obj_pos,
+                obj_world_quat_override=_fix_obj_quat if _fix_obj_quat is not None else _reset_obj_quat,
             )[0]
 
             # ── Verify bootstrapped obs against saved reference ────────────
@@ -1987,6 +2489,13 @@ def run(args):
     _LONG_RGBA    = np.array([0.9, 0.2, 0.2, 0.8], dtype=np.float32)   # red
     _SHORT_SIZE   = np.array([0.015, 0.0, 0.0], dtype=np.float64)
     _LONG_SIZE    = np.array([0.015, 0.0, 0.0], dtype=np.float64)
+    # Dropout visualization: robot-perceived object position during sensor dropout.
+    _DROPOUT_RGBA = np.array([1.0, 0.9, 0.0, 0.5], dtype=np.float32)   # yellow
+    _DROPOUT_SIZE = np.array([0.04, 0.0, 0.0], dtype=np.float64)
+    _DROPOUT_LINK_RGBA = np.array([1.0, 0.6, 0.0, 0.8], dtype=np.float32)  # orange
+    _DROPOUT_LINK_RADIUS = 0.01
+    _dropout_viz_active = False    # True while inside a dropout block
+    _dropout_viz_pos: np.ndarray | None = None  # (3,) world-frame perceived object position
     # Gantry visualization constants
     _GANTRY_ANCHOR_RGBA = np.array([1.0, 0.5, 0.0, 0.9], dtype=np.float32)  # orange sphere
     _GANTRY_ROPE_RGBA   = np.array([1.0, 0.8, 0.0, 0.7], dtype=np.float32)  # yellow capsule
@@ -2047,6 +2556,48 @@ def run(args):
                 )
                 scn.ngeom += 1
 
+    def _add_dropout_markers(scn) -> None:
+        """Draw the object position as perceived by the robot during dropout."""
+        if not _dropout_viz_active or _dropout_viz_pos is None:
+            return
+
+        max_g = scn.maxgeom
+        perceived_pos = np.asarray(_dropout_viz_pos, dtype=np.float64)
+        torso_pos = data.xpos[torso_body_id].astype(np.float64)
+
+        if scn.ngeom < max_g:
+            mujoco.mjv_initGeom(
+                scn.geoms[scn.ngeom],
+                mujoco.mjtGeom.mjGEOM_SPHERE,
+                _DROPOUT_SIZE,
+                perceived_pos,
+                _IDENTITY_MAT,
+                _DROPOUT_RGBA,
+            )
+            scn.ngeom += 1
+
+        if scn.ngeom < max_g:
+            vec = perceived_pos - torso_pos
+            length = float(np.linalg.norm(vec))
+            if length > 1e-4:
+                midpoint = (torso_pos + perceived_pos) * 0.5
+                z_axis = vec / length
+                perp = np.array([1.0, 0.0, 0.0]) if abs(z_axis[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+                x_axis = np.cross(perp, z_axis)
+                x_axis /= np.linalg.norm(x_axis)
+                y_axis = np.cross(z_axis, x_axis)
+                rot_mat = np.stack([x_axis, y_axis, z_axis], axis=1).flatten()
+                size = np.array([_DROPOUT_LINK_RADIUS, length * 0.5, 0.0], dtype=np.float64)
+                mujoco.mjv_initGeom(
+                    scn.geoms[scn.ngeom],
+                    mujoco.mjtGeom.mjGEOM_CAPSULE,
+                    size,
+                    midpoint,
+                    rot_mat,
+                    _DROPOUT_LINK_RGBA,
+                )
+                scn.ngeom += 1
+
     def _add_traj_markers(scn) -> None:
         max_g = scn.maxgeom
         for pts, size, rgba in (
@@ -2065,6 +2616,7 @@ def run(args):
                     rgba,
                 )
                 scn.ngeom += 1
+        _add_dropout_markers(scn)
         _add_gantry_markers(scn)
 
     try:
@@ -2186,6 +2738,37 @@ def main():
         ),
     )
     parser.add_argument(
+        "--left-down", "--left_down",
+        dest="left_down",
+        action="store_true",
+        help=(
+            "Replace the PKL object trajectory with a left-down command: "
+            "hold, lift up 0.5 m, move left to y=0.9 m, lower down 0.8 m, then hold."
+        ),
+    )
+    parser.add_argument(
+        "--back",
+        action="store_true",
+        help=(
+            "Replace the PKL object trajectory with a back command: "
+            "hold, lift up 0.5 m, then move back (-x) 0.3 m while staying lifted, then hold."
+        ),
+    )
+    parser.add_argument(
+        "--lift-back-left-down", "--lift_back_left_down",
+        dest="lift_back_left_down",
+        action="store_true",
+        help=(
+            "Replace the PKL object trajectory with a lift-back-left-down command: "
+            "hold, lift up 0.5 m, move back 0.3 m, move left 0.9 m, lower down 0.8 m, then hold."
+        ),
+    )
+    parser.add_argument(
+        "--trapezoid",
+        action="store_true",
+        help="Use trapezoidal velocity profile for trajectory ramps (default: linear).",
+    )
+    parser.add_argument(
         "--virtual",
         action="store_true",
         help=(
@@ -2219,6 +2802,13 @@ def main():
         help="Gantry rest length in metres (slack before the elastic band starts pulling). Default: 0.0.",
     )
     parser.add_argument(
+        "--floor-friction", "--floor_friction",
+        dest="floor_friction",
+        type=float,
+        default=None,
+        help="Override floor friction coefficient (applied to floor geom and all foot-floor contact pairs). Default: use XML values.",
+    )
+    parser.add_argument(
         "--reference-speed", "--reference_speed",
         dest="reference_speed",
         type=float,
@@ -2234,6 +2824,49 @@ def main():
         dest="plot_joint_action",
         action="store_true",
         help="Save per-joint OTT action plots/logs (raw + processed) to test_log/ on exit.",
+    )
+    parser.add_argument(
+        "--fix-object", "--fix_object",
+        dest="fix_object",
+        action="store_true",
+        help="Freeze object observation at its initial pose for the entire episode (object still moves in sim, but the policy always sees the first-frame pose).",
+    )
+    parser.add_argument(
+        "--object-dropout", "--object_dropout",
+        dest="object_dropout",
+        action="store_true",
+        help="Simulate apriltag undetection by randomly dropping object observations.",
+    )
+    parser.add_argument(
+        "--object-dropout-prob", "--object_dropout_prob",
+        dest="object_dropout_prob",
+        type=float,
+        default=0.3,
+        help="Per-step probability of starting a dropout block (when not already in one). Default: 0.3.",
+    )
+    parser.add_argument(
+        "--object-dropout-sec-min", "--object_dropout_sec_min",
+        dest="object_dropout_sec_min",
+        type=float,
+        default=0.1,
+        help="Minimum duration (seconds) of a simulated dropout block. Default: 0.1.",
+    )
+    parser.add_argument(
+        "--object-dropout-sec-max", "--object_dropout_sec_max",
+        dest="object_dropout_sec_max",
+        type=float,
+        default=1.0,
+        help="Maximum duration (seconds) of a simulated dropout block. Default: 1.0.",
+    )
+    parser.add_argument(
+        "--cache-world", "--cache_world",
+        dest="cache_world",
+        action="store_true",
+        help=(
+            "When object dropout is active: cache the world-frame pose and re-project into "
+            "the current heading frame each step (observation updates as robot moves). "
+            "When False (default): freeze the last heading-frame observation as-is."
+        ),
     )
     parser.add_argument("--record",    action="store_true", help="Record video while showing viewer.")
     parser.add_argument("--offscreen", action="store_true", help="Run headless, record video, stop when motion ends.")

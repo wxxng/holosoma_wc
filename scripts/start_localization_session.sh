@@ -40,9 +40,11 @@ commands+=("$CLEAN bash -c '$ROS_LOC && ros2 launch livox_ros_driver2 msg_MID360
 commands+=("$CLEAN bash -c '$ROS_LOC && rviz2 -d ~/ws_loc/src/FAST_LIO_LOCALIZATION_HUMANOID/FAST_LIO/rviz/fastlio.rviz'")
 
 if [ "$FAKE_OBJECT" != true ]; then
-    commands+=("$CLEAN bash -c '$ROS2_WS && ros2 launch realsense2_camera rs_launch.py enable_depth:=false rgb_camera.enable_auto_exposure:=false rgb_camera.color_profile:=640,480,30'")
+    commands+=("$CLEAN bash -c '$ROS2_WS && ros2 launch realsense2_camera rs_launch.py config_file:=/home/rllab3/ros2_ws/rs_rgb_manual.yaml'")
+    # commands+=("$CLEAN bash -c '$ROS2_WS && ros2 launch realsense2_camera rs_launch.py enable_depth:=false rgb_camera.enable_auto_exposure:=false exposure:=50 gain:=16 rgb_camera.color_profile:=640,480,30'")
     commands+=("$CLEAN bash -c '$ROS2_WS && ros2 launch apriltag_ros realsense_apriltag.launch.py'")
     commands+=("$CLEAN bash -c '$ROS2_WS && python3 ~/ros2_ws/src/apriltag_ros/scripts/bundle_pose_node.py --ros-args -p bundle_config_file:=\$HOME/ros2_ws/src/apriltag_ros/cfg/bundle.yaml'")
+    commands+=("$CLEAN bash -c 'mkdir -p ~/Desktop/codebase/unitreeG1/holosoma_wc/rosbag && source /opt/ros/jazzy/setup.bash && ros2 bag record /camera/camera/color/image_raw /pelvis_pose_world /object_pose_world /object_pose_torso /bundle_pose /object_detected -o ~/Desktop/codebase/unitreeG1/holosoma_wc/rosbag/\$(date +%Y%m%d_%H%M%S)'")
 fi
 
 commands+=("echo ${SUDO_PASS} | sudo -S true && cd ~/Desktop/codebase/unitreeG1/holosoma_wc && source scripts/source_holoinference_wc_setup.sh && python read_dof_pos_real.py --ros")
