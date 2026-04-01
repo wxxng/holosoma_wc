@@ -60,6 +60,37 @@ class NotebookMujocoSimulatorAdapter:
         raise RuntimeError(f"Body '{body_name}' not found in MuJoCo model.")
 
 
+def _make_body_state_getter(
+    sim: NotebookMujocoSimulatorAdapter,
+    body_id: int,
+    body_local_offset: np.ndarray | None = None,
+) -> callable:
+    """Return body/attachment point position and velocity in world frame."""
+    local_offset = None if body_local_offset is None else np.asarray(body_local_offset, dtype=np.float64)
+
+    def _get_state() -> tuple[np.ndarray, np.ndarray]:
+        body_xpos = sim.data.xpos[body_id].copy()
+        body_vel = np.zeros(6, dtype=np.float64)  # [angular_vel, linear_vel]
+        mujoco.mj_objectVelocity(
+            sim.model, sim.data, mujoco.mjtObj.mjOBJ_BODY, body_id, body_vel, 0
+        )
+        ang_vel = body_vel[:3]
+        lin_vel = body_vel[3:]
+
+        if local_offset is None:
+            return body_xpos, lin_vel
+
+        body_xmat = sim.data.xmat[body_id].reshape(3, 3)
+        ipos_local = sim.model.body_ipos[body_id]
+        body_origin_world = body_xpos - body_xmat @ ipos_local
+        apply_point_world = body_origin_world + body_xmat @ local_offset
+        r = apply_point_world - body_xpos
+        apply_point_vel = lin_vel + np.cross(ang_vel, r)
+        return apply_point_world, apply_point_vel
+
+    return _get_state
+
+
 def _make_point_force_apply(
     sim: NotebookMujocoSimulatorAdapter,
     body_id: int,
@@ -124,6 +155,11 @@ def create_mujoco_virtual_gantry(
         enable=enabled,
         attachment_body_names=search_names,
         cfg=gantry_cfg,
+    )
+    gantry._attachment_state_fn = _make_body_state_getter(
+        sim,
+        gantry.body_link_id,
+        None if force_local_offset is None else np.asarray(force_local_offset, dtype=np.float64),
     )
 
     if force_local_offset is not None:

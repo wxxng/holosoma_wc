@@ -1,9 +1,13 @@
 import csv
 import json
 import pickle
+import platform
 import signal
 import socket
 import sys
+import time
+
+import psutil
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -450,6 +454,19 @@ class WholeBodyTrackingPolicy(BasePolicy):
         self._master_last_action = None  # action order (43) for master policy
         self._stabilization_last_action_43 = None  # raw action (43) in ACTION_ORDER_43DOF
 
+        # Interp-to-first-frame mode: stabilization policy commanded to interpolate to first frame
+        self._interp_to_first_frame_mode = False
+        self._interp_to_first_frame_steps = 200  # number of policy steps to interpolate over
+        self._interp_to_first_frame_count = 0
+        self._interp_to_first_frame_start_q = None  # current dof_pos (motion order) at activation
+
+        # Interp-to-default mode: stabilization policy commanded to interpolate to default (zero) pose
+        self._interp_to_default_mode = False
+        self._interp_to_default_steps = 200
+        self._interp_to_default_count = 0
+        self._interp_to_default_start_q = None
+        self._hold_default_pose = False  # True after interp-to-default finishes, holds zero until d/X or s
+
         # Motion command is always body-only 29-DOF
         self.motion_body_indices = None
         self.motion_command_dofs = 29
@@ -464,9 +481,13 @@ class WholeBodyTrackingPolicy(BasePolicy):
 
         # Optional recorded object trajectory in world frame for BPS motion commands.
         self.record_traj = bool(getattr(config.task, "record_traj", False))
+        self.use_recorded_traj = bool(getattr(config.task, "use_recorded_traj", False))
         self._record_traj_active = False
+        self._recorded_obj_pos_w_source = None  # [num_frames, 3] saved absolute world trajectory
+        self._recorded_obj_rot_wxyz_source = None  # [num_frames, 4] saved absolute world trajectory
         self._recorded_obj_pos_w = None  # [num_frames, 3]
         self._recorded_obj_rot_wxyz = None  # [num_frames, 4]
+        self._recorded_traj_timestep = 0
         self._recorded_traj_time_buffer: list[float] = []
         self._recorded_traj_pos_buffer: list[np.ndarray] = []
         self._recorded_traj_rot_buffer: list[np.ndarray] = []
@@ -504,6 +525,20 @@ class WholeBodyTrackingPolicy(BasePolicy):
         else:
             raise ValueError("Robot config must specify motor_kd for WBT policy")
         
+        self._object_dropout = bool(getattr(config.task, "object_dropout", False))
+        self._object_dropout_prob = float(getattr(config.task, "object_dropout_prob", 0.3))
+        self._object_dropout_sec_min = float(getattr(config.task, "object_dropout_sec_min", 0.1))
+        self._object_dropout_sec_max = float(getattr(config.task, "object_dropout_sec_max", 1.0))
+        self._object_dropout_remaining_steps = 0  # steps left in current dropout block
+        if self._object_dropout:
+            logger.info(
+                colored(
+                    f"Object dropout enabled (prob={self._object_dropout_prob:.2f}, "
+                    f"duration=[{self._object_dropout_sec_min:.2f}, {self._object_dropout_sec_max:.2f}]s)",
+                    "cyan",
+                )
+            )
+
         self.use_gen_traj = config.task.use_gen_traj
         self._traj_gen = None
         self._gen_traj_initialized = False
@@ -511,8 +546,23 @@ class WholeBodyTrackingPolicy(BasePolicy):
             self._traj_gen = TrajectoryGenerator(
                 rl_rate=config.task.rl_rate,
                 mode=config.task.gen_traj_mode,
+                trapezoid=config.task.gen_traj_trapezoid,
             )
-        
+        if self.use_gen_traj and self.use_recorded_traj:
+            logger.warning("Both use_gen_traj and use_recorded_traj are enabled; use_gen_traj will take precedence.")
+
+        # Right hand open override: when active, command right hand to zeros
+        # and freeze the right hand observation to the snapshot taken at activation.
+        # Inference time profiling
+        self._inference_time_enabled = bool(getattr(config.task, "inference_time", False))
+        self._inference_time_count = 0
+        self._inference_times: list[float] = []  # all inference times in ms
+        self._inference_cpu_usages: list[float] = []  # CPU % per step
+
+        self._right_hand_open = False
+        self._right_hand_frozen_obs_pos = None  # [1, 7] snapshot of joint_pos_hand right-hand slice
+        self._right_hand_frozen_obs_vel = None  # [1, 7] snapshot of joint_vel_hand right-hand slice
+
         # Prompt user before entering stiff mode (only if stdin is available)
         def _show_warning():
             logger.warning(
@@ -540,6 +590,18 @@ class WholeBodyTrackingPolicy(BasePolicy):
                     "cyan",
                 )
             )
+            if self.use_gen_traj and self._traj_gen is not None:
+                zero_pos = np.zeros(3, dtype=np.float32)
+                identity_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+                pos_seq_w, quat_seq_wxyz = self._traj_gen.build_gen_traj(
+                    start_pos=zero_pos,
+                    start_quat_wxyz=identity_quat,
+                )
+                self.motion_obj_pos = pos_seq_w.astype(np.float32, copy=False)
+                self.motion_obj_rot = quat_seq_wxyz.astype(np.float32, copy=False)
+                self._motion_obj_pos_world = self.motion_obj_pos.copy()
+                self._motion_obj_rot_world_wxyz = self.motion_obj_rot.copy()
+                self.motion_fps = self.config.task.rl_rate
             self._send_rviz_traj()
 
         if sys.stdin.isatty():
@@ -664,6 +726,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
 
     def __del__(self):
         """Save log files on cleanup."""
+        self._print_inference_time_summary()
         # Save debug log
         if hasattr(self, 'debug_log_data') and self.debug_log_data is not None and len(self.debug_log_data.get("dof_pos", [])) > 0:
             self._save_debug_log()
@@ -724,9 +787,69 @@ class WholeBodyTrackingPolicy(BasePolicy):
     # Motion logging (observation terms + poses, collected after 's' key)
     # -------------------------------------------------------------------------
 
+    def _print_inference_time_summary(self):
+        if not hasattr(self, "_inference_times") or not self._inference_times:
+            return
+        times = np.array(self._inference_times)
+        avg = float(times.mean())
+        std = float(times.std())
+        mn, mx = float(times.min()), float(times.max())
+
+        # CPU info
+        try:
+            with open("/proc/cpuinfo") as f:
+                cpu_model = next(
+                    (line.split(":")[1].strip() for line in f if "model name" in line),
+                    platform.processor() or "unknown",
+                )
+        except Exception:
+            cpu_model = platform.processor() or "unknown"
+
+        # ONNX provider
+        providers = []
+        if hasattr(self, "onnx_policy_session"):
+            providers = self.onnx_policy_session.get_providers()
+        device = "GPU" if any("CUDA" in p or "Tensorrt" in p for p in providers) else "CPU"
+
+        logger.info(colored("\n" + "=" * 80, "green", attrs=["bold"]))
+        logger.info(colored("[Inference Time Summary (wall-clock)]", "green", attrs=["bold"]))
+        logger.info(colored(f"  Steps:      {len(times)}", "green"))
+        logger.info(colored(f"  Avg:        {avg:.2f} ms", "green"))
+        logger.info(colored(f"  Std:        {std:.2f} ms", "green"))
+        logger.info(colored(f"  Min:        {mn:.2f} ms", "green"))
+        logger.info(colored(f"  Max:        {mx:.2f} ms", "green"))
+        logger.info(colored(f"  CPU Model:  {cpu_model}", "green"))
+        logger.info(colored(f"  Device:     {device} (providers={providers})", "green"))
+        logger.info(colored("=" * 80 + "\n", "green", attrs=["bold"]))
+
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            fig, ax = plt.subplots(figsize=(10, 4))
+            ax.plot(times, color="steelblue", linewidth=0.8, label="Inference time")
+            ax.axhline(avg, color="red", linestyle="--", linewidth=1.0, label=f"Mean {avg:.2f} ms")
+            ax.fill_between(range(len(times)), avg - std, avg + std, alpha=0.2, color="red", label=f"±1σ {std:.2f} ms")
+            ax.set_xlabel("Step")
+            ax.set_ylabel("Inference time (ms)")
+            ax.set_title(f"Inference time over {len(times)} steps — {device}")
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+
+            out_path = Path("/tmp/inference_time.png")
+            fig.savefig(out_path, dpi=120, bbox_inches="tight")
+            plt.close(fig)
+            logger.info(colored(f"  Graph saved to {out_path}", "green"))
+        except Exception as e:
+            logger.warning(f"Could not save inference time graph: {e}")
+
+        self._inference_times = []  # avoid printing twice
+
     def _on_sigint(self, signum, frame):
         """Save logs on Ctrl+C, then propagate signal."""
         logger.info(colored("Ctrl+C detected — saving logs...", "yellow", attrs=["bold"]))
+        self._print_inference_time_summary()
         if self._motion_log_data:
             self._save_motion_log()
         # Restore previous handler and re-raise so the process exits normally
@@ -777,10 +900,76 @@ class WholeBodyTrackingPolicy(BasePolicy):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         return log_dir / f"recorded_object_traj_{timestamp}.pkl"
 
+    def _resolve_recorded_traj_path(self, configured_path: str | None = None) -> Path | None:
+        if configured_path:
+            resolved_path = Path(configured_path).expanduser()
+            if not resolved_path.exists():
+                raise FileNotFoundError(f"Configured recorded trajectory path does not exist: {resolved_path}")
+            return resolved_path
+
+        log_dir = Path("logs/recorded_object_traj")
+        if not log_dir.exists():
+            return None
+
+        candidates = list(log_dir.glob("recorded_object_traj_*.pkl"))
+        if not candidates:
+            return None
+        return max(candidates, key=lambda path: (path.stat().st_mtime_ns, path.name))
+
+    def _load_recorded_traj_from_pkl(self, configured_path: str | None = None) -> bool:
+        resolved_path = self._resolve_recorded_traj_path(configured_path)
+        if resolved_path is None:
+            return False
+
+        with resolved_path.open("rb") as f:
+            payload = pickle.load(f)
+
+        if not isinstance(payload, dict):
+            raise ValueError(f"Recorded trajectory file must contain a dict payload: {resolved_path}")
+
+        pos = np.asarray(payload.get("obj_pos_w"), dtype=np.float32)
+        rot = np.asarray(payload.get("obj_rot_wxyz"), dtype=np.float32)
+        if pos.ndim != 2 or pos.shape[1] != 3:
+            raise ValueError(f"Invalid obj_pos_w shape in recorded trajectory: {pos.shape}")
+        if rot.ndim != 2 or rot.shape[1] != 4:
+            raise ValueError(f"Invalid obj_rot_wxyz shape in recorded trajectory: {rot.shape}")
+        traj_len = min(pos.shape[0], rot.shape[0])
+        if traj_len <= 0:
+            raise ValueError(f"Recorded trajectory is empty: {resolved_path}")
+
+        recorded_pos_w = pos[:traj_len].astype(np.float32, copy=False)
+        recorded_rot_wxyz = self._normalize_quat_wxyz(
+            rot[:traj_len].astype(np.float32, copy=False)
+        )
+        self._recorded_obj_pos_w_source = recorded_pos_w.copy()
+        self._recorded_obj_rot_wxyz_source = recorded_rot_wxyz.copy()
+        self._recorded_obj_pos_w = recorded_pos_w.copy()
+        self._recorded_obj_rot_wxyz = recorded_rot_wxyz.copy()
+        self._recorded_traj_timestep = 0
+        self._recorded_traj_path = resolved_path
+
+        payload_obj_name = payload.get("motion_obj_name", None)
+        if payload_obj_name is not None:
+            self._apply_object_identity(payload_obj_name, source=f"recorded traj {resolved_path.name}")
+
+        source_fps = payload.get("fps", None)
+        logger.info(
+            colored(
+                f"Loaded recorded world-frame object trajectory: {resolved_path.resolve()} "
+                f"({traj_len} frames"
+                f"{'' if source_fps is None else f', saved_fps={float(source_fps):.1f}'}"
+                f", playback_fps={float(self.config.task.rl_rate):.1f})",
+                "cyan",
+                attrs=["bold"],
+            )
+        )
+        return True
+
     def _start_record_traj(self) -> None:
         self._recorded_traj_time_buffer = []
         self._recorded_traj_pos_buffer = []
         self._recorded_traj_rot_buffer = []
+        self._recorded_traj_timestep = 0
         self._recorded_traj_path = self._init_recorded_traj_path()
         self._record_traj_active = True
         logger.info(
@@ -815,8 +1004,11 @@ class WholeBodyTrackingPolicy(BasePolicy):
             float(self.config.task.rl_rate),
         )
         source_fps = self._estimate_sample_rate(raw_time)
-        self._recorded_obj_pos_w = pos
-        self._recorded_obj_rot_wxyz = quat
+        self._recorded_obj_pos_w_source = pos.copy()
+        self._recorded_obj_rot_wxyz_source = quat.copy()
+        self._recorded_obj_pos_w = pos.copy()
+        self._recorded_obj_rot_wxyz = quat.copy()
+        self._recorded_traj_timestep = 0
 
         payload = {
             "created_at": datetime.now().isoformat(),
@@ -889,6 +1081,91 @@ class WholeBodyTrackingPolicy(BasePolicy):
         self._recorded_traj_time_buffer.append(float(pose_timestamp))
         self._recorded_traj_pos_buffer.append(pos_w[0].astype(np.float32, copy=True))
         self._recorded_traj_rot_buffer.append(self._normalize_quat_wxyz(quat_wxyz)[0].astype(np.float32, copy=True))
+
+    def _has_recorded_world_traj(self) -> bool:
+        return (
+            self._recorded_obj_pos_w is not None
+            and self._recorded_obj_rot_wxyz is not None
+            and self._recorded_obj_pos_w.shape[0] > 0
+            and self._recorded_obj_rot_wxyz.shape[0] > 0
+        )
+
+    def _get_recorded_world_traj_len(self) -> int:
+        if not self._has_recorded_world_traj():
+            return 0
+        return min(self._recorded_obj_pos_w.shape[0], self._recorded_obj_rot_wxyz.shape[0])
+
+    def _get_recorded_traj_command_timestep(self) -> int:
+        traj_len = self._get_recorded_world_traj_len()
+        if traj_len <= 0:
+            return 0
+        return int(np.clip(self._recorded_traj_timestep, 0, traj_len - 1))
+
+    def _get_object_world_pose_for_command_start(self) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Get the best available live object world pose for command anchoring."""
+        obj_pos_w = getattr(self, "_cached_obj_pos_w_detection", None)
+        obj_quat_w = getattr(self, "_cached_obj_quat_w_detection", None)
+        if obj_pos_w is None:
+            obj_pos_w = self._get_object_pos_w()
+        if obj_quat_w is None:
+            obj_quat_w = self._get_object_quat_w()
+        return obj_pos_w, obj_quat_w
+
+    def _reanchor_recorded_world_traj_to_live_pose(self) -> bool:
+        """Rebase the recorded world trajectory onto the current live object pose."""
+        pos_src = self._recorded_obj_pos_w_source
+        rot_src = self._recorded_obj_rot_wxyz_source
+        if pos_src is None or rot_src is None:
+            pos_src = self._recorded_obj_pos_w
+            rot_src = self._recorded_obj_rot_wxyz
+        if pos_src is None or rot_src is None:
+            return False
+
+        pos_src = np.asarray(pos_src, dtype=np.float32)
+        rot_src = self._normalize_quat_wxyz(np.asarray(rot_src, dtype=np.float32))
+        if pos_src.ndim != 2 or pos_src.shape[1] != 3:
+            return False
+        if rot_src.ndim != 2 or rot_src.shape[1] != 4:
+            return False
+
+        traj_len = min(pos_src.shape[0], rot_src.shape[0])
+        if traj_len <= 0:
+            return False
+        pos_src = pos_src[:traj_len]
+        rot_src = rot_src[:traj_len]
+
+        live_pos_w, live_quat_wxyz = self._get_object_world_pose_for_command_start()
+        if live_pos_w is None or live_quat_wxyz is None:
+            return False
+        live_pos_w = np.asarray(live_pos_w, dtype=np.float32).reshape(1, 3)
+        live_quat_wxyz = self._normalize_quat_wxyz(
+            np.asarray(live_quat_wxyz, dtype=np.float32).reshape(1, 4)
+        )
+
+        init_pos_w = pos_src[0:1]
+        init_quat_wxyz = self._normalize_quat_wxyz(rot_src[0:1])
+        init_quat_inv = quat_inverse(init_quat_wxyz)
+        init_quat_inv_rep = np.repeat(init_quat_inv, traj_len, axis=0)
+
+        rel_pos = quat_apply(init_quat_inv_rep, pos_src - init_pos_w)
+        rel_quat = self._normalize_quat_wxyz(quat_mul(init_quat_inv_rep, rot_src))
+
+        live_quat_rep = np.repeat(live_quat_wxyz, traj_len, axis=0)
+        anchored_pos_w = live_pos_w + quat_apply(live_quat_rep, rel_pos)
+        anchored_quat_wxyz = self._normalize_quat_wxyz(quat_mul(live_quat_rep, rel_quat))
+
+        self._recorded_obj_pos_w = anchored_pos_w.astype(np.float32, copy=False)
+        self._recorded_obj_rot_wxyz = anchored_quat_wxyz.astype(np.float32, copy=False)
+        self._recorded_traj_timestep = 0
+        logger.info(
+            colored(
+                "Re-anchored recorded object trajectory to the current live object pose "
+                f"start_pos={live_pos_w.flatten().tolist()}, "
+                f"start_quat_wxyz={live_quat_wxyz.flatten().tolist()}",
+                "cyan",
+            )
+        )
+        return True
 
     @staticmethod
     def _estimate_sample_rate(sample_times: np.ndarray) -> float | None:
@@ -996,6 +1273,13 @@ class WholeBodyTrackingPolicy(BasePolicy):
         obj_quat_world_wxyz = self._get_object_quat_w()
         pelvis_pose_world = np.asarray(robot_state_data[0, :7], dtype=np.float32).copy()
 
+        # Log the ref body (torso_link) pose used for heading-frame commands.
+        # This differs from pelvis_pose_world when pinocchio FK is active.
+        ref_pos_w, ref_quat_wxyz = self._get_ref_body_pose_in_world(robot_state_data)
+        ref_body_pose_world = np.concatenate(
+            [ref_pos_w.reshape(3), ref_quat_wxyz.reshape(4)]
+        ).astype(np.float32)
+
         entry = {
             "motion_timestep": int(self.motion_timestep),
             "global_timestep": int(self.global_timestep),
@@ -1012,6 +1296,8 @@ class WholeBodyTrackingPolicy(BasePolicy):
             "object_pose_torso": self._pose_to_log_array(obj_pos_torso, obj_quat_torso_wxyz),
             "object_pose_world": self._pose_to_log_array(obj_pos_world, obj_quat_world_wxyz),
             "pelvis_pose_world": pelvis_pose_world,
+            "ref_body_pose_world": ref_body_pose_world,
+            "object_detected": bool(getattr(self, "_last_object_detected", True)),
         }
         self._motion_log_data.append(entry)
 
@@ -1323,6 +1609,12 @@ class WholeBodyTrackingPolicy(BasePolicy):
         # Stabilization uses the first motion frame only
         if self._soft_stop_active:
             current_obs_buffer_dict["motion_command_sequence"] = self._get_motion_command_sequence_soft_stop()
+        elif self._interp_to_default_mode:
+            current_obs_buffer_dict["motion_command_sequence"] = self._get_motion_command_sequence_interp_to_default(robot_state_data)
+        elif self._hold_default_pose:
+            current_obs_buffer_dict["motion_command_sequence"] = self._get_motion_command_sequence_hold_default()
+        elif self._interp_to_first_frame_mode:
+            current_obs_buffer_dict["motion_command_sequence"] = self._get_motion_command_sequence_interp_to_first(robot_state_data)
         else:
             current_obs_buffer_dict["motion_command_sequence"] = self._get_motion_command_sequence_first_frame()
 
@@ -1723,25 +2015,15 @@ class WholeBodyTrackingPolicy(BasePolicy):
         return command_seq.reshape(1, -1)
 
     def _get_motion_command_sequence_first_frame(self) -> np.ndarray:
-        """Get a 10-frame sequence repeating the configured start motion frame (body-only)."""
+        """Get a 10-frame sequence starting from the configured start frame (body-only).
+
+        Uses actual future frames (start_idx to start_idx+9) with real velocities,
+        matching the wbt_motion.py stabilization behaviour.
+        """
         if self.motion_dof_pos is None or self.motion_length == 0:
             return np.zeros((1, 10 * self.motion_command_dofs * 2), dtype=np.float32)
 
-        start_idx = self._get_motion_start_frame_index()
-        pos0 = self.motion_dof_pos[start_idx]
-        vel0 = self.motion_dof_vel[start_idx] if self.motion_dof_vel is not None else np.zeros_like(pos0)
-
-        if pos0.shape[0] != self.motion_command_dofs:
-            if self.motion_body_indices is not None:
-                pos0 = pos0[self.motion_body_indices]
-                vel0 = vel0[self.motion_body_indices]
-            else:
-                pos0 = pos0[: self.motion_command_dofs]
-                vel0 = vel0[: self.motion_command_dofs]
-
-        frame = np.concatenate([pos0, vel0], axis=0).reshape(1, -1)  # [1, 58]
-        seq = np.repeat(frame, 10, axis=0)  # [10, 58]
-        return seq.reshape(1, -1).astype(np.float32, copy=False)
+        return self._get_motion_command_sequence(self._get_motion_start_frame_index())
     
     def _get_motion_command_sequence_first_pos(self) -> np.ndarray:
         """Get a 10-frame sequence repeating the configured start motion position."""
@@ -2017,6 +2299,14 @@ class WholeBodyTrackingPolicy(BasePolicy):
         else:
             logger.warning(f"Motion PKL file not found. Searched: {[str(p) for p in pkl_search_paths]}")
 
+        if self.use_recorded_traj:
+            configured_recorded_traj_path = getattr(self.config.task, "recorded_traj_path", None)
+            if not self._load_recorded_traj_from_pkl(configured_recorded_traj_path):
+                logger.warning(
+                    "use_recorded_traj is enabled but no saved recorded trajectory was found; "
+                    "falling back to generated/clip object trajectory."
+                )
+
         # Policy function - simplified since motion is loaded separately
         def policy_act(input_feed):
             output = self.onnx_policy_session.run(["actions"], input_feed)
@@ -2032,6 +2322,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
             {
                 "motion_timestep": self.motion_timestep,
                 "motion_clip_key": self.motion_clip_key,
+                "recorded_traj_timestep": self._recorded_traj_timestep,
             }
         )
         return state
@@ -2040,6 +2331,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
         super()._restore_policy_state(state)
         self.motion_timestep = state.get("motion_timestep", self._get_configured_motion_start_timestep())
         self.motion_clip_key = state.get("motion_clip_key", None)
+        self._recorded_traj_timestep = int(state.get("recorded_traj_timestep", 0))
         self.motion_clip_progressing = False
         self.stabilization_mode = False
         self.motion_start_timestep = None
@@ -2265,9 +2557,24 @@ class WholeBodyTrackingPolicy(BasePolicy):
             hand_idx = self._proprio_hand_indices
             body_idx = self._proprio_body_indices
 
+            # Override hand joint velocities with finite-difference if enabled
+            if self._fd_hand_vel:
+                dof_vel_config = self._apply_fd_hand_vel(dof_pos_config, dof_vel_config, hand_idx)
+
             dof_pos_rel = dof_pos_config - self.default_dof_angles.reshape(1, -1)
-            current_obs_buffer_dict["joint_pos_hand"] = dof_pos_rel[:, hand_idx]
-            current_obs_buffer_dict["joint_vel_hand"] = dof_vel_config[:, hand_idx]
+            hand_pos_obs = dof_pos_rel[:, hand_idx]
+            hand_vel_obs = dof_vel_config[:, hand_idx]
+
+            # Right hand open override: freeze right hand observation (indices 7-13 in hand obs)
+            if self._right_hand_open:
+                if self._right_hand_frozen_obs_pos is not None:
+                    hand_pos_obs = hand_pos_obs.copy()
+                    hand_vel_obs = hand_vel_obs.copy()
+                    hand_pos_obs[:, 7:14] = self._right_hand_frozen_obs_pos
+                    hand_vel_obs[:, 7:14] = self._right_hand_frozen_obs_vel
+
+            current_obs_buffer_dict["joint_pos_hand"] = hand_pos_obs
+            current_obs_buffer_dict["joint_vel_hand"] = hand_vel_obs
             current_obs_buffer_dict["joint_pos_body"] = dof_pos_rel[:, body_idx]
             current_obs_buffer_dict["joint_vel_body"] = dof_vel_config[:, body_idx]
 
@@ -2535,34 +2842,146 @@ class WholeBodyTrackingPolicy(BasePolicy):
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Compute current object pos and 6D orientation in robot heading frame.
 
+        When the apriltag is detected, uses the fresh torso-frame measurement and
+        caches the corresponding world pose.  When undetected, the behaviour
+        depends on ``task.cache_world``:
+
+        * **cache_world=True** – falls back to the cached world pose and
+          re-projects it into the current heading frame so that the observation
+          stays consistent even as the robot's torso moves.
+        * **cache_world=False** (default) – simply reuses the last torso-frame
+          observation as-is (no world-frame re-projection).
+
         Returns:
             obj_pos_rel  : (1, 3)  object position relative to torso in heading frame
             obj_rot_6d   : (1, 6)  object 6D rotation in heading frame (first 2 columns of R)
             yaw_quat     : (1, 4)  heading (yaw-only) quaternion wxyz for reuse
         """
+        cache_world = bool(getattr(self.config.task, "cache_world", False))
+
         torso_pos_w, ref_quat_wxyz = self._get_ref_body_pose_in_world(robot_state_data)
         _, _, yaw = quat_to_rpy(ref_quat_wxyz.reshape(-1))
         yaw_quat = rpy_to_quat((0.0, 0.0, yaw)).reshape(1, 4)
 
+        # Clear stale detection caches if the UDP bridge was restarted.
+        if getattr(self.interface, "pending_reset", False):
+            self._cached_obj_pos_w_detection = None
+            self._cached_obj_quat_w_detection = None
+            self._cached_obj_pos_rel = None
+            self._cached_obj_rot_6d = None
+            self._undetected_logged = False
+            # Also clear freeze-mode cache so a stale frozen pose isn't used.
+            self._cached_object_pos_w = None
+            self._cached_object_quat_w = None
+            self.interface.pending_reset = False
+            self.logger.info("Detection caches cleared after UDP bridge reset.")
+
+        # Check whether the apriltag is currently detected.
+        object_detected = True
+        if hasattr(self.interface, "is_object_detected"):
+            object_detected = self.interface.is_object_detected()
+
+        # Simulate contiguous dropout blocks in sim for testing.
+        if self._object_dropout:
+            if self._object_dropout_remaining_steps > 0:
+                # Still inside a dropout block.
+                self._object_dropout_remaining_steps -= 1
+                object_detected = False
+            elif object_detected and np.random.random() < self._object_dropout_prob:
+                # Start a new dropout block with random duration.
+                rl_rate = float(getattr(self.config.task, "rl_rate", 50))
+                dur = np.random.uniform(self._object_dropout_sec_min, self._object_dropout_sec_max)
+                self._object_dropout_remaining_steps = max(1, int(round(dur * rl_rate)))
+                object_detected = False
+
+        # Store effective detection status for motion log.
+        self._last_object_detected = object_detected
+
         obj_pos_torso, obj_quat_torso_wxyz = self._get_object_pose_torso()
-        if obj_pos_torso is not None:
-            # Convert torso-frame measurement into the policy heading frame.
+
+        if object_detected and obj_pos_torso is not None:
+            # Fresh torso-frame measurement → use it.
             delta_w = quat_apply(ref_quat_wxyz, obj_pos_torso)
             obj_pos_rel = quat_rotate_inverse(yaw_quat, delta_w).astype(np.float32)
-        else:
+            # Cache the world-frame pose for fallback during undetection.
+            self._cached_obj_pos_w_detection = (
+                torso_pos_w.reshape(1, 3) + delta_w.reshape(1, 3)
+            )
+            # Cache the torso-frame observation for non-cache_world fallback.
+            self._cached_obj_pos_rel = obj_pos_rel.copy()
+        elif object_detected:
+            # Detected but no torso-frame pose (e.g. sim with UDP object state).
+            # Read live world pose and cache it.
             obj_pos_w = self._get_object_pos_w()
             if obj_pos_w is not None:
+                self._cached_obj_pos_w_detection = obj_pos_w.copy()
                 delta = obj_pos_w - torso_pos_w.reshape(1, 3)
                 obj_pos_rel = quat_rotate_inverse(yaw_quat, delta).astype(np.float32)
             else:
                 obj_pos_rel = np.zeros((1, 3), dtype=np.float32)
-
-        if obj_quat_torso_wxyz is not None:
-            obj_quat_w = quat_mul(ref_quat_wxyz, self._normalize_quat_wxyz(obj_quat_torso_wxyz))
+            self._cached_obj_pos_rel = obj_pos_rel.copy()
         else:
-            obj_quat_w = self._get_object_quat_w()
+            # Undetected → fallback strategy depends on cache_world.
+            if not getattr(self, "_undetected_logged", False):
+                if cache_world:
+                    self.logger.warning(
+                        colored("[BPS] AprilTag undetected — using cached world pose for object observation", "yellow")
+                    )
+                else:
+                    self.logger.warning(
+                        colored("[BPS] AprilTag undetected — reusing last torso-frame observation", "yellow")
+                    )
+                self._undetected_logged = True
 
-        if obj_quat_w is not None:
+            if cache_world:
+                # Re-project cached world pose into current heading frame.
+                obj_pos_w = getattr(self, "_cached_obj_pos_w_detection", None)
+                if obj_pos_w is None:
+                    obj_pos_w = self._get_object_pos_w()
+                if obj_pos_w is not None:
+                    delta = obj_pos_w - torso_pos_w.reshape(1, 3)
+                    obj_pos_rel = quat_rotate_inverse(yaw_quat, delta).astype(np.float32)
+                else:
+                    obj_pos_rel = np.zeros((1, 3), dtype=np.float32)
+            else:
+                # Just reuse the last torso-frame observation as-is.
+                obj_pos_rel = getattr(self, "_cached_obj_pos_rel", None)
+                if obj_pos_rel is None:
+                    obj_pos_rel = np.zeros((1, 3), dtype=np.float32)
+
+        if object_detected:
+            self._undetected_logged = False
+
+        if object_detected and obj_quat_torso_wxyz is not None:
+            obj_quat_w = quat_mul(ref_quat_wxyz, self._normalize_quat_wxyz(obj_quat_torso_wxyz))
+            self._cached_obj_quat_w_detection = obj_quat_w.copy()
+            # Cache heading-frame rotation for non-cache_world fallback.
+            q_w2h = quat_inverse(yaw_quat)
+            q_obj_h = quat_mul(q_w2h, self._normalize_quat_wxyz(obj_quat_w))
+            R = matrix_from_quat(q_obj_h)
+            self._cached_obj_rot_6d = R[0, :, :2].flatten().reshape(1, 6).astype(np.float32)
+        elif object_detected:
+            obj_quat_w = self._get_object_quat_w()
+            if obj_quat_w is not None:
+                self._cached_obj_quat_w_detection = obj_quat_w.copy()
+                q_w2h = quat_inverse(yaw_quat)
+                q_obj_h = quat_mul(q_w2h, self._normalize_quat_wxyz(obj_quat_w))
+                R = matrix_from_quat(q_obj_h)
+                self._cached_obj_rot_6d = R[0, :, :2].flatten().reshape(1, 6).astype(np.float32)
+        else:
+            if cache_world:
+                obj_quat_w = getattr(self, "_cached_obj_quat_w_detection", None)
+                if obj_quat_w is None:
+                    obj_quat_w = self._get_object_quat_w()
+            else:
+                obj_quat_w = None  # will use cached rot_6d below
+
+        if not object_detected and not cache_world:
+            # Reuse last heading-frame rotation observation directly.
+            obj_rot_6d = getattr(self, "_cached_obj_rot_6d", None)
+            if obj_rot_6d is None:
+                obj_rot_6d = np.zeros((1, 6), dtype=np.float32)
+        elif obj_quat_w is not None:
             q_w2h = quat_inverse(yaw_quat)
             q_obj_h = quat_mul(q_w2h, self._normalize_quat_wxyz(obj_quat_w))
             R = matrix_from_quat(q_obj_h)  # (1, 3, 3)
@@ -2589,12 +3008,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
             pos_long   : (1, 15)   5×3 positions
             ori_long   : (1, 30)   5×6 6D orientations
         """
-        use_recorded_world_traj = (
-            self._recorded_obj_pos_w is not None
-            and self._recorded_obj_rot_wxyz is not None
-            and self._recorded_obj_pos_w.shape[0] > 0
-            and self._recorded_obj_rot_wxyz.shape[0] > 0
-        )
+        use_recorded_world_traj = self._has_recorded_world_traj()
 
         if not use_recorded_world_traj and (self.motion_obj_pos is None or self.motion_obj_rot is None):
             return (
@@ -2611,10 +3025,17 @@ class WholeBodyTrackingPolicy(BasePolicy):
         else:
             torso_pos_w, _ = self._get_ref_body_pose_in_world(robot_state_data)
 
+        # Simulate noisy world-pose estimation.
+        world_pose_noise = float(getattr(self.config.task, "world_pose_noise", 0.0))
+        if world_pose_noise > 0.0:
+            noise = np.random.uniform(-world_pose_noise, world_pose_noise, size=(1, 3)).astype(np.float32)
+            torso_pos_w = torso_pos_w.reshape(1, 3) + noise
+
         if use_recorded_world_traj:
-            traj_len = min(self._recorded_obj_pos_w.shape[0], self._recorded_obj_rot_wxyz.shape[0])
-            short_idx = np.clip(timestep + np.arange(1, 11), 0, traj_len - 1)
-            long_idx = np.clip(timestep + np.array([20, 40, 60, 80, 100]), 0, traj_len - 1)
+            traj_len = self._get_recorded_world_traj_len()
+            recorded_timestep = self._get_recorded_traj_command_timestep()
+            short_idx = np.clip(recorded_timestep + np.arange(1, 11), 0, traj_len - 1)
+            long_idx = np.clip(recorded_timestep + np.array([20, 40, 60, 80, 100]), 0, traj_len - 1)
 
             torso_pos = torso_pos_w.reshape(1, 3)
 
@@ -2642,7 +3063,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
             short_idx = np.clip(timestep + np.arange(1, 11), 0, self.motion_length - 1)
             long_idx  = np.clip(timestep + np.array([20, 40, 60, 80, 100]), 0, self.motion_length - 1)
 
-            # Positions: (N, 3) world → heading frame relative to torso
+            # Positions: (N, 3) aligned → heading frame relative to torso
             def _pos_to_heading(pos_w_batch: np.ndarray) -> np.ndarray:
                 delta = pos_w_batch - torso_pos  # (N, 3)
                 q = np.repeat(yaw_quat, delta.shape[0], axis=0)
@@ -2651,7 +3072,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
             pos_short = _pos_to_heading(self.motion_obj_pos[short_idx]).reshape(1, -1)
             pos_long  = _pos_to_heading(self.motion_obj_pos[long_idx]).reshape(1, -1)
 
-            # Orientations: (N, 4) world wxyz → heading frame → 6D
+            # Orientations: (N, 4) aligned wxyz → heading frame → 6D
             q_w2h = quat_inverse(yaw_quat)
 
             def _ori_to_6d(rot_wxyz_batch: np.ndarray) -> np.ndarray:
@@ -2743,6 +3164,13 @@ class WholeBodyTrackingPolicy(BasePolicy):
             return
 
     def _get_motion_obj_traj_world(self, timestep: int) -> tuple[np.ndarray, np.ndarray] | None:
+        if self._has_recorded_world_traj():
+            traj_len = self._get_recorded_world_traj_len()
+            base_timestep = self._get_recorded_traj_command_timestep()
+            short_idx = np.clip(base_timestep + np.arange(1, 11), 0, traj_len - 1)
+            long_idx = np.clip(base_timestep + np.array([20, 40, 60, 80, 100]), 0, traj_len - 1)
+            return self._recorded_obj_pos_w[short_idx], self._recorded_obj_pos_w[long_idx]
+
         if self.motion_obj_pos is None or self.motion_length == 0:
             return None
         if self.motion_obj_pos.ndim != 2 or self.motion_obj_pos.shape[1] != 3:
@@ -2852,16 +3280,22 @@ class WholeBodyTrackingPolicy(BasePolicy):
             return
 
     def _get_sampled_motion_obj_traj_for_rviz(self) -> np.ndarray | None:
-        # Use original world-frame object poses (preserved before alignment).
-        # For gen_traj the trajectory is already in world frame and stored directly
-        # in motion_obj_pos / motion_obj_rot, so fall back to those.
-        pos_seq = self._motion_obj_pos_world if self._motion_obj_pos_world is not None else self.motion_obj_pos
-        rot_seq = (
-            self._motion_obj_rot_world_wxyz
-            if self._motion_obj_rot_world_wxyz is not None
-            else self.motion_obj_rot
-        )
-        if pos_seq is None or rot_seq is None or self.motion_fps is None:
+        if self._has_recorded_world_traj():
+            pos_seq = self._recorded_obj_pos_w
+            rot_seq = self._recorded_obj_rot_wxyz
+            sample_fps = float(self.config.task.rl_rate)
+        else:
+            # Use original world-frame object poses (preserved before alignment).
+            # For gen_traj the trajectory is already in world frame and stored directly
+            # in motion_obj_pos / motion_obj_rot, so fall back to those.
+            pos_seq = self._motion_obj_pos_world if self._motion_obj_pos_world is not None else self.motion_obj_pos
+            rot_seq = (
+                self._motion_obj_rot_world_wxyz
+                if self._motion_obj_rot_world_wxyz is not None
+                else self.motion_obj_rot
+            )
+            sample_fps = None if self.motion_fps is None else float(self.motion_fps)
+        if pos_seq is None or rot_seq is None or sample_fps is None:
             return None
 
         pos_arr = np.asarray(pos_seq, dtype=np.float32)
@@ -2888,7 +3322,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
             quat_mul(np.repeat(init_rot_inv, traj_len, axis=0), rot_arr)
         )
 
-        sample_step = max(1, int(round(self._rviz_traj_dt * float(self.motion_fps))))
+        sample_step = max(1, int(round(self._rviz_traj_dt * sample_fps)))
         sample_idx = np.arange(0, traj_len, sample_step, dtype=np.int64)
         if sample_idx.size == 0 or sample_idx[-1] != traj_len - 1:
             sample_idx = np.concatenate([sample_idx, np.array([traj_len - 1], dtype=np.int64)], axis=0)
@@ -3252,7 +3686,30 @@ class WholeBodyTrackingPolicy(BasePolicy):
         else:
             input_feed = {name: group_outputs[name] for name in self.onnx_input_names}
 
-        raw_action_order = self.policy(input_feed)  # Raw action in action order
+        if self._inference_time_enabled:
+            t0 = time.perf_counter()
+            raw_action_order = self.policy(input_feed)
+            dt_ms = (time.perf_counter() - t0) * 1000.0
+            self._inference_time_count += 1
+            if self._inference_time_count <= 50:
+                # Warmup — discard
+                if self._inference_time_count == 50:
+                    logger.info(colored("[Inference timing] Warmup done, now collecting 300 steps...", "green"))
+            else:
+                elapsed = self._inference_time_count - 50
+                self._inference_times.append(dt_ms)
+                if elapsed <= 10:
+                    providers = self.onnx_policy_session.get_providers()
+                    device = "GPU" if any("CUDA" in p or "Tensorrt" in p for p in providers) else "CPU"
+                    logger.info(colored(
+                        f"[Inference {elapsed}/300] {dt_ms:.2f} ms  ({device})",
+                        "green", attrs=["bold"],
+                    ))
+                if elapsed == 300:
+                    self._print_inference_time_summary()
+                    self._inference_time_enabled = False
+        else:
+            raw_action_order = self.policy(input_feed)  # Raw action in action order
 
         # Action scaling/offset from training (in action order)
         # action = raw_action * scale + offset
@@ -3311,7 +3768,12 @@ class WholeBodyTrackingPolicy(BasePolicy):
             policy_action_config = policy_action_order[:, np.array(ACTION_ASSET_TO_CONFIG_ORDER_29DOF)]
         
         self.scaled_policy_action = policy_action_config
-        
+
+        # Right hand open override: set right hand commands to zeros (config indices 36-42)
+        if self._right_hand_open and self.num_dofs == 43:
+            self.scaled_policy_action = self.scaled_policy_action.copy()
+            self.scaled_policy_action[:, 36:43] = 0.0
+
         # Store last policy action for observation (in action order)
         self.last_policy_action = raw_action_order
         
@@ -3363,6 +3825,10 @@ class WholeBodyTrackingPolicy(BasePolicy):
                 self.motion_timestep = end
                 self.motion_clip_progressing = False
                 self.logger.info(colored(f"Reached motion_end_timestep={end}, stopping motion clip", "yellow"))
+            if self._has_recorded_world_traj():
+                traj_len = self._get_recorded_world_traj_len()
+                if traj_len > 0:
+                    self._recorded_traj_timestep = min(self._recorded_traj_timestep + 1, traj_len - 1)
         return self.scaled_policy_action
 
     def _get_motion_command_sequence_soft_stop(self) -> np.ndarray:
@@ -3398,6 +3864,85 @@ class WholeBodyTrackingPolicy(BasePolicy):
         # Concatenate pos and vel
         frame = np.concatenate([target_q_motion, vel0], axis=0).reshape(1, -1)  # [1, 58]
         seq = np.repeat(frame, 10, axis=0)  # [10, 58]
+        return seq.reshape(1, -1).astype(np.float32, copy=False)
+
+    def _get_motion_command_sequence_interp_to_first(self, robot_state_data) -> np.ndarray:
+        """Get a 10-frame sequence interpolating from current pose toward the first motion frame.
+
+        On each call advances the internal counter so the command smoothly moves toward the target.
+        Once the interpolation is complete, falls back to first-frame sequence.
+        """
+        # Get first frame target in motion order
+        if self.motion_dof_pos is None or self.motion_length == 0:
+            return np.zeros((1, 10 * self.motion_command_dofs * 2), dtype=np.float32)
+
+        start_idx = self._get_motion_start_frame_index()
+        target_q_motion = self.motion_dof_pos[start_idx].copy()
+        if target_q_motion.shape[0] != self.motion_command_dofs:
+            if self.motion_body_indices is not None:
+                target_q_motion = target_q_motion[self.motion_body_indices]
+            else:
+                target_q_motion = target_q_motion[:self.motion_command_dofs]
+
+        # Capture starting pose (in motion order) on first call
+        if self._interp_to_first_frame_start_q is None:
+            dof_pos_config = robot_state_data[0, 7: 7 + self.num_dofs]
+            body_joint_names = list(G1_MOTION_JOINT_NAMES_29)
+            body_indices_config = np.array(
+                get_index_of_a_in_b(body_joint_names, self.dof_names), dtype=np.int64
+            )
+            self._interp_to_first_frame_start_q = dof_pos_config[body_indices_config].copy()
+
+        ratio = min(self._interp_to_first_frame_count / self._interp_to_first_frame_steps, 1.0)
+        interp_q = self._interp_to_first_frame_start_q + ratio * (target_q_motion - self._interp_to_first_frame_start_q)
+        self._interp_to_first_frame_count += 1
+
+        # When done, switch back to normal stabilization
+        if self._interp_to_first_frame_count >= self._interp_to_first_frame_steps:
+            self._interp_to_first_frame_mode = False
+            self.logger.info(colored("✅ Interp to first frame complete — resuming normal stabilization", "cyan"))
+
+        vel0 = np.zeros(self.motion_command_dofs, dtype=np.float32)
+        frame = np.concatenate([interp_q, vel0]).reshape(1, -1)  # [1, 58]
+        seq = np.repeat(frame, 10, axis=0)  # [10, 58]
+        return seq.reshape(1, -1).astype(np.float32, copy=False)
+
+    def _get_motion_command_sequence_interp_to_default(self, robot_state_data) -> np.ndarray:
+        """Interpolate stabilization command from current pose to all-zero (default) joint positions."""
+        if self.motion_dof_pos is None or self.motion_length == 0:
+            return np.zeros((1, 10 * self.motion_command_dofs * 2), dtype=np.float32)
+
+        body_joint_names = list(G1_MOTION_JOINT_NAMES_29)
+        body_indices_config = np.array(
+            get_index_of_a_in_b(body_joint_names, self.dof_names), dtype=np.int64
+        )
+
+        # Capture start pose on first call
+        if self._interp_to_default_start_q is None:
+            dof_pos_config = robot_state_data[0, 7: 7 + self.num_dofs]
+            self._interp_to_default_start_q = dof_pos_config[body_indices_config].copy()
+
+        target_q = np.zeros(self.motion_command_dofs, dtype=np.float32)
+        ratio = min(self._interp_to_default_count / self._interp_to_default_steps, 1.0)
+        interp_q = self._interp_to_default_start_q + ratio * (target_q - self._interp_to_default_start_q)
+        self._interp_to_default_count += 1
+
+        if self._interp_to_default_count >= self._interp_to_default_steps:
+            self._interp_to_default_mode = False
+            self._hold_default_pose = True
+            self.logger.info(colored("✅ Interp to default pose complete — press 'd' to go to first motion frame", "cyan"))
+
+        vel0 = np.zeros(self.motion_command_dofs, dtype=np.float32)
+        frame = np.concatenate([interp_q, vel0]).reshape(1, -1)
+        seq = np.repeat(frame, 10, axis=0)
+        return seq.reshape(1, -1).astype(np.float32, copy=False)
+
+    def _get_motion_command_sequence_hold_default(self) -> np.ndarray:
+        """Return a constant zero-joint-position command (holds default pose after interp-to-default)."""
+        target_q = np.zeros(self.motion_command_dofs, dtype=np.float32)
+        vel0 = np.zeros(self.motion_command_dofs, dtype=np.float32)
+        frame = np.concatenate([target_q, vel0]).reshape(1, -1)
+        seq = np.repeat(frame, 10, axis=0)
         return seq.reshape(1, -1).astype(np.float32, copy=False)
 
     def _get_manual_command(self, robot_state_data):
@@ -3484,7 +4029,15 @@ class WholeBodyTrackingPolicy(BasePolicy):
             self._recorded_traj_time_buffer = []
             self._recorded_traj_pos_buffer = []
             self._recorded_traj_rot_buffer = []
+            self._recorded_traj_timestep = 0
         
+        # Reset right hand open override so it doesn't carry over to the next run
+        if self._right_hand_open:
+            self._right_hand_open = False
+            self._right_hand_frozen_obs_pos = None
+            self._right_hand_frozen_obs_vel = None
+            self.logger.info(colored("✋ Right hand open override cleared on stop", "cyan"))
+
         # First stop press: soft stop (hold current position with stabilization policy)
         if not self._soft_stop_active:
             self.use_policy_action = True  # Keep inference running!
@@ -3549,17 +4102,44 @@ class WholeBodyTrackingPolicy(BasePolicy):
             if self._motion_log_data:
                 self._save_motion_log()
 
+    def _toggle_right_hand_open(self, robot_state_data=None):
+        """Toggle right hand open override. Snapshots hand obs on activation."""
+        self._right_hand_open = not self._right_hand_open
+        if self._right_hand_open:
+            # Snapshot current right hand observation for freezing
+            if robot_state_data is None:
+                if self.num_dofs == 43:
+                    robot_state_data = self.interface.get_full_state_43dof()
+                else:
+                    robot_state_data = self.interface.get_low_state()
+            if robot_state_data is not None and hasattr(self, "_proprio_hand_indices"):
+                dof_pos_config = robot_state_data[:, 7 : 7 + self.num_dofs]
+                dof_pos_rel = dof_pos_config - self.default_dof_angles.reshape(1, -1)
+                dof_vel_config = robot_state_data[
+                    :, 7 + self.num_dofs + 6 : 7 + self.num_dofs + 6 + self.num_dofs
+                ]
+                hand_idx = self._proprio_hand_indices
+                self._right_hand_frozen_obs_pos = dof_pos_rel[:, hand_idx][:, 7:14].copy()
+                self._right_hand_frozen_obs_vel = dof_vel_config[:, hand_idx][:, 7:14].copy()
+            self.logger.info(colored("✋ Right hand open override ON — commanding right hand to zeros", "cyan", attrs=["bold"]))
+        else:
+            self._right_hand_frozen_obs_pos = None
+            self._right_hand_frozen_obs_vel = None
+            self.logger.info(colored("✋ Right hand open override OFF — policy controls right hand", "cyan", attrs=["bold"]))
+
     def _handle_start_stabilization(self):
         """Handle start stabilization mode using the configured motion start frame."""
         if not self.use_policy_action:
             self.logger.warning("Press ']' first to enable policy, then 'd' to start stabilization")
             return
-        
+
         self._stiff_startup_active = False
         self.stabilization_mode = True
         self.motion_clip_progressing = False
         self._reset_motion_timing()
         self._reset_master_obs_history()
+        # Reset gen_traj so it re-initializes from the current object pose on the next 's'/start.
+        self._gen_traj_initialized = False
         self.logger.info(
             colored("🛡️  Entering stabilization mode - policy active with configured start-frame command", "yellow", attrs=["bold"])
         )
@@ -3601,7 +4181,11 @@ class WholeBodyTrackingPolicy(BasePolicy):
 
     def _handle_start_motion_clip(self):
         """Handle start motion clip action."""
+        self._inference_time_count = 0  # Reset so timing prints for the next 10 steps
+        self._inference_times.clear()  # Discard stabilization-phase times
+        self._inference_cpu_usages.clear()
         self._stiff_startup_active = False
+        self._hold_default_pose = False
         if self._record_traj_active:
             self.logger.warning("Finish trajectory recording first before starting the motion clip.")
             return
@@ -3614,8 +4198,11 @@ class WholeBodyTrackingPolicy(BasePolicy):
             self.stabilization_mode = False
             self.logger.info(colored("Exiting stabilization mode", "cyan"))
         if self.use_gen_traj and (not self._gen_traj_initialized) and (self._traj_gen is not None):
-            obj_pos_w = self._get_object_pos_w()
-            obj_quat_w = self._get_object_quat_w()
+            # Prefer the detection-derived world pose cached by _compute_bps_obj_state
+            # during stabilization ticks — this is the pose the policy observations are
+            # actually based on and avoids mismatches with the UDP object_pose_world
+            # topic (which follows a different transform chain).
+            obj_pos_w, obj_quat_w = self._get_object_world_pose_for_command_start()
             if obj_pos_w is not None and obj_quat_w is not None:
                 # obj_pos_w: [1,3], obj_quat_w: [1,4] (wxyz)
                 pos_seq_w, quat_seq_wxyz = self._traj_gen.build_gen_traj(
@@ -3639,14 +4226,25 @@ class WholeBodyTrackingPolicy(BasePolicy):
                 logger.info(
                     colored(
                         f"Gen traj enabled: length={self.motion_length} frames "
-                        f"({self.motion_length/self.motion_fps:.2f}s), mode={self._traj_gen.mode}",
+                        f"({self.motion_length/self.motion_fps:.2f}s), mode={self._traj_gen.mode}, "
+                        f"start_pos={obj_pos_w.flatten().tolist()}, "
+                        f"start_quat_wxyz={obj_quat_w.flatten().tolist()}",
                         "cyan",
                     )
                 )
             else:
                 logger.warning("Gen traj requested but object pose not available; keeping original motion object traj.")
+        elif self._has_recorded_world_traj():
+            if not self._reanchor_recorded_world_traj_to_live_pose():
+                logger.warning(
+                    "Recorded trajectory is loaded but live object pose is unavailable; "
+                    "using the recorded trajectory in its saved world frame."
+                )
+        elif self.use_recorded_traj:
+            logger.warning("use_recorded_traj is enabled but no recorded trajectory is loaded; using clip object trajectory.")
         elif self.record_traj and self._recorded_obj_pos_w is None:
             logger.warning("record_traj is enabled but no recorded world-frame trajectory is available; using clip object trajectory.")
+        self._recorded_traj_timestep = 0
         self._send_rviz_traj()
         self.clock_sub.reset_origin()
         self.motion_clip_progressing = True
@@ -3685,9 +4283,46 @@ class WholeBodyTrackingPolicy(BasePolicy):
         else:
             self.logger.info(colored(f"🎬 Starting motion clip playback from timestep {start_idx}", "blue", attrs=["bold"]))
 
+    def _handle_interp_to_default(self):
+        """Use stabilization policy to smoothly command from current pose to default (zero) joint positions."""
+        if not self.use_policy_action:
+            self.logger.warning("Press ']' first to enable policy before interpolating to default pose")
+            return
+        self.stabilization_mode = True
+        self.motion_clip_progressing = False
+        self._soft_stop_active = False
+        self._soft_stop_target_q = None
+        self._hold_default_pose = False
+        self._interp_to_first_frame_mode = False
+        self._interp_to_default_mode = True
+        self._interp_to_default_count = 0
+        self._interp_to_default_start_q = None  # will be captured on first inference tick
+        self.logger.info(colored("🔄 Stabilization policy: interpolating command to default (zero) pose", "cyan", attrs=["bold"]))
+
+    def _handle_interp_to_first_frame(self):
+        """Use stabilization policy to smoothly command from current pose to first motion frame."""
+        if not self.use_policy_action:
+            self.logger.warning("Press ']' first to enable policy before interpolating to first frame")
+            return
+        self.stabilization_mode = True
+        self.motion_clip_progressing = False
+        self._soft_stop_active = False
+        self._soft_stop_target_q = None
+        self._hold_default_pose = False
+        self._interp_to_default_mode = False
+        self._interp_to_first_frame_mode = True
+        self._interp_to_first_frame_count = 0
+        self._interp_to_first_frame_start_q = None  # will be captured on first inference tick
+        self._gen_traj_initialized = False  # re-initialize from current object pose on next 's'
+        self.logger.info(colored("🔄 Stabilization policy: interpolating command to first motion frame", "cyan", attrs=["bold"]))
+
     def handle_keyboard_button(self, keycode):
         """Add new keyboard button to start and end the motion clips"""
-        if keycode in ["\r", "\n", "", "return", "enter"]:
+        if keycode == "e":
+            self._handle_interp_to_default()
+        elif keycode == "d":
+            self._handle_interp_to_first_frame()
+        elif keycode in ["\r", "\n", "", "return", "enter"]:
             # Print current dof_pos when Enter is pressed
             robot_state_data = self.interface.get_low_state()
             if robot_state_data is not None:
@@ -3751,9 +4386,6 @@ class WholeBodyTrackingPolicy(BasePolicy):
                 logger.info(colored("="*80 + "\n", "cyan", attrs=["bold"]))
             else:
                 logger.warning("Unable to get robot state")
-        elif keycode == "d":
-            # Start stabilization mode - policy runs with first motion frame
-            self._handle_start_stabilization()
         elif keycode == "t":
             self._toggle_record_traj()
         elif keycode == "s":
@@ -3787,6 +4419,9 @@ class WholeBodyTrackingPolicy(BasePolicy):
             # First 's': start motion
             self.clock_sub.reset_origin()
             self._handle_start_motion_clip()
+        elif keycode == "a":
+            # Toggle right hand open override
+            self._toggle_right_hand_open()
         elif keycode == "m":
             # Toggle between motion tracking and policy
             self.use_motion_tracking = not self.use_motion_tracking
@@ -3797,11 +4432,13 @@ class WholeBodyTrackingPolicy(BasePolicy):
 
     def handle_joystick_button(self, cur_key):
         """Handle joystick button presses for WBT-specific controls."""
-        if cur_key == "Y" and self.record_traj:
-            self._toggle_record_traj()
+        if cur_key == "F1":
+            self._handle_interp_to_default()
         elif cur_key == "X":
-            # Start stabilization mode
-            self._handle_start_stabilization()
+            self._handle_interp_to_first_frame()
+        elif cur_key == "Y":
+            # Toggle right hand open override
+            self._toggle_right_hand_open()
         elif cur_key == "start":
             # Start playing motion clip
             self._handle_start_motion_clip()

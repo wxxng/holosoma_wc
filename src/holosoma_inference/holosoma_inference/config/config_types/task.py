@@ -36,6 +36,9 @@ class TaskConfig:
     switch_hands: bool = False
     """Canonicalize swapped-hand DDS topics, including side swap, middle/index remap, and sign fixes."""
 
+    hand_gain_scale: float = 1.0
+    """Multiplicative scale applied to both kp and kd for both hands. E.g. 1.2 for 20% higher gains."""
+
     joystick_type: str = "xbox"
     """Joystick type."""
 
@@ -79,8 +82,27 @@ class TaskConfig:
     use_gen_traj: bool = False
     """Whether to use trajectory generator for object motion."""
 
+    gen_traj_mode: str = "stay"
+    """Trajectory generator mode. One of: lift, lift_down, right, left, left_down, left_back_down, back, lift_back_left_down, stay."""
+
+    gen_traj_down_height_m: float = 0.3
+    """For lift_down mode: how far to lower the object after lifting (meters). Default 0.3m."""
+
+    gen_traj_trapezoid: bool = False
+    """Use trapezoidal velocity profile for trajectory ramps. If False, use linear interpolation."""
+
+    inference_time: bool = False
+    """If True, print inference time for the first 10 steps after motion starts."""
+
     record_traj: bool = False
     """If True, allow recording an object trajectory in torso frame after stabilization."""
+
+    use_recorded_traj: bool = False
+    """If True, load and use a previously recorded world-frame object trajectory for commands."""
+
+    recorded_traj_path: str | None = None
+    """Optional path to a saved recorded object trajectory PKL.
+    If None and use_recorded_traj=True, the newest file under logs/recorded_object_traj is used."""
 
     debug_traj_viz: bool = True
     """Enable short/long-horizon trajectory visualization in the MuJoCo viewer."""
@@ -88,16 +110,16 @@ class TaskConfig:
     debug_traj_viz_port: int = 10006
     """UDP port used to stream trajectory visualization points to the simulator bridge."""
 
-    debug_rviz_obj_traj_viz: bool = False
+    rviz_traj: bool = False
     """Enable UDP streaming of sampled object trajectory poses for RViz visualization."""
 
-    debug_rviz_obj_traj_viz_host: str = "127.0.0.1"
+    rviz_traj_host: str = "127.0.0.1"
     """Destination host for sampled RViz object trajectory UDP packets."""
 
-    debug_rviz_obj_traj_viz_port: int = 10007
+    rviz_traj_port: int = 10007
     """UDP port used to stream sampled object trajectory poses for RViz visualization."""
 
-    debug_rviz_obj_traj_viz_dt: float = 0.2
+    rviz_traj_dt: float = 0.2
     """Sampling interval in seconds for RViz object trajectory UDP packets."""
 
     change_loco_order: bool = False
@@ -115,5 +137,43 @@ class TaskConfig:
     debug_hand_action: str | None = None
     """Optional path to saved hand joint targets. When provided on 43-DOF robots, replays that sequence instead of the default debug_hand cycle."""
 
+    reference_speed: float = 1.0
+    """Playback speed multiplier for the reference motion trajectory
+    (e.g. 2.0 = 2× faster, 0.5 = half speed).
+    All motion arrays are resampled via linear interpolation."""
+
     log: bool = False
     """Enable task-specific inference logging when supported by the active policy."""
+
+    object_dropout: bool = False
+    """Simulate apriltag undetection by randomly dropping object observations."""
+
+    object_dropout_prob: float = 0.3
+    """Per-step probability of starting a dropout block each step (when not already in one)."""
+
+    object_dropout_sec_min: float = 0.1
+    """Minimum duration (seconds) of a simulated dropout block."""
+
+    object_dropout_sec_max: float = 1.0
+    """Maximum duration (seconds) of a simulated dropout block."""
+
+    cache_world: bool = False
+    """When True, cache detected world pose and re-project to current torso frame when apriltag is undetected.
+    When False, just reuse the last torso-frame observation as-is."""
+
+    world_pose_noise: float = 0.0
+    """Simulate noisy world-pose estimation by adding uniform noise to torso_pos_w
+    in motion command computation. Value is half-range: noise ~ U[-val, val] per xyz axis.
+    0 means disabled."""
+
+    mujoco_twin: bool = False
+    """Enable real-time MuJoCo twin visualization by streaming robot state via UDP."""
+
+    mujoco_twin_host: str = "127.0.0.2"
+    """Destination host for MuJoCo twin UDP packets."""
+
+    mujoco_twin_port: int = 10008
+    """UDP port for MuJoCo twin state streaming."""
+
+    fd_hand_vel: bool = False
+    """Use finite-difference hand joint velocity (dof_pos difference / dt) instead of raw velocity sensor readings."""
