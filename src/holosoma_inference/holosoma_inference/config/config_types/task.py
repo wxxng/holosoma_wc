@@ -36,6 +36,9 @@ class TaskConfig:
     switch_hands: bool = False
     """Canonicalize swapped-hand DDS topics, including side swap, middle/index remap, and sign fixes."""
 
+    hand_gain_scale: float = 1.0
+    """Multiplicative scale applied to both kp and kd for both hands. E.g. 1.2 for 20% higher gains."""
+
     joystick_type: str = "xbox"
     """Joystick type."""
 
@@ -80,7 +83,13 @@ class TaskConfig:
     """Whether to use trajectory generator for object motion."""
 
     gen_traj_mode: str = "stay"
-    """Trajectory generator mode. One of: lift, right, left, left_down, back, stay."""
+    """Trajectory generator mode. One of: lift, lift_down, right, left, left_down, left_back_down, back, lift_back_left_down, stay."""
+
+    gen_traj_down_height_m: float = 0.3
+    """For lift_down mode: how far to lower the object after lifting (meters). Default 0.3m."""
+
+    gen_traj_trapezoid: bool = False
+    """Use trapezoidal velocity profile for trajectory ramps. If False, use linear interpolation."""
 
     inference_time: bool = False
     """If True, print inference time for the first 10 steps after motion starts."""

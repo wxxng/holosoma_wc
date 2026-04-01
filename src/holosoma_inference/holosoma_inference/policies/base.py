@@ -167,6 +167,7 @@ class BasePolicy:
                 use_joystick=self.config.task.use_joystick,
                 use_hands=(self.robot_config.num_joints == 43),
                 switch_hands=getattr(self.config.task, "switch_hands", False),
+                hand_gain_scale=getattr(self.config.task, "hand_gain_scale", 1.0),
             )
         else:
             self.interface = create_interface(
